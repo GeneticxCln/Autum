@@ -15,7 +15,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import AsyncIterator, Mapping, Protocol, Sequence
+from typing import Any, AsyncIterator, Callable, Mapping, Protocol, Sequence
 
 from autum.bus import EventBus
 from autum.events import Event, Provenance, new_id
@@ -23,7 +23,11 @@ from autum.text import SentenceChunker, speakable
 
 log = logging.getLogger("autum.runtime")
 
-Message = Mapping[str, str]
+# A chat message: {"role", "content"}. A user turn may also carry "audio"
+# (WAV bytes) when the pipeline hears speech directly; its "content" is
+# filled in from the transcript once that arrives. "turn_id" ties a history
+# entry to its turn.
+Message = Mapping[str, Any]
 
 
 class Inference(Protocol):
@@ -106,7 +110,7 @@ class Runtime:
         speech: SpeechOutput,
         *,
         mode: Mode = Mode.PUSH_TO_TALK,
-        system_prompt: str | None = None,
+        system_prompt: str | Callable[[], str] | None = None,
         max_history: int = 20,
         cancel_timeout_s: float = 1.0,
     ) -> None:
@@ -115,7 +119,7 @@ class Runtime:
         self.speech = speech
         self.mode = mode
         self.system_prompt = system_prompt
-        self.history: deque[dict[str, str]] = deque(maxlen=max_history)
+        self.history: deque[dict[str, Any]] = deque(maxlen=max_history)
         self.cancel_timeout_s = cancel_timeout_s
         self.state = State.IDLE
         self.muted = False
@@ -183,8 +187,12 @@ class Runtime:
                 if event.turn_id == self._input_turn and self.state is State.SPEECH_DETECTED:
                     self._set_state(State.PROCESSING, "speech_ended", event)
             case "audio.transcribed":
-                if event.payload["final"] and event.turn_id == self._input_turn:
+                if not event.payload["final"]:
+                    return
+                if event.turn_id == self._input_turn:
                     self._on_final_transcript(event)
+                else:
+                    self._fill_transcript(event)
             case "speech.playback_started":
                 if self._op and event.operation_id == self._op.id and self.state is State.THINKING:
                     self._set_state(State.SPEAKING, "playback_started", event)
@@ -204,6 +212,13 @@ class Runtime:
             self._begin_cancel(source, event)
         self._set_state(State.SPEECH_DETECTED, "speech_started", event)
 
+    def _fill_transcript(self, event: Event) -> None:
+        """A transcript for a turn the model already heard as audio."""
+        for entry in self.history:
+            if entry.get("turn_id") == event.turn_id and "audio" in entry:
+                entry.pop("audio")
+                entry["content"] = str(event.payload["text"]).strip()
+
     def _on_final_transcript(self, event: Event) -> None:
         self._input_turn = None
         text = str(event.payload["text"]).strip()
@@ -213,6 +228,17 @@ class Runtime:
         self._start_response(text, "speech", event.turn_id or new_id(), event)
 
     # ----- public API ----------------------------------------------------
+
+    def submit_speech(self, turn_id: str, audio: bytes, cause: Event | None = None) -> None:
+        """A finished utterance for a pipeline whose model hears audio directly.
+
+        The transcript, when the voice engine publishes it, replaces the
+        audio in the history.
+        """
+        if turn_id != self._input_turn:
+            return  # superseded by a newer utterance
+        self._input_turn = None
+        self._start_response("", "speech", turn_id, cause, audio=audio)
 
     def submit_text(self, text: str) -> None:
         """Text input (plan §3.1): same path as a spoken turn."""
@@ -238,7 +264,9 @@ class Runtime:
 
     # ----- responses -----------------------------------------------------
 
-    def _start_response(self, text: str, source: str, turn_id: str, cause: Event | None) -> None:
+    def _start_response(
+        self, text: str, source: str, turn_id: str, cause: Event | None, audio: bytes | None = None
+    ) -> None:
         op_id = new_id()
         self.bus.fence.open(op_id)
         message = self.bus.emit(
@@ -249,7 +277,10 @@ class Runtime:
             operation_id=op_id,
             cause=cause,
         )
-        self.history.append({"role": "user", "content": text})
+        entry: dict[str, Any] = {"role": "user", "content": text, "turn_id": turn_id}
+        if audio is not None:
+            entry["audio"] = audio
+        self.history.append(entry)
         self._set_state(State.THINKING, "user_message", message)
         task = asyncio.get_running_loop().create_task(self._respond(op_id, turn_id, message))
         self._op = _Operation(op_id, turn_id, task)
@@ -257,9 +288,10 @@ class Runtime:
 
     async def _respond(self, op_id: str, turn_id: str, cause: Event | None) -> None:
         messages: list[Message] = []
-        if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        messages.extend(self.history)
+        prompt = self.system_prompt() if callable(self.system_prompt) else self.system_prompt
+        if prompt:
+            messages.append({"role": "system", "content": prompt})
+        messages.extend(dict(entry) for entry in self.history)
         chunker = SentenceChunker()
         parts: list[str] = []
         try:

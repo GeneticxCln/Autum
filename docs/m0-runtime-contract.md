@@ -102,7 +102,19 @@ Autum's own echo).
 
 **Inference** (`Inference` in `runtime.py`): `stream(messages,
 operation_id)` yields response text and stops when its task is
-cancelled.
+cancelled. A message is `{"role", "content"}`, plus `"turn_id"` for
+history entries. A user message may also carry `"audio"` (WAV bytes) when
+the pipeline's model hears speech directly.
+
+**Spoken turns that the model hears directly** (pipeline D): after
+`audio.speech_ended`, the voice engine calls
+`runtime.submit_speech(turn_id, wav, cause)` instead of waiting for a
+transcript. The runtime starts the response with the audio in the
+history. The voice engine transcribes the audio once the reply has
+finished or been cancelled, and publishes `audio.transcribed`. The
+runtime then replaces the audio in the history with the text. A final
+transcript for the turn the runtime is still waiting on starts a
+response; a transcript for an earlier turn only fills in history.
 
 **Speech output** (`SpeechOutput` in `runtime.py`):
 

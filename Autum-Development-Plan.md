@@ -439,7 +439,8 @@ Runtimes and libraries the candidates run on:
 | ONNX Runtime | Runs Silero VAD on the CPU | 1.29.0 | MIT |
 | PyTorch | Runs Chatterbox-Turbo | 2.15.0+cu132 | Apache-2.0, BSD-3-Clause, MIT and others for bundled parts (package metadata) |
 | Transformers | Chatterbox-Turbo dependency | 5.2.0 | Apache-2.0 |
-| PipeWire echo-cancel module | Echo-cancellation test for hands-free mode | PipeWire 1.6.11 with WebRTC echo cancellation from `webrtc-audio-processing` 1.3 | PipeWire: MIT and LGPL-2.1-or-later; WebRTC library: BSD-3-Clause |
+| PipeWire, including `pw-record`, `pw-play`, `wpctl`, and the echo-cancel module | Microphone capture, speech playback, and mute state in the M2 app; echo-cancellation test for hands-free mode | PipeWire 1.6.11 with WebRTC echo cancellation from `webrtc-audio-processing` 1.3 | PipeWire: MIT and LGPL-2.1-or-later; WebRTC library: BSD-3-Clause |
+| httpx | HTTP client for Ollama (benchmark and M2 app) | 0.28.1 | BSD-3-Clause |
 
 Pipelines. Every pipeline uses Silero VAD for end-of-turn:
 
@@ -816,6 +817,11 @@ AUT-11 has at least one acceptance test.
 | M10 | Environment integrations, including user-selected window inspection | WP7, WP10 | M7, M8 |
 | M11 | Human character prototype, if pursued | WP9 | M4 |
 | **R2** | **Expanded release** (§9.2), reliability-tested | WP11 | R1, M6–M10; M11 if included in release scope |
+
+**M2 status (2026-11-22):** at the user's request, M2 is built on pipeline D
+(LFM3-Omni hears the user and answers in its own voice) as a provisional
+choice, before the recorded-set results. ADR 0002 confirms it or names the
+pipeline that replaces it. Push-to-talk is a key in Autum's terminal for now.
 
 M0 and M1 run in parallel. M0's skeleton is the codebase M2 builds on;
 M1's benchmark harness is the first running voice pipeline. Visual work

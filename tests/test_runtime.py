@@ -276,3 +276,40 @@ def test_long_sessions_keep_bounded_state():
     assert len(h.runtime.history) == 6
     assert h.runtime._tasks == set()
     h.assert_nothing_open()
+
+
+# ----- pipelines that hear audio directly (provisional pipeline D) -------
+
+
+def test_a_spoken_turn_reaches_the_model_as_audio_and_the_transcript_fills_history_later():
+    async def scenario():
+        h = Harness(system_prompt=lambda: "prompt built per turn")
+        turn = h.mic.start_speaking()
+        ended = h.bus.emit("audio.speech_ended", {"confidence": 1.0}, turn_id=turn)
+        h.runtime.submit_speech(turn, b"RIFF-fake-wav", ended)
+        await h.until(lambda: h.runtime.state is State.IDLE and h.log.of("speech.playback_finished"))
+        heard = h.inference.calls[0]
+        h.bus.emit("audio.transcribed", {"text": "What time is it?", "final": True}, turn_id=turn)
+        await h.settle()
+        return h, heard
+
+    h, heard = run(scenario())
+    assert heard[0] == {"role": "system", "content": "prompt built per turn"}
+    assert heard[-1]["audio"] == b"RIFF-fake-wav" and heard[-1]["content"] == ""
+    assert h.log.states() == ["speech_detected", "processing", "thinking", "speaking", "idle"]
+    user = h.runtime.history[0]
+    assert user["content"] == "What time is it?" and "audio" not in user  # audio dropped once transcribed
+    assert not h.log.of("conversation.user_message")[1:]  # the late transcript starts no new turn
+
+
+def test_audio_from_a_superseded_utterance_is_ignored():
+    async def scenario():
+        h = Harness()
+        old = h.mic.start_speaking()
+        h.mic.start_speaking()  # pressed again before the first was submitted
+        h.runtime.submit_speech(old, b"old")
+        await h.settle()
+        return h
+
+    h = run(scenario())
+    assert not h.log.of("conversation.user_message")

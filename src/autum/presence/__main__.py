@@ -15,6 +15,7 @@ from PySide6.QtGui import QGuiApplication, QRegion
 from PySide6.QtQml import QQmlApplicationEngine
 
 from autum.presence import has_layer_shell
+from autum.presence.cloud_item import register_qml_types
 from autum.presence.model import PresenceModel
 from autum.transport import default_socket_path
 
@@ -27,6 +28,7 @@ def main() -> int:
 
     app = QGuiApplication(sys.argv)
     app.setApplicationName("Autum")
+    register_qml_types()
     model = PresenceModel(args.socket or default_socket_path(), measure=args.measure)
     engine = QQmlApplicationEngine()
     engine.rootContext().setContextProperty("presence", model)

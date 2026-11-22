@@ -19,9 +19,11 @@ from PySide6.QtQml import QQmlApplicationEngine  # noqa: E402
 from autum.bus import EventBus  # noqa: E402
 from autum.events import new_id  # noqa: E402
 from autum.presence import has_layer_shell  # noqa: E402
+from autum.presence.cloud_item import FaceCloudItem, register_qml_types  # noqa: E402
 from autum.presence.model import PresenceModel  # noqa: E402
 
 APP = QGuiApplication.instance() or QGuiApplication([])
+register_qml_types()
 QML = Path(__file__).resolve().parents[1] / "src" / "autum" / "presence" / "Presence.qml"
 WAYLAND_QML = QML.with_name("PresenceWayland.qml")
 
@@ -143,3 +145,38 @@ def test_lag_is_measured_from_event_to_frame(tmp_path):
     model.frame_swapped()
     report = model.lag_report()
     assert report["event_to_screen"]["n"] == 3 and report["event_to_screen"]["max_ms"] >= 0
+
+
+def test_face_cloud_renders_valid_premultiplied_frames_and_reacts_to_states():
+    import numpy as np
+    from PySide6.QtGui import QColor
+
+    item = FaceCloudItem()
+    item.tint = QColor("#dce6f2")
+    idle = item.render_rgba(180, 180, 60.0)
+    assert idle.shape == (180, 180, 4) and idle.dtype == np.uint8
+    # Premultiplied alpha invariant: rgb <= alpha everywhere
+    assert np.all(idle[:, :, :3] <= idle[:, :, 3:4])
+    # Center orb is opaque & bright, corners are transparent
+    assert idle[90, 90, 3] > 200 and idle[2, 2, 3] == 0
+    assert int(idle[:, :, :3].max()) > 160
+
+    # Speaking voice burst adds particles/brightness
+    item.speaking = True
+    item.voice = 0.85
+    speaking = item.render_rgba(180, 180, 60.0)
+    assert speaking[:, :, :3].mean() > idle[:, :, :3].mean()
+
+    # Muted gap darkens the lower-right rim quadrant compared to idle
+    item.speaking = False
+    item.voice = 0.0
+    item.gap = 1.0
+    muted = item.render_rgba(180, 180, 60.0)
+    assert muted[120:155, 120:155, :3].mean() < idle[120:155, 120:155, :3].mean()
+
+    # Observation halo lights up the outer ring in cyan-teal
+    item.gap = 0.0
+    item.observing = True
+    item.observeGlow = 0.8
+    obs = item.render_rgba(180, 180, 60.0)
+    assert obs[25, 90, 2] > idle[25, 90, 2] + 20

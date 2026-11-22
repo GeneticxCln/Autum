@@ -829,12 +829,14 @@ AUT-11 has at least one acceptance test.
 | M11 | Human character prototype, if pursued | WP9 | M4 |
 | **R2** | **Expanded release** (§9.2), reliability-tested | WP11 | R1, M6–M10; M11 if included in release scope |
 
-**M2 status (2026-11-22):** at the user's request, M2 is built on pipeline D
-(LFM3-Omni hears the user and answers in its own voice) as a provisional
-choice, before the recorded-set results. ADR 0002 confirms it or names the
-pipeline that replaces it. Autum runs in the background with no terminal
-program. Push-to-talk: hold the desktop key (KDE's GlobalShortcuts portal;
-the user confirms the key once) or hold the bubble.
+**M1 & M2 status (2026-11-22):** [ADR 0002](docs/adr/0002-voice-pipeline-and-resource-budget.md)
+confirms **Pipeline D** (`lfm3-omni:2b` for audio understanding, chat, vision,
+tool calling, and streaming speech, with an 80 Hz high-pass input filter) based
+on the `synthetic-v2` 5-pipeline comparison, cancellation probe, Wayland
+presence measurements, and live push-to-talk validation. Formal `recorded-v1`
+WER and `bench.attended` speaker echo measurements remain noted in ADR 0002 as
+deferred checks. Autum runs in the background with no terminal program;
+push-to-talk uses the KDE GlobalShortcuts portal or holding the cloud.
 
 **M3 status (2026-11-22):** hands-free mode (`--hands-free`) is implemented
 on top of streaming Silero VAD v6 (`src/autum/vad.py`, ~0.08 ms/frame on CPU)

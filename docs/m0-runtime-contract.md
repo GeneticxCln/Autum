@@ -1,6 +1,6 @@
 # M0 — Runtime contract
 
-*Status: draft for M2. Revise after the M1 pipeline decision.*
+*Status: active for M0–M10; aligned with ADR 0002 (Pipeline D).*
 
 This document fixes the interfaces the voice engine, inference,
 visual presence, and later subsystems build against. The code in

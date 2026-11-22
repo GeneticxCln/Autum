@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
 from autum.integrations import IntegrationContext
+from autum.integrations.kwin_windows import SNAP_POSITIONS, KWinController
+from autum.integrations.screen_watch import ScreenWatcher
 from autum.logging import redact_sensitive
 from autum.perception import is_excluded_path
 from autum.tools import Capability, PermissionLevel, ToolRegistry
@@ -117,7 +119,9 @@ def _portal_screenshot_sync(timeout_s: float) -> bytes:
     unique = bus.get_unique_name().lstrip(":").replace(".", "_")
     req_path = f"{PORTAL_PATH}/request/{unique}/{token}"
 
-    loop = GLib.MainLoop()
+    ctx = GLib.MainContext.new()
+    ctx.push_thread_default()
+    loop = GLib.MainLoop.new(ctx, False)
     outcome: dict[str, Any] = {}
 
     def on_response(_conn, _sender, _path, _iface, _signal, params):
@@ -130,12 +134,14 @@ def _portal_screenshot_sync(timeout_s: float) -> bytes:
         PORTAL_BUS, REQUEST_IFACE, "Response", req_path, None, Gio.DBusSignalFlags.NONE, on_response
     )
 
-    def on_timeout():
+    def on_timeout(*_):
         outcome["timeout"] = True
         loop.quit()
         return False
 
-    timer_id = GLib.timeout_add(int(timeout_s * 1000), on_timeout)
+    timeout_src = GLib.timeout_source_new(int(timeout_s * 1000))
+    timeout_src.set_callback(on_timeout)
+    timeout_src.attach(ctx)
     try:
         options = {
             "handle_token": GLib.Variant("s", token),
@@ -155,8 +161,9 @@ def _portal_screenshot_sync(timeout_s: float) -> bytes:
         )
         loop.run()
     finally:
-        GLib.source_remove(timer_id)
+        timeout_src.destroy()
         bus.signal_unsubscribe(sub_id)
+        ctx.pop_thread_default()
 
     if outcome.get("timeout"):
         raise TimeoutError("window selection timed out")
@@ -274,16 +281,28 @@ class LinuxDesktopIntegration:
         capture_window: WindowCapturer = portal_screenshot_interactive,
         launcher: AppLauncher = launch_desktop_app,
         app_dirs: Sequence[Path] | None = None,
+        screen_watcher: Any | None = None,
+        window_controller: Any | None = None,
     ) -> None:
         self.capture_window = capture_window
         self.launcher = launcher
         self.app_dirs = app_dirs
+        self.screen_watcher = screen_watcher if screen_watcher is not None else ScreenWatcher()
+        self.window_controller = window_controller if window_controller is not None else KWinController()
+        self._set_obs: Callable[[str], None] | None = None
 
     def is_available(self) -> bool:
         return platform.system() == "Linux"
 
+    async def shutdown(self) -> None:
+        if getattr(self.screen_watcher, "active", False):
+            await self.screen_watcher.stop()
+            if self._set_obs is not None:
+                self._set_obs("none")
+
     def register(self, registry: ToolRegistry, context: IntegrationContext) -> list[str]:
         registered: list[str] = []
+        self._set_obs = context.set_observation
 
         def _notify(source: str) -> None:
             if context.set_observation is not None:
@@ -437,5 +456,267 @@ class LinuxDesktopIntegration:
             )
         )
         registered.append("open_application")
+
+        # 5. Eyes: opt-in real-time screen watch (REVERSIBLE / READ_ONLY, observed)
+        watcher = self.screen_watcher
+
+        async def _start_watch(args: dict[str, Any]) -> dict[str, Any]:
+            source = str(args.get("source", "both"))
+            if source not in ("monitor", "window", "both"):
+                raise ValueError("source must be 'monitor', 'window', or 'both'")
+            res = await watcher.start(source)
+            _notify("screen")
+            return res
+
+        async def _verify_start_watch(_args: dict[str, Any], _res: dict[str, Any]) -> bool:
+            return bool(watcher.active)
+
+        registry.register(
+            Capability(
+                name="start_screen_watch",
+                description="Start opt-in real-time screen or window watching via the desktop share picker so Autum can see your screen live until you stop it.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "source": {"type": "string", "description": "What to share: 'monitor', 'window', or 'both' (default)"},
+                    },
+                    "additionalProperties": False,
+                },
+                output_schema={"type": "object", "required": ["active"]},
+                permission_level=PermissionLevel.REVERSIBLE,
+                timeout_s=65.0,
+                observed_output=True,
+                execute=_start_watch,
+                verify=_verify_start_watch,
+                target_summary=lambda _: "live screen sharing",
+            )
+        )
+        registered.append("start_screen_watch")
+
+        async def _look_at_screen(args: dict[str, Any]) -> dict[str, Any]:
+            if context.vision is None:
+                raise RuntimeError("local vision analyzer is not configured")
+            frame = watcher.latest_frame()
+            question = str(args.get("question") or "Describe what is currently visible on the screen concisely.")
+            observation = await context.vision(frame, "image/jpeg", question)
+            return {
+                "source": "screen",
+                "frame_bytes": len(frame),
+                "frame_age_s": round(watcher.frame_age_s or 0.0, 2),
+                "observation": observation,
+            }
+
+        async def _verify_look(_args: dict[str, Any], res: dict[str, Any]) -> bool:
+            return bool(res.get("observation")) and int(res.get("frame_bytes", 0)) > 0
+
+        registry.register(
+            Capability(
+                name="look_at_screen",
+                description="Inspect the latest live frame from active screen watching (call start_screen_watch first if not watching).",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string", "minLength": 1, "maxLength": 400, "description": "What to look for on the screen"},
+                    },
+                    "additionalProperties": False,
+                },
+                output_schema={"type": "object", "required": ["source", "frame_bytes", "observation"]},
+                permission_level=PermissionLevel.READ_ONLY,
+                timeout_s=60.0,
+                observed_output=True,
+                execute=_look_at_screen,
+                verify=_verify_look,
+                target_summary=lambda _: "live screen frame",
+            )
+        )
+        registered.append("look_at_screen")
+
+        async def _stop_watch(_args: dict[str, Any]) -> dict[str, Any]:
+            res = await watcher.stop()
+            _notify("none")
+            return res
+
+        async def _verify_stop_watch(_args: dict[str, Any], _res: dict[str, Any]) -> bool:
+            return not bool(watcher.active)
+
+        registry.register(
+            Capability(
+                name="stop_screen_watch",
+                description="Stop live screen watching immediately and close the screen-sharing session.",
+                input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                output_schema={"type": "object", "required": ["active"]},
+                permission_level=PermissionLevel.REVERSIBLE,
+                observed_output=True,
+                execute=_stop_watch,
+                verify=_verify_stop_watch,
+                target_summary=lambda _: "stop live screen sharing",
+            )
+        )
+        registered.append("stop_screen_watch")
+
+        # 6. Hands: KDE KWin window control (list, focus, move/tile/desktop, state, close)
+        wm = self.window_controller
+        if wm is not None and wm.is_available():
+            async def _list_windows(_args: dict[str, Any]) -> dict[str, Any]:
+                wins = await wm.list_windows(context.excluded_windows)
+                return {"windows": wins, "count": len(wins)}
+
+            async def _verify_list_windows(_args: dict[str, Any], res: dict[str, Any]) -> bool:
+                return isinstance(res.get("windows"), list)
+
+            registry.register(
+                Capability(
+                    name="list_windows",
+                    description="List currently open desktop application windows with their app name, title, geometry, and virtual desktop.",
+                    input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                    output_schema={"type": "object", "required": ["windows", "count"]},
+                    permission_level=PermissionLevel.READ_ONLY,
+                    observed_output=True,
+                    execute=_list_windows,
+                    verify=_verify_list_windows,
+                    target_summary=lambda _: "open desktop windows",
+                )
+            )
+            registered.append("list_windows")
+
+            async def _focus_window(args: dict[str, Any]) -> dict[str, Any]:
+                return await wm.focus_window(str(args["window"]), context.excluded_windows)
+
+            async def _verify_focus(_args: dict[str, Any], res: dict[str, Any]) -> bool:
+                return bool(res.get("id")) and not bool(res.get("minimized"))
+
+            registry.register(
+                Capability(
+                    name="focus_window",
+                    description="Bring an open application window to the front and focus it by app name, title, or ID.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "window": {"type": "string", "minLength": 1, "maxLength": 120, "description": "App name, window title substring, or window ID"},
+                        },
+                        "required": ["window"],
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["id", "title", "app"]},
+                    permission_level=PermissionLevel.REVERSIBLE,
+                    observed_output=True,
+                    execute=_focus_window,
+                    verify=_verify_focus,
+                    target_summary=lambda a: f"focus window '{a['window']}'",
+                )
+            )
+            registered.append("focus_window")
+
+            async def _move_window(args: dict[str, Any]) -> dict[str, Any]:
+                return await wm.move_window(
+                    str(args["window"]),
+                    position=args.get("position"),
+                    x=args.get("x"),
+                    y=args.get("y"),
+                    width=args.get("width"),
+                    height=args.get("height"),
+                    desktop=args.get("desktop"),
+                    excluded=context.excluded_windows,
+                )
+
+            async def _verify_move(args: dict[str, Any], res: dict[str, Any]) -> bool:
+                if not res.get("id"):
+                    return False
+                if args.get("desktop") is not None and res.get("desktop") not in (0, int(args["desktop"])):
+                    return False
+                return True
+
+            registry.register(
+                Capability(
+                    name="move_window",
+                    description=(
+                        "Move, resize, snap/tile (left, right, top, bottom, center, top_left, top_right, "
+                        "bottom_left, bottom_right), or send an open window to another virtual desktop."
+                    ),
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "window": {"type": "string", "minLength": 1, "maxLength": 120, "description": "App name, window title substring, or window ID"},
+                            "position": {"type": "string", "description": f"Snap preset: {', '.join(sorted(SNAP_POSITIONS))}"},
+                            "x": {"type": "integer", "minimum": -4096, "maximum": 16384},
+                            "y": {"type": "integer", "minimum": -4096, "maximum": 16384},
+                            "width": {"type": "integer", "minimum": 100, "maximum": 8192},
+                            "height": {"type": "integer", "minimum": 100, "maximum": 8192},
+                            "desktop": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Target virtual desktop number (1-based)"},
+                        },
+                        "required": ["window"],
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["id", "x", "y", "width", "height"]},
+                    permission_level=PermissionLevel.REVERSIBLE,
+                    observed_output=True,
+                    execute=_move_window,
+                    verify=_verify_move,
+                    target_summary=lambda a: f"move window '{a['window']}'",
+                )
+            )
+            registered.append("move_window")
+
+            async def _window_state(args: dict[str, Any]) -> dict[str, Any]:
+                return await wm.set_window_state(str(args["window"]), str(args["action"]), context.excluded_windows)
+
+            async def _verify_state(args: dict[str, Any], res: dict[str, Any]) -> bool:
+                if args["action"] == "minimize":
+                    return bool(res.get("minimized"))
+                return bool(res.get("id")) and not bool(res.get("minimized"))
+
+            registry.register(
+                Capability(
+                    name="window_state",
+                    description="Minimize, maximize, or restore an open application window.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "window": {"type": "string", "minLength": 1, "maxLength": 120, "description": "App name, window title substring, or window ID"},
+                            "action": {"type": "string", "description": "One of: minimize, maximize, restore"},
+                        },
+                        "required": ["window", "action"],
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["id", "action"]},
+                    permission_level=PermissionLevel.REVERSIBLE,
+                    observed_output=True,
+                    execute=_window_state,
+                    verify=_verify_state,
+                    target_summary=lambda a: f"{a['action']} window '{a['window']}'",
+                )
+            )
+            registered.append("window_state")
+
+            async def _close_window(args: dict[str, Any]) -> dict[str, Any]:
+                return await wm.close_window(str(args["window"]), context.excluded_windows)
+
+            async def _verify_close(_args: dict[str, Any], res: dict[str, Any]) -> bool:
+                await asyncio.sleep(0.15)
+                remaining = await wm.list_windows(context.excluded_windows)
+                return all(w["id"] != res.get("id") for w in remaining)
+
+            registry.register(
+                Capability(
+                    name="close_window",
+                    description="Close an open application window (irreversible: may lose unsaved work; always requires explicit user approval).",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "window": {"type": "string", "minLength": 1, "maxLength": 120, "description": "App name, window title substring, or window ID"},
+                        },
+                        "required": ["window"],
+                        "additionalProperties": False,
+                    },
+                    output_schema={"type": "object", "required": ["id", "closed"]},
+                    permission_level=PermissionLevel.IRREVERSIBLE,
+                    cancellable=False,
+                    observed_output=True,
+                    execute=_close_window,
+                    verify=_verify_close,
+                    target_summary=lambda a: f"close window '{a['window']}'",
+                )
+            )
+            registered.append("close_window")
 
         return registered

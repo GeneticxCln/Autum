@@ -86,3 +86,14 @@ class IntegrationManager:
             self.loaded[name] = list(cap_names)
             active.append(name)
         return active
+
+    async def shutdown(self) -> None:
+        """Cleanly stop any loaded integrations that hold active resources."""
+        for name in list(self.loaded):
+            integration = self._integrations.get(name)
+            stop_fn = getattr(integration, "shutdown", None)
+            if callable(stop_fn):
+                try:
+                    await stop_fn()
+                except Exception as exc:
+                    log.warning("integration %r shutdown error: %s", name, exc)

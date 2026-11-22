@@ -53,10 +53,10 @@ Autum speaks interrupts her immediately.
   `~/.local/share/autum/memory.json` with provenance tracking and secret
   exclusion. Conversations are not saved by default, and raw WAV audio is
   released after every turn.
-- **Replaceable Linux desktop integration (`linux_desktop`):** `system_info`,
-  scoped `list_directory`, interactive user-selected `inspect_selected_window`
-  (via XDG Screenshot portal, blocking password-manager windows and deleting
-  temporary captures immediately), and `open_application`.
+- **Replaceable Linux desktop integration (`linux_desktop`):**
+  - **Info & files:** `system_info`, scoped `list_directory` (`allowed_read_dirs`).
+  - **Eyes (opt-in live screen vision):** `start_screen_watch` (one-time KDE ScreenCast share picker; keeps a single downscaled JPEG in RAM while the cloud's cyan-teal halo stays lit), `look_at_screen` (instant local vision on the latest live frame), `stop_screen_watch`, and one-shot `inspect_selected_window`.
+  - **Hands (KDE KWin window control & apps):** `open_application`, `list_windows`, `focus_window`, `move_window` (snap/tile left/right/top/bottom/center/corners, coordinates, or move to another virtual desktop), `window_state` (minimize/maximize/restore), and `close_window` *(irreversible — requires approval)*. Password managers and wallets are excluded.
 - **Approvals & audit:** irreversible actions (`delete_note`, `forget_memory`)
   always require explicit user approval (single-use, timed, anti-spoofed).
   Actions are recorded in a redacted audit log at

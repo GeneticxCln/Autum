@@ -902,7 +902,11 @@ integration (`src/autum/integrations/linux_desktop.py`: `system_info`,
 scoped `list_directory` enforcing `allowed_read_dirs` and secret exclusion,
 interactive user-selected `inspect_selected_window` via the XDG Desktop
 Screenshot portal with excluded-window blocking and immediate temp-file
-deletion, and `open_application` via `.desktop` discovery blocking shells).
+deletion, opt-in live `start_screen_watch`/`look_at_screen`/`stop_screen_watch`
+via XDG `ScreenCast` + PipeWire + GStreamer RAM frame buffer (`screen_watch.py`),
+KDE KWin Wayland window control (`list_windows`, `focus_window`, `move_window`,
+`window_state`, and irreversible `close_window` in `kwin_windows.py`), and
+`open_application` via `.desktop` discovery blocking shells).
 All integration outputs carry `Provenance.OBSERVED` (§5.1) and the core
 runtime stays decoupled and usable when integrations are disabled or
 unavailable. Verified with `tests/test_integrations.py` (132 passed, 0

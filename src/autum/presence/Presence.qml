@@ -36,6 +36,7 @@ Window {
     readonly property bool speaking: st === "speaking"
     readonly property bool micOpen: presence.connected && presence.microphone === "open"
     readonly property bool muted: presence.connected && presence.microphone === "muted"
+    readonly property bool observing: presence.connected && presence.observation !== "none"
 
     // Muted, low-glare colours per state.
     readonly property var stateColors: ({
@@ -53,6 +54,7 @@ Window {
     property real gather: hearing ? 0.86 : st === "interrupted" ? 0.8 : 1.0
     property real brightness: st === "offline" ? 0.45 : hearing || speaking ? 1.0 : 0.82
     property real warmth: micOpen ? 0.55 : 0.0
+    property real observeGlow: observing ? 0.6 : 0.0
     property real gap: muted ? 1.0 : 0.0
     Behavior on loose { NumberAnimation { duration: 600; easing.type: Easing.InOutQuad } }
     Behavior on spinSpeed { NumberAnimation { duration: 800; easing.type: Easing.InOutQuad } }
@@ -60,6 +62,7 @@ Window {
     Behavior on gather { NumberAnimation { duration: 350; easing.type: Easing.OutBack } }
     Behavior on brightness { NumberAnimation { duration: 400 } }
     Behavior on warmth { NumberAnimation { duration: 250 } }
+    Behavior on observeGlow { NumberAnimation { duration: 300 } }
     Behavior on gap { NumberAnimation { duration: 400 } }
 
     property real voice: presence.level
@@ -184,6 +187,27 @@ Window {
                 GradientStop { position: 1.0; color: Qt.rgba(0.91, 0.64, 0.48, 0.0) }
             }
             PathAngleArc { centerX: win.size * 0.65; centerY: win.size * 0.65; radiusX: win.size * 0.65; radiusY: win.size * 0.65; startAngle: 0; sweepAngle: 360 }
+        }
+    }
+
+    // Observation active (§3.2 / §5.4): a cool cyan-teal outer edge ring while
+    // observing a screenshot, window, image, or document; invisible otherwise.
+    Shape {
+        anchors.centerIn: parent
+        width: win.size * 1.38; height: width
+        preferredRendererType: Shape.CurveRenderer
+        opacity: win.observeGlow
+        ShapePath {
+            strokeColor: "transparent"
+            fillGradient: RadialGradient {
+                centerX: win.size * 0.69; centerY: centerX; centerRadius: centerX
+                focalX: centerX; focalY: centerY
+                GradientStop { position: 0.0; color: Qt.rgba(0.45, 0.85, 0.92, 0.0) }
+                GradientStop { position: 0.68; color: Qt.rgba(0.45, 0.85, 0.92, 0.0) }
+                GradientStop { position: 0.82; color: Qt.rgba(0.45, 0.85, 0.92, 0.34) }
+                GradientStop { position: 1.0; color: Qt.rgba(0.45, 0.85, 0.92, 0.0) }
+            }
+            PathAngleArc { centerX: win.size * 0.69; centerY: win.size * 0.69; radiusX: win.size * 0.69; radiusY: win.size * 0.69; startAngle: 0; sweepAngle: 360 }
         }
     }
 

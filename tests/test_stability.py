@@ -149,3 +149,54 @@ def test_bubble_supervisor_restarts_after_crash_and_stops_cleanly():
     assert log.of("runtime.component_error")[0].payload["component"] == "presence"
     assert log.of("runtime.component_recovered")[0].payload == {"component": "presence"}
     assert spawned[1].returncode == 0
+
+
+def test_core_operates_with_external_network_blocked(tmp_path, monkeypatch):
+    """AUT-01 / §5.5: core runtime, tools, config, and transport make zero external network calls."""
+    import socket as sockmod
+
+    from autum.capabilities import build_default_registry
+    from autum.config import Config
+    from autum.tools import ToolCall
+    from autum.transport import EventServer
+
+    real_connect = sockmod.socket.connect
+
+    def guarded_connect(self, address):
+        if self.family in (sockmod.AF_INET, sockmod.AF_INET6):
+            host = address[0] if isinstance(address, tuple) else str(address)
+            if host not in ("127.0.0.1", "::1", "localhost"):
+                raise PermissionError(f"external network blocked: {address!r}")
+        return real_connect(self, address)
+
+    monkeypatch.setattr(sockmod.socket, "connect", guarded_connect)
+
+    async def scenario():
+        cfg = Config.load(tmp_path / "missing.toml")
+        bus = EventBus("offline")
+        registry, timers, notes = build_default_registry(tmp_path / "data")
+        server = EventServer(bus, lambda c: asyncio.sleep(0), path=tmp_path / "events.sock")
+        await server.start()
+
+        class LocalToolModel:
+            def __init__(self) -> None:
+                self.step = 0
+
+            async def stream(self, messages, *, operation_id: str, tools=None):
+                self.step += 1
+                if self.step == 1:
+                    yield ToolCall("c1", "create_note", {"title": "offline", "content": "works locally"})
+                else:
+                    yield "Saved offline note."
+
+        runtime = Runtime(
+            bus, LocalToolModel(), MockSpeech(bus, synth_s=0.0, per_char_s=0.0),
+            tools=registry, max_history=cfg.max_history, max_context_chars=cfg.max_context_chars,
+        )
+        runtime.submit_text("Save an offline note.")
+        await runtime.wait_until_settled()
+        timers.stop_all()
+        await server.close()
+        return notes.read("offline")["content"]
+
+    assert run(scenario()) == "works locally"

@@ -111,6 +111,10 @@ class EventServer:
         except OSError:
             return False
         writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
         return True
 
     def _publish(self, event: Event) -> None:
@@ -154,6 +158,10 @@ class EventServer:
             self._clients.discard(queue)
             sender.cancel()
             writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
 
     async def _send(self, queue: asyncio.Queue, writer: asyncio.StreamWriter) -> None:
         try:

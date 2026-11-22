@@ -486,7 +486,7 @@ class Runtime:
                         tool_calls.append(item)
                         continue
                     parts.append(item)
-                    if not tool_schemas:
+                    if not tool_calls:
                         self.bus.emit(
                             "conversation.response_chunk",
                             {"text": item},
@@ -535,17 +535,6 @@ class Runtime:
                             }
                         )
                     continue
-                if tool_schemas:
-                    for part in parts:
-                        self.bus.emit(
-                            "conversation.response_chunk",
-                            {"text": part},
-                            provenance=Provenance.MODEL,
-                            turn_id=turn_id,
-                            operation_id=op_id,
-                            cause=started,
-                        )
-                        self._speak(chunker.feed(part), op_id, turn_id)
                 self._speak(chunker.flush(), op_id, turn_id)
                 final_text = "".join(parts)
                 break

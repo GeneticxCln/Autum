@@ -54,6 +54,7 @@ def test_client_gets_a_snapshot_then_live_events_in_order(tmp_path):
         mode_dir = stat.S_IMODE(os.stat(server.path.parent).st_mode)
         mode_sock = stat.S_IMODE(os.stat(server.path).st_mode)
         writer.close()
+        await writer.wait_closed()
         await server.close()
         return snapshot, live, mode_dir, mode_sock, server.path.exists()
 
@@ -79,6 +80,7 @@ def test_valid_commands_reach_the_handler_and_invalid_ones_do_not(tmp_path):
         await writer.drain()
         await asyncio.sleep(0.05)
         writer.close()
+        await writer.wait_closed()
         await server.close()
         return got
 
@@ -98,6 +100,7 @@ def test_a_client_that_stops_reading_is_dropped_not_buffered_forever(tmp_path):
         await asyncio.sleep(0.1)
         count = server.client_count
         writer.close()
+        await writer.wait_closed()
         await server.close()
         return count
 

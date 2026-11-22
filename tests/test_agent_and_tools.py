@@ -297,3 +297,29 @@ def test_affirmative_parser_only_accepts_clear_yes():
         assert is_affirmative(yes), yes
     for no in ("", "no", "maybe", "yes but don't delete", "I guess so", "wait"):
         assert not is_affirmative(no), no
+
+
+def test_streaming_speech_starts_before_inference_finishes_even_with_tools(tmp_path):
+    """Regression guard (AUT-03): tools registered must not delay first sentence playback."""
+
+    async def scenario():
+        bus = EventBus("s")
+        registry, timers, _ = build_default_registry(tmp_path)
+        speech = MockSpeech(bus, synth_s=0.0, per_char_s=0.0)
+        first_spoken_before_done = False
+
+        class SlowSecondSentence:
+            async def stream(self, messages, *, operation_id: str, tools=None):
+                nonlocal first_spoken_before_done
+                yield "First sentence is ready. "
+                await asyncio.sleep(0.05)
+                first_spoken_before_done = len(speech.audible) >= 1
+                yield "Second sentence arrives later."
+
+        runtime = Runtime(bus, SlowSecondSentence(), speech, tools=registry)
+        runtime.submit_text("Say two sentences.")
+        await runtime.wait_until_settled()
+        timers.stop_all()
+        return first_spoken_before_done
+
+    assert run(scenario()) is True

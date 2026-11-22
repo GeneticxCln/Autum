@@ -591,6 +591,17 @@ A particle sphere, orb, or another non-human visual form is acceptable
 for the first release. The initial visual must be polished and
 responsive rather than a placeholder that blocks the voice experience.
 
+Components (approved 2026-11-22; versions and licences verified on the
+reference machine):
+
+| Component | Role | Version | Licence |
+|---|---|---|---|
+| PySide6 | Python bindings for Qt; runs the bubble | 6.12.0 (system package) | LGPL-3.0-only or GPL-3.0-only (also sold commercially) |
+| Qt Quick (`qt6-declarative`) | Draws the particle cloud in QML | 6.12.0 | LGPL-3.0-only or GPL-3.0-only (also sold commercially) |
+| `layer-shell-qt` | Pins the bubble on Wayland (`wlr-layer-shell`) across all virtual desktops and windows without taskbar entries | 6.8.3 (system package) | LGPL-2.0-or-later or GPL-2.0-or-later |
+| libX11 (through Python's ctypes) | X11 fallback: keeps the bubble off the taskbar and on all desktops | 1.8.14 (system package) | MIT and X11 |
+| PyGObject (Gio, GLib) | Hold-to-talk key through the desktop's GlobalShortcuts portal (WP2) | 3.58.1 (system package) | LGPL-2.1-or-later |
+
 **Acceptance:** Every displayed state corresponds to a real runtime
 state. State changes meet the measured responsiveness target.
 Audio-reactive behaviour follows actual output audio.
@@ -821,7 +832,19 @@ AUT-11 has at least one acceptance test.
 **M2 status (2026-11-22):** at the user's request, M2 is built on pipeline D
 (LFM3-Omni hears the user and answers in its own voice) as a provisional
 choice, before the recorded-set results. ADR 0002 confirms it or names the
-pipeline that replaces it. Push-to-talk is a key in Autum's terminal for now.
+pipeline that replaces it. Autum runs in the background with no terminal
+program. Push-to-talk: hold the desktop key (KDE's GlobalShortcuts portal;
+the user confirms the key once) or hold the bubble.
+
+**M4 status (2026-11-22):** the visual presence is a particle cloud in
+the bottom-right screen corner and nothing else (user's choice of design):
+its own process, pinned across all virtual desktops and windows via Wayland
+`wlr-layer-shell` (with an X11 fallback), kept off the taskbar, fed by the
+event socket. The microphone indicator is part of the cloud: a warm edge glow
+while open, grey with a gap while muted. Steady CPU use about 15% of one
+core. On the reference display
+a state change reaches the screen in 4.6 ms median and 8.7 ms at worst
+(objective: 100 ms or less).
 
 M0 and M1 run in parallel. M0's skeleton is the codebase M2 builds on;
 M1's benchmark harness is the first running voice pipeline. Visual work

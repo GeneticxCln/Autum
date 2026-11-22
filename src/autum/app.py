@@ -1,29 +1,32 @@
-"""Talk to Autum in a terminal (M2, provisional pipeline D).
+"""Run Autum in the background: a bubble in the screen corner is her only face.
 
     PYTHONPATH=src python3 -m autum
 
-Space starts talking and Space again ends your turn; pressing Space while
-Autum speaks interrupts it. Everything runs locally: Ollama on localhost
-and PipeWire for audio. Nothing is recorded to disk.
+Hold the talk key (KDE asks you to confirm it the first time) or hold the
+bubble, speak, and let go. Pressing it while Autum speaks interrupts her.
+Everything runs locally: Ollama on localhost and PipeWire for audio.
+Nothing is recorded to disk. Stop Autum with Ctrl+C or by ending the process.
 """
 
 from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import importlib.util
 import os
 import shutil
+import signal
 import sys
-import termios
-import tty
 
 import httpx
 
 from autum.audio import MIC_HELP, MuteMonitor, SpeechPlayer, VoiceInput, check_microphone
 from autum.bus import EventBus
-from autum.events import Event, new_id
+from autum.events import new_id
+from autum.hotkey import PushToTalkKey
 from autum.ollama import OmniChat, OmniSpeech, OmniTranscriber, check_ready, preload
 from autum.runtime import Mode, Runtime
+from autum.transport import EventServer
 
 PERSONA = (
     "You are Autum, a friendly voice assistant running locally on the user's computer. "
@@ -32,7 +35,9 @@ PERSONA = (
     "screen or take actions yet; if asked to, say so briefly."
 )
 
-KEYS = "Space: talk, then Space when done (also interrupts Autum)   s: stop Autum   t: type   q: quit"
+
+def log(message: str) -> None:
+    print(f"autum: {message}", file=sys.stderr, flush=True)
 
 
 def system_prompt() -> str:
@@ -44,116 +49,102 @@ def system_prompt() -> str:
     )
 
 
-class Screen:
-    """Shows the conversation and Autum's status from runtime events."""
+def command_handler(runtime: Runtime, voice: VoiceInput):
+    """User actions from the bubble (validated by the transport)."""
 
-    def __init__(self, bus: EventBus) -> None:
-        self.replying = False
-        bus.subscribe(self.on_event)
-
-    def line(self, text: str) -> None:
-        if self.replying:
-            print()
-            self.replying = False
-        print(text, flush=True)
-
-    def on_event(self, e: Event) -> None:
-        match e.type:
-            case "audio.speech_started":
-                if self.replying:
-                    print(" [interrupted]")
-                    self.replying = False
-                self.line("● Listening… press Space when you're done.")
-            case "conversation.response_started":
-                self.line("")
-                print("Autum: ", end="", flush=True)
-                self.replying = True
-            case "conversation.response_chunk":
-                print(e.payload["text"], end="", flush=True)
-            case "conversation.response_finished":
-                self.line("")
-            case "operation.cancelled" if self.replying:
-                print(" [stopped]", flush=True)
-                self.replying = False
-            case "audio.transcribed" if e.payload["final"] and e.payload["text"]:
-                self.line(f"  (you said: {e.payload['text']})")
-            case "runtime.component_error":
-                self.line(f"! {e.payload['component']}: {e.payload['error']}")
-            case "audio.mute_changed":
-                self.line("Microphone muted: unmute it to talk." if e.payload["muted"] else "Microphone on.")
-
-
-async def keyboard(runtime: Runtime, voice: VoiceInput, screen: Screen) -> None:
-    loop = asyncio.get_running_loop()
-    fd = sys.stdin.fileno()
-    saved = termios.tcgetattr(fd)
-    keys: asyncio.Queue[bytes] = asyncio.Queue()
-
-    def listen() -> None:
-        tty.setcbreak(fd)
-        loop.add_reader(fd, lambda: keys.put_nowait(os.read(fd, 1)))
-
-    def unlisten() -> None:
-        loop.remove_reader(fd)
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-
-    listen()
-    try:
-        while True:
-            key = (await keys.get()).lower()
-            if key == b" ":
-                if voice.capturing:
-                    await voice.finish()
-                elif await voice.start() is None:
-                    screen.line("Microphone is muted: unmute it to talk.")
-            elif key == b"s":
+    async def handle(command: dict) -> None:
+        match command["command"]:
+            case "talk_start":
+                await voice.start()
+            case "talk_finish":
+                await voice.finish()
+            case "stop":
                 await voice.abort()
                 await runtime.cancel()
-            elif key == b"t":
+            case "text":
                 await voice.abort()
-                unlisten()
-                try:
-                    text = await loop.run_in_executor(None, input, "You (typing): ")
-                finally:
-                    listen()
-                runtime.submit_text(text)
-            elif key in (b"q", b"\x04"):
-                return
-    finally:
-        unlisten()
+                runtime.submit_text(command["text"])
+
+    return handle
+
+
+async def start_bubble() -> asyncio.subprocess.Process | None:
+    """The bubble runs as its own process; Autum keeps working without it."""
+    if importlib.util.find_spec("PySide6") is None:
+        log("the bubble needs PySide6, which is not installed")
+        return None
+    env = dict(os.environ)
+    from autum.presence import has_layer_shell
+
+    if env.get("WAYLAND_DISPLAY") and has_layer_shell():
+        # Native Wayland with wlr-layer-shell pins the cloud to the corner
+        # across all virtual desktops and windows without taskbar entries.
+        env["QT_QPA_PLATFORM"] = "wayland"
+    elif env.get("DISPLAY"):
+        # Fallback for X11 or Wayland compositors without layer-shell-qt.
+        env["QT_QPA_PLATFORM"] = "xcb"
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "autum.presence",
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, env=env,
+    )
+    try:
+        await asyncio.wait_for(proc.wait(), 1.5)
+        log("the bubble could not start")
+        return None
+    except asyncio.TimeoutError:
+        return proc  # still running: it started
 
 
 async def main() -> int:
     missing = [tool for tool in ("pw-record", "pw-play", "wpctl") if not shutil.which(tool)]
     if missing:
-        print(f"Missing PipeWire tools: {', '.join(missing)}")
+        log(f"missing PipeWire tools: {', '.join(missing)}")
         return 1
-    if not sys.stdin.isatty():
-        print("Run Autum in a terminal.")
-        return 1
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop.set)
+
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=3.0)) as client:
         problem = await check_ready(client)
         if problem:
-            print(problem)
+            log(problem)
             return 1
-        print("Checking the microphone…")
         if not await check_microphone():
-            print(MIC_HELP)
+            log(MIC_HELP)
             return 1
-        print("Loading the voice model…")
         await preload(client)
 
         bus = EventBus(new_id())
-        screen = Screen(bus)
+        bus.subscribe(
+            lambda e: log(f"{e.payload['component']}: {e.payload['error']}"),
+            {"runtime.component_error"},
+        )
         speech = SpeechPlayer(bus, OmniSpeech(client))
         runtime = Runtime(bus, OmniChat(client), speech, mode=Mode.PUSH_TO_TALK, system_prompt=system_prompt)
         voice = VoiceInput(bus, runtime, OmniTranscriber(client))
-        mute = asyncio.create_task(MuteMonitor(bus).run())
-        print("\nAutum is ready (provisional pipeline D: LFM3-Omni hears you and answers in its own voice).")
-        print(KEYS + "\n")
+        server = EventServer(bus, command_handler(runtime, voice))
         try:
-            await keyboard(runtime, voice, screen)
+            await server.start()
+        except RuntimeError as exc:
+            log(str(exc))
+            return 1
+        mute = asyncio.create_task(MuteMonitor(bus).run())
+        bubble = await start_bubble()
+        PushToTalkKey(
+            loop,
+            on_press=lambda: loop.create_task(voice.start()),
+            on_release=lambda: loop.create_task(voice.finish()),
+            on_status=log,
+        ).start()
+        log("running (provisional pipeline D). Stop with Ctrl+C.")
+        try:
+            await stop.wait()
         finally:
+            if bubble is not None and bubble.returncode is None:
+                bubble.terminate()
+                await bubble.wait()
+            await server.close()
             mute.cancel()
             await voice.abort()
             await runtime.cancel()
@@ -162,5 +153,4 @@ async def main() -> int:
                 await asyncio.wait_for(runtime.wait_until_settled(), 3)
             except asyncio.TimeoutError:
                 pass
-    print("Bye.")
     return 0

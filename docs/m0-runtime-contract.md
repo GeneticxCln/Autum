@@ -178,8 +178,29 @@ cannot see; its own light is the indicator.
 ## 8. Transport
 
 In-process components use the bus directly. Out-of-process consumers,
-starting with the visual presence in M4, connect to a Unix domain
-socket at `$XDG_RUNTIME_DIR/autum/events.sock` (directory mode 0700),
-and receive events as JSON Lines. Commands from those clients (text
-input, cancel, approvals) use a separate, smaller command schema that is
-validated before use. See ADR 0001.
+starting with the visual presence, connect to a Unix domain socket at
+`$XDG_RUNTIME_DIR/autum/events.sock` (`src/autum/transport.py`). See
+ADR 0001.
+
+- **Access:** the directory is mode 0700 and the socket 0600, so only the
+  user's own account can connect. A second Autum refuses to start while
+  one is listening; a stale socket from a crash is replaced.
+- **Events out:** every event as one JSON line. A new client first
+  receives the latest `audio.mute_changed` and `runtime.state_changed`,
+  in the order they happened, so it shows the right state at once.
+- **Bounded memory:** each client has a 512-line queue. A client that
+  falls that far behind is disconnected; it reconnects and gets a fresh
+  snapshot.
+- **Commands in:** one JSON object per line, validated before use; any
+  other input is ignored. Lines over 8 KiB drop the client.
+
+```text
+{"command": "talk_start"}              start a push-to-talk turn
+{"command": "talk_finish"}             end it
+{"command": "stop"}                    drop the current utterance and cancel the response
+{"command": "text", "text": "..."}     typed message, 1-2000 characters
+```
+
+Commands are user actions in a window the user controls, so they carry
+the same authority as keys in Autum's terminal. Approval commands will be
+added with WP6 and follow §5.2 of the plan.

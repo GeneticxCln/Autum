@@ -222,6 +222,9 @@ class FaceCloudItem(QQuickPaintedItem):
     hearingChanged = Signal()
     busyChanged = Signal()
     observingChanged = Signal()
+    lookXChanged = Signal()
+    lookYChanged = Signal()
+    hoveringChanged = Signal()
 
     def __init__(self, parent: Any = None) -> None:
         super().__init__(parent)
@@ -249,6 +252,18 @@ class FaceCloudItem(QQuickPaintedItem):
         self._hearing = False
         self._busy = False
         self._observing = False
+        self._look_x = 0.0
+        self._look_y = 0.0
+        self._hovering = False
+
+        # Smoothly-eased living 3D head pose state (prevents snapping between AI states)
+        self._pose_yaw = 0.0
+        self._pose_pitch = 0.0
+        self._pose_roll = 0.0
+        self._pose_tx = 0.0
+        self._pose_ty = 0.0
+        self._pose_scale = 1.0
+        self._last_phase: float | None = None
 
     # --- QML properties ------------------------------------------------------
 
@@ -438,6 +453,39 @@ class FaceCloudItem(QQuickPaintedItem):
 
     observing = Property(bool, _get_observing, _set_observing, notify=observingChanged)
 
+    def _get_look_x(self) -> float:
+        return self._look_x
+
+    def _set_look_x(self, value: float) -> None:
+        v = float(np.clip(value, -1.0, 1.0))
+        if v != self._look_x:
+            self._look_x = v
+            self.lookXChanged.emit()
+
+    lookX = Property(float, _get_look_x, _set_look_x, notify=lookXChanged)
+
+    def _get_look_y(self) -> float:
+        return self._look_y
+
+    def _set_look_y(self, value: float) -> None:
+        v = float(np.clip(value, -1.0, 1.0))
+        if v != self._look_y:
+            self._look_y = v
+            self.lookYChanged.emit()
+
+    lookY = Property(float, _get_look_y, _set_look_y, notify=lookYChanged)
+
+    def _get_hovering(self) -> bool:
+        return self._hovering
+
+    def _set_hovering(self, value: bool) -> None:
+        v = bool(value)
+        if v != self._hovering:
+            self._hovering = v
+            self.hoveringChanged.emit()
+
+    hovering = Property(bool, _get_hovering, _set_hovering, notify=hoveringChanged)
+
     @Slot()
     def redraw(self) -> None:
         self.update()
@@ -561,91 +609,177 @@ class FaceCloudItem(QQuickPaintedItem):
         mw = (0.14 + 0.28 * mseed[:, 0]) * np.clip((mr_proj - 0.36) / 0.42, 0.08, 1.0)
         mist_buf = _splat_soft(mpx, mpy, mw, pw, ph)
 
-        # Attenuate back-hemisphere stardust & mist behind the solid 3D head
-        occ = 1.0 - 0.88 * m["head_occ"]
-        rim_pulse = 1.0 + 0.06 * math.sin(phase * 1.15) + 0.28 * voice + (0.14 if self._hearing else 0.0)
+        # Attenuate back-hemisphere stardust & mist behind the moving 3D head
+        # Compute target 3D head pose driven by AI state + pointer proximity
+        if self._last_phase is None or abs(phase - self._last_phase) > 0.5:
+            dt_pose = None  # snap cleanly on first frame or explicit time jump
+        else:
+            dt_pose = max(0.016, min(0.25, abs(phase - self._last_phase)))
+        self._last_phase = phase
+
+        if self._speaking:
+            v_act = 0.45 + 0.75 * voice
+            t_yaw = 0.14 * math.sin(phase * 1.35) * v_act
+            t_pitch = -0.03 + 0.10 * voice * math.sin(phase * 4.6) + 0.04 * math.sin(phase * 1.5)
+            t_roll = 0.085 * math.sin(phase * 1.05 + 0.6) * v_act
+            t_tx = 0.028 * math.sin(phase * 1.15)
+            t_ty = -0.022 * voice + 0.020 * math.sin(phase * 1.9)
+            t_scale = 1.04 + 0.042 * voice
+        elif self._hearing:
+            t_yaw = 0.055 * math.sin(phase * 0.72) + (0.12 * self._look_x if self._hovering else 0.0)
+            t_pitch = -0.065 + 0.032 * math.sin(phase * 1.15)
+            t_roll = 0.080 * math.sin(phase * 0.48 + 0.5)
+            t_tx = 0.018 * math.sin(phase * 0.62)
+            t_ty = -0.028 + 0.016 * math.sin(phase * 1.25)
+            t_scale = 1.07
+        elif self._busy:
+            t_yaw = 0.26 * math.sin(phase * 0.68) + 0.06 * math.sin(phase * 1.45)
+            t_pitch = -0.13 + 0.065 * math.sin(phase * 0.92)
+            t_roll = 0.125 * math.sin(phase * 0.54 + 0.8)
+            t_tx = 0.052 * math.sin(phase * 0.74)
+            t_ty = -0.036 + 0.032 * math.sin(phase * 1.18)
+            t_scale = 1.015
+        elif self._observing:
+            # Active visual scanning gaze while Eyes are watching the desktop
+            t_yaw = 0.27 * math.sin(phase * 0.92)
+            t_pitch = 0.10 * math.sin(phase * 0.61 + 0.4)
+            t_roll = -0.06 * math.sin(phase * 0.92)
+            t_tx = 0.055 * math.sin(phase * 0.92)
+            t_ty = 0.035 * math.sin(phase * 0.61 + 0.4)
+            t_scale = 1.035
+        elif self._hovering:
+            # Sentient pointer awareness: head glides to look toward your cursor
+            t_yaw = 0.34 * self._look_x
+            t_pitch = 0.22 * self._look_y
+            t_roll = -0.075 * self._look_x
+            t_tx = 0.062 * self._look_x
+            t_ty = 0.050 * self._look_y
+            t_scale = 1.05
+        else:
+            # Alive autonomous idle: floating weightlessly and scanning smoothly inside the orb
+            t_yaw = 0.27 * math.sin(phase * 0.39) + 0.095 * math.sin(phase * 0.89 + 1.3)
+            t_pitch = 0.12 * math.sin(phase * 0.31 + 0.7) + 0.042 * math.sin(phase * 0.77 + 2.1)
+            t_roll = 0.095 * math.sin(phase * 0.35 + 1.6)
+            t_tx = 0.068 * math.sin(phase * 0.43 + 0.4) + 0.022 * math.sin(phase * 0.97)
+            t_ty = 0.056 * math.sin(phase * 0.56) + 0.018 * math.cos(phase * 1.13)
+            t_scale = 1.0 + 0.018 * math.sin(phase * 1.05)
+
+        if dt_pose is None:
+            self._pose_yaw, self._pose_pitch, self._pose_roll = t_yaw, t_pitch, t_roll
+            self._pose_tx, self._pose_ty, self._pose_scale = t_tx, t_ty, t_scale
+        else:
+            k = 1.0 - math.exp(-5.5 * dt_pose)
+            self._pose_yaw += (t_yaw - self._pose_yaw) * k
+            self._pose_pitch += (t_pitch - self._pose_pitch) * k
+            self._pose_roll += (t_roll - self._pose_roll) * k
+            self._pose_tx += (t_tx - self._pose_tx) * k
+            self._pose_ty += (t_ty - self._pose_ty) * k
+            self._pose_scale += (t_scale - self._pose_scale) * k
+
+        yaw = self._pose_yaw
+        pitch = self._pose_pitch
+        roll_h = self._pose_roll
+        head_tx = self._pose_tx
+        head_ty = self._pose_ty
+        head_scale = self._pose_scale
+
+        # Shift head occlusion silhouette dynamically so it tracks the floating head
+        sx_i = int(round((head_tx + 0.18 * math.sin(yaw)) * r_px))
+        sy_i = int(round((head_ty + 0.14 * math.sin(pitch)) * r_px))
+        if sx_i == 0 and sy_i == 0:
+            head_occ_shifted = m["head_occ"]
+        else:
+            head_occ_shifted = np.zeros_like(m["head_occ"])
+            src_y0 = max(0, -sy_i)
+            src_y1 = min(ph, ph - sy_i)
+            dst_y0 = max(0, sy_i)
+            dst_y1 = dst_y0 + (src_y1 - src_y0)
+            src_x0 = max(0, -sx_i)
+            src_x1 = min(pw, pw - sx_i)
+            dst_x0 = max(0, sx_i)
+            dst_x1 = dst_x0 + (src_x1 - src_x0)
+            if src_y1 > src_y0 and src_x1 > src_x0:
+                head_occ_shifted[dst_y0:dst_y1, dst_x0:dst_x1] = m["head_occ"][src_y0:src_y1, src_x0:src_x1]
+
+        occ = 1.0 - 0.88 * head_occ_shifted
+        rim_pulse = 1.0 + 0.08 * math.sin(phase * 1.15) + 0.34 * voice + (0.16 if self._hearing else 0.0)
         rim_lum = m["rim_base"] * rim_pulse
         if gap > 1e-3:
             rim_lum = rim_lum * (1.0 - gap * m["gap_mask"])
 
         env_lum = (rim_lum + 0.72 * shell_back + 0.52 * mist_buf) * occ + 0.88 * shell_front
 
-        # 2. Living, breathing 3D stippled face coalescing out of suspended dust
-        att = 0.32 if self._hearing else 1.0
-        # Multi-harmonic quasi-periodic organic sway (never feels mechanically looped)
-        yaw = (
-            0.088 * math.sin(phase * 0.39)
-            + 0.032 * math.sin(phase * 0.83 + 1.1)
-            + 0.014 * math.sin(phase * 1.41 + 2.4)
-        ) * att
-        pitch = (
-            0.038 * math.sin(phase * 0.29 + 0.7)
-            + 0.016 * math.sin(phase * 0.71 + 2.0)
-            - (0.025 if self._hearing else 0.0)
-        ) * att
-
-        # Organic fluid flow across the face: silky micro-life on sculpted features,
-        # graceful wispy tendrils curling off the ears, crown, and smoky neck.
-        c_f1, s_f1 = math.cos(phase * 0.95), math.sin(phase * 0.95)
-        c_f2, s_f2 = math.cos(phase * 1.55), math.sin(phase * 1.55)
+        # 2. Living, floating, turning 3D stippled face coalescing out of suspended dust
+        c_f1, s_f1 = math.cos(phase * 1.05), math.sin(phase * 1.05)
+        c_f2, s_f2 = math.cos(phase * 1.72), math.sin(phase * 1.72)
         flow_x = (c["f_s1"] * c_f1 + c["f_c1"] * s_f1) * 0.62 + (c["f_c2"] * c_f2 - c["f_s2"] * s_f2) * 0.38
         flow_y = (c["f_c1"] * c_f1 - c["f_s1"] * s_f1) * 0.62 - (c["f_s2"] * c_f2 + c["f_c2"] * s_f2) * 0.38
         flow_z = (c["f_s1"] * c_f2 - c["f_c2"] * s_f1) * 0.50
 
-        wisp_amp = 0.0040 + 0.019 * c["f_edge"]
+        wisp_amp = 0.0046 + 0.022 * c["f_edge"]
         if self._busy:
-            wisp_amp = wisp_amp * (1.15 + 0.35 * c["crown_w"])
+            wisp_amp = wisp_amp * (1.20 + 0.42 * c["crown_w"])
         if voice > 0.005:
-            wisp_amp = wisp_amp + 0.0065 * voice
+            wisp_amp = wisp_amp + 0.0085 * voice
 
         fx0 = c["fx"] + flow_x * wisp_amp
         fy0 = c["fy"] + 0.05 + flow_y * wisp_amp
-        fz0 = c["fz"] - 0.22 + flow_z * wisp_amp
+        fz0 = c["fz"] - 0.18 + flow_z * wisp_amp
 
-        # Speaking jaw/lower-lip articulation + subtle acoustic facial ripple
+        # Speaking jaw/lower-lip articulation + acoustic facial ripple
         if voice > 0.005:
             jw = c["jaw_w"]
             f_ac = c["f_ac_s"] * c_ac - c["f_ac_c"] * s_ac
-            fy0 = fy0 + jw * (0.048 * voice) + f_ac * (0.0045 * voice)
-            fz0 = fz0 - jw * (0.018 * voice) + f_ac * (0.008 * voice)
+            fy0 = fy0 + jw * (0.068 * voice) + f_ac * (0.006 * voice)
+            fz0 = fz0 - jw * (0.024 * voice) + f_ac * (0.011 * voice)
 
+        # Full 3D rotation: Yaw (Y) -> Pitch (X) -> Roll (Z) around head pivot
         cyaw, syaw = math.cos(yaw), math.sin(yaw)
         cpit, spit = math.cos(pitch), math.sin(pitch)
+        crol, srol = math.cos(roll_h), math.sin(roll_h)
+
         rx1 = fx0 * cyaw + fz0 * syaw
         rz1 = -fx0 * syaw + fz0 * cyaw
-        ry2 = fy0 * cpit - rz1 * spit - 0.05
-        rz2 = fy0 * spit + rz1 * cpit + 0.22
+        ry2 = fy0 * cpit - rz1 * spit
+        rz2 = fy0 * spit + rz1 * cpit + 0.18
+        rx3 = rx1 * crol - ry2 * srol
+        ry3 = rx1 * srol + ry2 * crol - 0.05
 
-        # Gentle telephoto perspective + organic breathing
-        breath = gather * (1.0 + 0.012 * math.sin(phase * 1.08) + 0.004 * math.sin(phase * 2.16) + 0.024 * voice)
-        persp = 3.4 / (3.4 - rz2)
-        fpx = cx + r_px * breath * rx1 * persp
-        fpy = cy + r_px * breath * ry2 * persp
+        # Volumetric perspective projection + weightless floating translation inside orb
+        breath = gather * head_scale * (1.0 + 0.012 * math.sin(phase * 1.08) + 0.004 * math.sin(phase * 2.16))
+        persp = 3.0 / (3.0 - rz2)
+        fpx = cx + r_px * (head_tx + breath * rx3 * persp)
+        fpy = cy + r_px * (head_ty + breath * ry3 * persp)
 
-        # Bioluminescent stipple shimmer + subtle idle blink + state cues
-        c_ftw, s_ftw = math.cos(phase * 1.45), math.sin(phase * 1.45)
-        f_shimmer = 0.82 + 0.24 * (0.5 + 0.5 * (c["f_tw_s"] * c_ftw + c["f_tw_c"] * s_ftw))
+        # Bioluminescent AI neural shimmer + natural blink + expressive state lighting
+        c_ftw, s_ftw = math.cos(phase * 1.65), math.sin(phase * 1.65)
+        f_shimmer = 0.80 + 0.28 * (0.5 + 0.5 * (c["f_tw_s"] * c_ftw + c["f_tw_c"] * s_ftw))
         fw = c["flum"] * f_shimmer
 
-        # Soft natural blink every ~5.4 s while idle (paused during attentive states)
+        # Soft natural blink every ~5.2 s while idle (paused during attentive states)
         if not (self._hearing or self._observing or self._speaking):
-            b_t = phase % 5.4
+            b_t = phase % 5.2
             if b_t < 0.18:
                 blink = math.sin(math.pi * (b_t / 0.18))
-                fw = fw * (1.0 - 0.58 * blink * c["eye_w"])
+                fw = fw * (1.0 - 0.62 * blink * c["eye_w"])
 
-        shade = 0.92 + 0.16 * (rz2 - 0.20)
-        if self._hearing or self._observing:
-            eye_boost = (0.30 if self._hearing else 0.0) + (0.36 if self._observing else 0.0)
+        # Dynamic 3D directional lighting reacts as the head turns & tilts
+        shade = 0.88 + 0.22 * (rz2 - 0.18) + 0.12 * (rx3 * math.sin(yaw))
+        if self._hearing or self._observing or self._hovering:
+            eye_boost = (
+                (0.34 if self._hearing else 0.0)
+                + (0.40 if self._observing else 0.0)
+                + (0.20 if self._hovering else 0.0)
+            )
             fw = fw + c["eye_w"] * eye_boost
         if self._busy:
-            c_cr, s_cr = math.cos(phase * 3.8), math.sin(phase * 3.8)
+            c_cr, s_cr = math.cos(phase * 4.2), math.sin(phase * 4.2)
             wave = 0.5 + 0.5 * (s_cr * c["f_cr_c"] - c_cr * c["f_cr_s"])
-            fw = fw + c["crown_w"] * (0.30 * wave)
+            fw = fw + c["crown_w"] * (0.38 * wave)
         if voice > 0.005:
-            fw = fw * (1.0 + 0.16 * voice) + c["jaw_w"] * (0.26 * voice)
+            fw = fw * (1.0 + 0.18 * voice) + c["jaw_w"] * (0.36 * voice)
 
-        face_raw = _splat_bilinear(fpx, fpy, fw * shade * 0.86, pw, ph)
+        face_raw = _splat_bilinear(fpx, fpy, fw * shade * 0.88, pw, ph)
 
         # Fast rational tone curve (crisp sculpting, deep obsidian sockets, 4x faster than exp)
         face_lum = face_raw / (face_raw + 0.58)

@@ -118,11 +118,29 @@ Window {
         hearing: win.hearing
         busy: win.busy
         observing: win.observing
+        lookX: talkArea.lookX
+        lookY: talkArea.lookY
+        hovering: talkArea.hoveringOrb
     }
 
-    // Hold the orb to talk.
+    // Hold the orb to talk; hovering lets the 3D head turn toward your cursor.
     MouseArea {
+        id: talkArea
         anchors.fill: parent
+        hoverEnabled: true
+        property real lookX: 0
+        property real lookY: 0
+        property bool hoveringOrb: false
+        onPositionChanged: (mouse) => {
+            const dx = (mouse.x - width / 2) / win.radius
+            const dy = (mouse.y - height / 2) / win.radius
+            hoveringOrb = Math.sqrt(dx * dx + dy * dy) <= 1.15
+            if (hoveringOrb) {
+                lookX = Math.max(-1, Math.min(1, dx))
+                lookY = Math.max(-1, Math.min(1, dy))
+            }
+        }
+        onExited: hoveringOrb = false
         onPressed: (mouse) => {
             const dx = mouse.x - width / 2, dy = mouse.y - height / 2
             if (Math.sqrt(dx * dx + dy * dy) > win.radius * 1.05) { mouse.accepted = false; return }

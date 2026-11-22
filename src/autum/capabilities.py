@@ -130,13 +130,18 @@ class NotesStore:
         if redact_sensitive(content) != content:
             raise ValueError("refusing to store passwords, keys, or tokens in notes (plan §5.3)")
         path = self._path(title)
-        self.notes_dir.mkdir(parents=True, exist_ok=True)
-        # Exclusive creation ('x'): atomic no-overwrite guarantee (§5.2).
+        self.notes_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.notes_dir.parent, 0o700)
+        self.notes_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.notes_dir, 0o700)
+        # Exclusive creation (O_CREAT | O_EXCL, mode 0600): atomic no-overwrite + private (§5.2, §5.3).
         try:
-            with path.open("x", encoding="utf-8") as fh:
-                fh.write(content)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
             raise FileExistsError(f"note {path.stem!r} already exists; create_note never overwrites") from None
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.chmod(path, 0o600)
         return {"slug": path.stem, "bytes": len(content.encode("utf-8"))}
 
     def list_notes(self) -> list[str]:

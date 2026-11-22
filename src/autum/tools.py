@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -190,8 +191,16 @@ class AuditLog:
         if len(self.entries) > self.max_memory:
             del self.entries[: len(self.entries) - self.max_memory]
         if self.path is not None:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as fh:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(self.path.parent, 0o700)
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                fh = os.fdopen(fd, "a", encoding="utf-8")
+            except Exception:
+                os.close(fd)
+                raise
+            with fh:
                 fh.write(line + "\n")
         return sanitized
 

@@ -1,9 +1,13 @@
 # ADR 0002 — Voice pipeline, resource budget, and acceptance thresholds
 
-*Status: accepted by user decision on 2026-11-22 (with open real-voice WER and
-hands-free speaker echo checks noted below). Reference machine: AMD Ryzen 7
-5800XT, 32 GB RAM, NVIDIA GeForce RTX 4060 Ti 16 GB, PipeWire 1.6.11, Ollama
-0.40.16.*
+*Status: **Provisional** (2026-11-22). Based on `synthetic-v2` (48 synthetic
+prompts), the live cancellation probe, Wayland presence measurements, and
+informal live push-to-talk use. Cannot move to **Accepted** until the approved
+M1 primary evidence is collected: `recorded-v1` (48 real-voice clips via
+`python3 -m bench.record_corpus`) and the attended hands-free echo/interruption
+test (`python3 -m bench.attended`), per [docs/m1-benchmark-methodology.md](../m1-benchmark-methodology.md)
+and plan Rule 2. Reference machine: AMD Ryzen 7 5800XT, 32 GB RAM, NVIDIA
+GeForce RTX 4060 Ti 16 GB, PipeWire 1.6.11, Ollama 0.40.16.*
 
 ## Context
 
@@ -33,9 +37,9 @@ Additional measured components on the reference machine:
 - **Visual presence** (native Wayland `wlr-layer-shell`, 300 px cloud): `6.0 ms` median / `71.2 ms` max event-to-screen lag (`n=20`), `14.0%` of one CPU core, `~302 MiB` RSS.
 - **Microphone preprocessing:** the reference Blue Microphones USB source had `-32.8 dBFS` sub-sonic rumble below 20 Hz (`99.1%` of idle energy). Adding an 80 Hz high-pass filter (`highpass_pcm`) resolved quiet-clip misrecognition in live push-to-talk conversations.
 
-## Decision
+## Provisional decision
 
-Confirm **Pipeline D** (`lfm3-omni:2b`, Ollama ID `4c0ee9400634`, Q4_K_M,
+Use **Pipeline D** provisionally (`lfm3-omni:2b`, Ollama ID `4c0ee9400634`, Q4_K_M,
 4,096 context across chat, speech, vision, and background transcription) paired
 with:
 

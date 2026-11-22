@@ -347,3 +347,22 @@ def test_hotkey_stop_prevents_dispatch():
         return calls
 
     assert run(scenario()) == []
+
+
+# 11. Local data directory, audit log, memory store, and notes are strictly owner-only (0700 / 0600)
+def test_local_data_files_are_owner_only_permissions(tmp_path):
+    import stat
+
+    data_dir = tmp_path / "autum-private"
+    reg, timers, notes = build_default_registry(data_dir)
+    reg.audit.record("tool_requested", tool="get_time")
+    notes.create("private-note", "hello")
+    mem = MemoryStore(data_dir / "memory.json")
+    mem.remember("color", "blue")
+    timers.stop_all()
+
+    assert stat.S_IMODE(data_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((data_dir / "audit.jsonl").stat().st_mode) == 0o600
+    assert stat.S_IMODE((data_dir / "memory.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((data_dir / "notes").stat().st_mode) == 0o700
+    assert stat.S_IMODE((data_dir / "notes" / "private-note.txt").stat().st_mode) == 0o600

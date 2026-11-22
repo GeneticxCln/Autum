@@ -830,13 +830,14 @@ AUT-11 has at least one acceptance test.
 | **R2** | **Expanded release** (§9.2), reliability-tested | WP11 | R1, M6–M10; M11 if included in release scope |
 
 **M1 & M2 status (2026-11-22):** [ADR 0002](docs/adr/0002-voice-pipeline-and-resource-budget.md)
-confirms **Pipeline D** (`lfm3-omni:2b` for audio understanding, chat, vision,
-tool calling, and streaming speech, with an 80 Hz high-pass input filter) based
-on the `synthetic-v2` 5-pipeline comparison, cancellation probe, Wayland
-presence measurements, and live push-to-talk validation. Formal `recorded-v1`
-WER and `bench.attended` speaker echo measurements remain noted in ADR 0002 as
-deferred checks. Autum runs in the background with no terminal program;
-push-to-talk uses the KDE GlobalShortcuts portal or holding the cloud.
+documents **provisional Pipeline D** (`lfm3-omni:2b` for audio understanding,
+chat, vision, tool calling, and streaming speech, with an 80 Hz high-pass input
+filter) based on `synthetic-v2`, the cancellation probe, Wayland presence
+measurements, and informal live push-to-talk use. ADR 0002 remains **provisional**
+until the primary M1 evidence (`recorded-v1` real-voice corpus and
+`bench.attended` echo/interruption run) is completed per methodology & Rule 2.
+Autum runs in the background with no terminal program; push-to-talk uses the KDE
+GlobalShortcuts portal (in Autum's own systemd scope) or holding the orb.
 
 **M3 status (2026-11-22):** hands-free mode (`--hands-free`) is implemented
 on top of streaming Silero VAD v6 (`src/autum/vad.py`, ~0.08 ms/frame on CPU)
@@ -916,13 +917,13 @@ warnings) and live `system_info` tool verification on local `lfm3-omni:2b`.
 
 **WP11 / R2 acceptance suite status (2026-11-22):** added explicit
 `AUT-01`–`AUT-11` traceability acceptance tests (`tests/test_r2_acceptance.py`)
-and documented the verification matrix in `docs/acceptance-matrix.md`. ADR 0002
-is accepted (`docs/adr/0002-voice-pipeline-and-resource-budget.md`). All
+and documented the verification matrix in `docs/acceptance-matrix.md`. All
 automated unit, integration, security, and acceptance tests pass. Remaining
-deferred hardware/human gates before a formal external R1/R2 sign-off: M1
-real-voice corpus (`recorded-v1`), attended speaker echo/barge-in run, and an
-8-hour continuous live soak. M11 (full animated human character prototype)
-remains optional and unstarted.
+open real-world/human gates before formal R1/R2 sign-off: M1 real-voice corpus
+(`recorded-v1`) and attended speaker echo/barge-in run (`bench.attended`) to
+finalize ADR 0002, live end-to-end verification of Eyes & Hands, asset license
+resolution for the face reference image, and an 8-hour continuous live soak.
+M11 (full animated human character prototype) remains optional and unstarted.
 
 M0 and M1 run in parallel. M0's skeleton is the codebase M2 builds on;
 M1's benchmark harness is the first running voice pipeline. Visual work

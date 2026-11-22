@@ -13,6 +13,7 @@ Implements plan §5.1, §5.3, and §6 WP8:
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -81,10 +82,14 @@ class MemoryStore:
                 self._entries[entry.id] = entry
 
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.path.parent, 0o700)
         payload = [e.to_dict() for e in self._entries.values()]
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, indent=2, sort_keys=True))
+        os.chmod(tmp, 0o600)
         tmp.replace(self.path)
 
     def remember(

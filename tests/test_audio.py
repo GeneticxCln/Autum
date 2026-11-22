@@ -432,6 +432,49 @@ def test_hands_free_barge_in_cancels_active_speech_and_answers_new_turn():
     assert len(log.of("audio.speech_started")) == 1
 
 
+def test_hands_free_speaker_safe_mode_never_cuts_off_own_voice_from_speakers():
+    async def scenario():
+        bus = EventBus("s")
+        log = Recorder(bus)
+        speech = MockSpeech(bus, synth_s=0.005, per_char_s=0.015)
+        inf = MockInference("Hello! I am speaking a complete sentence out of your speakers.", token_delay_s=0.001)
+        runtime = Runtime(bus, inf, speech, mode=Mode.HANDS_FREE)
+        proc = StreamingRecordProc()
+
+        async def spawn_(*args, **kw):
+            return proc
+
+        hf = HandsFreeInput(
+            bus,
+            runtime,
+            FakeTranscriber(),
+            _hf_detector(),
+            spawn_=spawn_,
+            voice_barge_in=False,
+            post_speech_cooldown_s=0.06,
+        )
+        await hf.start()
+        await asyncio.sleep(0.02)
+
+        runtime.submit_text("say hello")
+        deadline = time.monotonic() + 2.0
+        while runtime.state is not State.SPEAKING and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert runtime.state is State.SPEAKING
+
+        # Simulate loud speaker bleed into the microphone while Autum is speaking
+        proc.push(*([_hf_frame(1)] * 25))
+        await runtime.wait_until_settled()
+        await asyncio.sleep(0.08)
+        await hf.stop()
+        return log, runtime
+
+    log, runtime = run(scenario())
+    assert log.of("operation.cancel_requested") == []
+    assert log.of("audio.speech_started") == []
+    assert runtime.history[-1]["content"].strip() == "Hello! I am speaking a complete sentence out of your speakers."
+
+
 def test_hands_free_respects_hard_mute_and_resumes_on_unmute():
     async def scenario():
         bus = EventBus("s")

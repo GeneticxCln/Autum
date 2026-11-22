@@ -228,8 +228,16 @@ Window {
             curY = mouse.y
             leftHeld = true
             dragging = false
-            talking = true
-            presence.talkStart()
+            // In push_to_talk mode (or when answering an approval prompt), start
+            // recording immediately at 0 ms so the first syllable is never clipped;
+            // in hands_free mode, don't cancel active speech if the user is just
+            // dragging the orb across the screen.
+            if (presence.mode !== "hands_free" || win.st === "waiting_for_approval") {
+                talking = true
+                presence.talkStart()
+            } else {
+                talking = false
+            }
         }
         onReleased: (mouse) => {
             if (mouse.button !== Qt.LeftButton)
@@ -245,6 +253,8 @@ Window {
                     settingsBridge.savePosition(win.marginRight, win.marginBottom)
             } else if (talking) {
                 presence.talkFinish()
+            } else if (presence.mode === "hands_free" && (win.speaking || win.busy)) {
+                presence.stopSpeaking()
             }
             leftHeld = false
             dragging = false

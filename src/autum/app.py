@@ -467,7 +467,15 @@ async def main(argv: Sequence[str] | None = None) -> int:
                         silence_ms=silence_ms,
                         barge_in_ms=barge_in_ms,
                     )
-                    hands_free = HandsFreeInput(bus, runtime, transcriber, detector, target=in_target)
+                    hands_free = HandsFreeInput(
+                        bus,
+                        runtime,
+                        transcriber,
+                        detector,
+                        target=in_target,
+                        voice_barge_in=False,
+                        post_speech_cooldown_s=0.60,
+                    )
                 return hands_free
 
             async def reload_live_config() -> None:

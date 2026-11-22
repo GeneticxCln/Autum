@@ -492,6 +492,8 @@ class HandsFreeInput:
         stall_s: float = MIC_STALL_S,
         reconnect_s: float = MIC_RECONNECT_S,
         target: str | None = None,
+        voice_barge_in: bool = True,
+        post_speech_cooldown_s: float = 0.0,
     ) -> None:
         self.bus = bus
         self.runtime = runtime
@@ -501,9 +503,13 @@ class HandsFreeInput:
         self.stall_s = stall_s
         self.reconnect_s = reconnect_s
         self.target = target
+        self.voice_barge_in = voice_barge_in
+        self.post_speech_cooldown_s = post_speech_cooldown_s
         self.muted = False
         self._active = False
         self._autum_speaking = False
+        self._runtime_state = "idle"
+        self._cooldown_until = 0.0
         self._errored = False
         self._turn: str | None = None
         self._proc: asyncio.subprocess.Process | None = None
@@ -515,6 +521,9 @@ class HandsFreeInput:
             {
                 "audio.mute_changed",
                 "runtime.state_changed",
+                "speech.playback_started",
+                "speech.output_level",
+                "speech.playback_finished",
                 "conversation.response_finished",
                 "operation.cancelled",
             },
@@ -607,6 +616,25 @@ class HandsFreeInput:
             self._drop_turn()
 
     def _handle_frame(self, frame: bytes) -> None:
+        now = time.monotonic()
+        # Never start a new utterance while Autum is transcribing (processing) or loading;
+        # and when speaker echo protection is active (not voice_barge_in), gate mic VAD
+        # while she is thinking/speaking plus the post-playback acoustic cooldown so her
+        # own speaker output never cuts her off after one word or triggers an echo loop.
+        if self._runtime_state in ("processing", "loading"):
+            if self.detector.in_speech:
+                self.detector.reset()
+            return
+        if not self.voice_barge_in:
+            if self._runtime_state in ("thinking", "speaking") or self._autum_speaking:
+                self._cooldown_until = now + self.post_speech_cooldown_s
+                self._turn = None
+                self.detector.reset()
+                return
+            if now < self._cooldown_until:
+                self._turn = None
+                self.detector.reset()
+                return
         event = self.detector.feed(frame, speaking=self._autum_speaking)
         if event is None:
             return
@@ -671,7 +699,20 @@ class HandsFreeInput:
             else:
                 self._start_runner()
         elif event.type == "runtime.state_changed":
-            self._autum_speaking = event.payload["to"] in ("speaking", "thinking")
+            to_state = str(event.payload["to"])
+            was_speaking = self._runtime_state == "speaking"
+            self._runtime_state = to_state
+            self._autum_speaking = to_state in ("speaking", "thinking")
+            if not self.voice_barge_in and (to_state in ("processing", "thinking", "speaking") or was_speaking):
+                if was_speaking and to_state != "speaking":
+                    self._cooldown_until = time.monotonic() + self.post_speech_cooldown_s
+                self._turn = None
+                self.detector.reset()
+        elif event.type in ("speech.playback_started", "speech.output_level", "speech.playback_finished"):
+            if not self.voice_barge_in:
+                self._cooldown_until = time.monotonic() + self.post_speech_cooldown_s
+                self._turn = None
+                self.detector.reset()
         elif event.turn_id in self._awaiting_transcript:
             self._track(self._transcribe(event.turn_id))
 

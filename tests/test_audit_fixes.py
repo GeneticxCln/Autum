@@ -437,3 +437,40 @@ def test_model_swapper_dynamically_swaps_heavy_models_and_pins_voice():
     assert unloaded == ["gemma4:12b", "qwen3-vl:8b"]
     assert "lfm3-omni:2b" not in unloaded
     assert swaps == [("qwen3-vl:8b", "gemma4:12b"), ("gemma4:12b", "qwen3-vl:8b")]
+
+
+# 14. direct_audio=False transcribes via lfm3-omni first and sends clean text to gemma4
+def test_direct_audio_false_transcribes_first_and_sends_text_to_chat():
+    class _FakeTranscriber:
+        async def transcribe(self, _wav: bytes) -> str:
+            return "Move Chrome to the left."
+
+    seen_messages: list[list[dict]] = []
+
+    class _CaptureInference:
+        async def stream(self, messages, *, operation_id, tools=None):
+            seen_messages.append(list(messages))
+            yield "Done."
+
+    async def scenario():
+        bus = EventBus("s")
+        rt = Runtime(
+            bus,
+            _CaptureInference(),
+            MockSpeech(bus, synth_s=0.0, per_char_s=0.0),
+            transcriber=_FakeTranscriber(),
+            direct_audio=False,
+        )
+        turn = new_id()
+        bus.emit("audio.speech_started", {"mode": "push_to_talk"}, provenance=Provenance.USER, turn_id=turn)
+        ended = bus.emit("audio.speech_ended", {"confidence": 1.0}, provenance=Provenance.USER, turn_id=turn)
+        rt.submit_speech(turn, b"RIFFfakewav", ended)
+        await rt.wait_until_settled()
+        return rt
+
+    rt = run(scenario())
+    assert rt.state is State.IDLE
+    assert len(seen_messages) == 1
+    user_msg = seen_messages[0][-1]
+    assert user_msg["content"] == "Move Chrome to the left."
+    assert "audio" not in user_msg

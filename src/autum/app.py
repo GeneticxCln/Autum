@@ -325,7 +325,9 @@ async def main(argv: Sequence[str] | None = None) -> int:
 
             chat_effort = None if cfg.chat_think else ("none" if any(k in chat_model.lower() for k in ("gemma4", "qwen3")) else None)
             vision_effort = None if cfg.chat_think else ("none" if any(k in vision_model.lower() for k in ("gemma4", "qwen3")) else None)
-            direct_audio = any(k in chat_model.lower() for k in ("omni", "gemma4"))
+            # Only send raw WAV directly into chat when the omni voice model itself is the chat model;
+            # otherwise let lfm3-omni:2b transcribe speech cleanly into text for gemma4:12b.
+            direct_audio = chat_model == cfg.model and "omni" in chat_model.lower()
 
             swapper: ModelSwapper | None = None
             if cfg.dynamic_swap and len({m for m in (chat_model, vision_model) if m != cfg.model}) > 1:

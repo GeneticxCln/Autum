@@ -117,12 +117,13 @@ class TurnDetector:
         samples = np.frombuffer(pcm_frame, dtype=np.int16).astype(np.float32) / 32768.0
         return float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
 
-    def feed(self, pcm_frame: bytes, *, speaking: bool = False) -> TurnEvent | None:
+    def feed(self, pcm_frame: bytes, *, speaking: bool = False, min_rms: float = 0.012) -> TurnEvent | None:
         prob = float(self.scorer(pcm_frame))
         frame_rms = self._frame_rms(pcm_frame) if self._use_energy_gate else 1.0
+        eff_min_rms = max(0.012, min_rms)
         if not self._in_speech:
             self._pre_roll.append(pcm_frame)
-            is_voice = prob >= self.threshold and (not self._use_energy_gate or frame_rms >= 0.012)
+            is_voice = prob >= self.threshold and (not self._use_energy_gate or frame_rms >= eff_min_rms)
             if is_voice:
                 self._speech_run += 1
                 self._speech_probs.append(prob)
@@ -143,15 +144,21 @@ class TurnDetector:
 
         self._utterance.append(pcm_frame)
         self._peak_rms = max(self._peak_rms, frame_rms)
-        min_continue_rms = max(0.010, self._peak_rms * 0.18) if self._use_energy_gate else 0.0
-        if prob >= self.neg_threshold and frame_rms >= min_continue_rms:
+        if speaking and self._use_energy_gate:
+            min_continue_rms = max(eff_min_rms, self._peak_rms * 0.45)
+            cont_prob = self.threshold
+        else:
+            min_continue_rms = max(eff_min_rms * 0.85, self._peak_rms * 0.25) if self._use_energy_gate else 0.0
+            cont_prob = self.neg_threshold
+        if prob >= cont_prob and frame_rms >= min_continue_rms:
             self._silence_run = 0
             if prob >= self.threshold:
                 self._speech_probs.append(prob)
         else:
             self._silence_run += 1
 
-        if self._silence_run >= self.silence_frames or len(self._utterance) >= self.max_frames:
+        max_f = min(self.max_frames, max(1, math.ceil(2800 / FRAME_MS))) if speaking and self._use_energy_gate else self.max_frames
+        if self._silence_run >= self.silence_frames or len(self._utterance) >= max_f:
             trim = max(0, self._silence_run - self.tail_frames)
             frames = self._utterance[:-trim] if trim else self._utterance
             pcm = b"".join(frames)

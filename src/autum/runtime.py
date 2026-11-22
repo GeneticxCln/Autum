@@ -14,6 +14,7 @@ import enum
 import inspect
 import json
 import logging
+import re
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -148,6 +149,7 @@ class Runtime:
         self._transcribe_task: asyncio.Task[None] | None = None
         self._approval_turn: tuple[str, str, int] | None = None  # (turn_id, source_mode, started_mono_ns)
         self._turn_observed = False
+        self.current_spoken_text: str = ""
         self._pending_announcements: deque[str] = deque(maxlen=16)
         self._response_errored = False
         self._tasks: set[asyncio.Task[None]] = set()
@@ -195,6 +197,90 @@ class Runtime:
                 if txt_words and len(txt_words & obs_words) / len(txt_words) >= 0.5:
                     return True
         return False
+
+    _WAKE_WORDS = frozenset(
+        {"autum", "autumn", "atom", "otto", "stop", "wait", "hold", "cancel", "pause", "quiet", "enough", "listen"}
+    )
+    _WAKE_GREETINGS = frozenset({"hey", "hi", "ok", "okay", "yo", "excuse", "no"})
+    _STOP_PHRASES = frozenset(
+        {
+            "stop",
+            "stop speaking",
+            "stop talking",
+            "wait",
+            "hold on",
+            "cancel",
+            "pause",
+            "quiet",
+            "be quiet",
+            "enough",
+            "shut up",
+            "never mind",
+            "nevermind",
+        }
+    )
+
+    def is_self_echo(self, transcript: str) -> bool:
+        """True if `transcript` is speaker bleed of Autum's own active speech rather than a user wake call or question."""
+        words = re.findall(r"[a-z0-9']+", (transcript or "").lower())
+        if not words:
+            return True
+        # Explicit wake-on-call ("Autum, ...", "Hey Autum, ...", "Stop", "Wait, ...") is NEVER echo
+        if words[0] in self._WAKE_WORDS:
+            return False
+        if len(words) >= 2 and words[0] in self._WAKE_GREETINGS and words[1] in self._WAKE_WORDS:
+            return False
+        spoken_words = set(re.findall(r"[a-z0-9']+", (self.current_spoken_text or "").lower()))
+        if spoken_words:
+            overlap = sum(1 for w in words if w in spoken_words) / len(words)
+            if overlap >= 0.50:
+                return True
+        return False
+
+    @classmethod
+    def clean_wake_transcript(cls, transcript: str) -> tuple[str, bool]:
+        """Strip optional leading wake call ('Autum,', 'Hey Autum,') and detect pure stop commands.
+
+        Returns `(cleaned_text, is_stop_only)`.
+        """
+        raw = (transcript or "").strip()
+        if not raw:
+            return "", False
+        cleaned = re.sub(
+            r"^\s*(?:(?:hey|hi|ok|okay|yo)\s+)?(?:autum|autumn|atom|otto)\b[\s,.:;!\-]*",
+            "",
+            raw,
+            flags=re.IGNORECASE,
+        ).strip()
+        norm = re.sub(r"[^a-z0-9\s]+", "", (cleaned or raw).lower()).strip()
+        norm = re.sub(r"\s+", " ", norm)
+        if not cleaned or norm in cls._STOP_PHRASES:
+            # If user only said "Autum, stop" or "Stop" or "Wait" (without a follow-up question)
+            if not cleaned and re.sub(r"[^a-z0-9\s]+", "", raw.lower()).strip() in {"autum", "autumn", "hey autum", "hey autumn"}:
+                return "", True
+            if norm in cls._STOP_PHRASES:
+                return "", True
+        return (cleaned or raw), False
+
+    def barge_in_with_text(self, transcript: str, turn_id: str | None = None) -> bool:
+        """Interrupt active speech with a verified wake-on-call or new question in hands-free mode."""
+        if self.is_self_echo(transcript):
+            return False
+        cleaned, is_stop = self.clean_wake_transcript(transcript)
+        if is_stop:
+            self._cancel_pending_transcription()
+            if self._op is not None:
+                self._begin_cancel("barge_in", None)
+            elif self.state not in (State.IDLE, State.LISTENING):
+                self._set_state(self.rest_state, "barge_in")
+            return True
+        if not cleaned:
+            return False
+        tid = turn_id or new_id()
+        self.bus.emit("audio.speech_started", {"mode": "hands_free"}, provenance=Provenance.USER, turn_id=tid)
+        self.bus.emit("audio.speech_ended", {"confidence": 1.0}, provenance=Provenance.USER, turn_id=tid)
+        self.bus.emit("audio.transcribed", {"text": cleaned, "final": True}, provenance=Provenance.USER, turn_id=tid)
+        return True
 
     @property
     def microphone(self) -> str:
@@ -377,11 +463,23 @@ class Runtime:
 
     def _on_final_transcript(self, event: Event) -> None:
         self._input_turn = None
-        text = str(event.payload["text"]).strip()
-        if not text:
+        raw_text = str(event.payload["text"]).strip()
+        if not raw_text:
             self._set_state(self.rest_state, "empty_transcript", event)
             self._drain_pending_announcements()
             return
+        if self.mode is Mode.HANDS_FREE:
+            cleaned, is_stop = self.clean_wake_transcript(raw_text)
+            if is_stop:
+                if self._op is not None:
+                    self._begin_cancel("barge_in", event)
+                else:
+                    self._set_state(self.rest_state, "stop_command", event)
+                    self._drain_pending_announcements()
+                return
+            text = cleaned
+        else:
+            text = raw_text
         self._start_response(text, "speech", event.turn_id or new_id(), event)
 
     # ----- public API ----------------------------------------------------
@@ -514,6 +612,7 @@ class Runtime:
             self._start_announcement(self._pending_announcements.popleft())
 
     async def _speak_announcement(self, op_id: str, text: str) -> None:
+        self.current_spoken_text = text
         try:
             self.speech.enqueue(text, operation_id=op_id, turn_id=None)
             await self.speech.drain(op_id)
@@ -634,6 +733,7 @@ class Runtime:
         emitted_parts: list[str] = []
         final_text = ""
         self._turn_observed = False
+        self.current_spoken_text = ""
         try:
             started = self.bus.emit(
                 "conversation.response_started", turn_id=turn_id, operation_id=op_id, cause=cause
@@ -758,6 +858,7 @@ class Runtime:
         for chunk in chunks:
             spoken = speakable(chunk)
             if spoken and self.bus.fence.is_live(op_id):
+                self.current_spoken_text = f"{self.current_spoken_text} {spoken}".strip()
                 self.speech.enqueue(spoken, operation_id=op_id, turn_id=turn_id)
 
     def _fail(self, op_id: str, exc: Exception) -> None:

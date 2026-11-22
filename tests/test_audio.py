@@ -475,6 +475,101 @@ def test_hands_free_speaker_safe_mode_never_cuts_off_own_voice_from_speakers():
     assert runtime.history[-1]["content"].strip() == "Hello! I am speaking a complete sentence out of your speakers."
 
 
+def test_hands_free_smart_barge_in_ignores_speaker_echo_and_interrupts_on_wake_question():
+    class ConfigurableTranscriber:
+        def __init__(self, text: str):
+            self.text = text
+
+        async def transcribe(self, _wav: bytes) -> str:
+            return self.text
+
+    # 1. Speaker echo matching what Autum is currently saying -> ignored, speech completes!
+    async def echo_scenario():
+        bus = EventBus("s")
+        log = Recorder(bus)
+        speech = MockSpeech(bus, synth_s=0.005, per_char_s=0.015)
+        reply = "The capital of France is Paris and it is famous for the Eiffel Tower."
+        runtime = Runtime(bus, MockInference(reply, token_delay_s=0.001), speech, mode=Mode.HANDS_FREE)
+        proc = StreamingRecordProc()
+
+        async def spawn_(*args, **kw):
+            return proc
+
+        tx = ConfigurableTranscriber("capital of France is Paris and it is famous")
+        hf = HandsFreeInput(
+            bus,
+            runtime,
+            tx,
+            _hf_detector(),
+            spawn_=spawn_,
+            voice_barge_in=False,
+            smart_barge_in=True,
+            post_speech_cooldown_s=0.05,
+        )
+        await hf.start()
+        await asyncio.sleep(0.02)
+
+        runtime.submit_text("tell me about france")
+        deadline = time.monotonic() + 2.0
+        while runtime.state is not State.SPEAKING and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+
+        proc.push(*([_hf_frame(1)] * 12 + [_hf_frame(0)] * 6))
+        await runtime.wait_until_settled()
+        await asyncio.sleep(0.08)
+        await hf.stop()
+        return log, runtime
+
+    log_echo, rt_echo = run(echo_scenario())
+    assert log_echo.of("operation.cancel_requested") == []
+    assert rt_echo.history[-1]["content"].strip() == "The capital of France is Paris and it is famous for the Eiffel Tower."
+
+    # 2. Wake-on-call ("Autum, what time is it?") while she speaks -> interrupts & answers new question!
+    async def wake_question_scenario():
+        bus = EventBus("s")
+        log = Recorder(bus)
+        speech = MockSpeech(bus, synth_s=0.005, per_char_s=0.02)
+        inf = MockInference("First long answer sentence. Second long answer sentence. Third sentence.", token_delay_s=0.002)
+        runtime = Runtime(bus, inf, speech, mode=Mode.HANDS_FREE)
+        proc = StreamingRecordProc()
+
+        async def spawn_(*args, **kw):
+            return proc
+
+        tx = ConfigurableTranscriber("Autum, what time is it right now?")
+        hf = HandsFreeInput(
+            bus,
+            runtime,
+            tx,
+            _hf_detector(),
+            spawn_=spawn_,
+            voice_barge_in=False,
+            smart_barge_in=True,
+            post_speech_cooldown_s=0.05,
+        )
+        await hf.start()
+        await asyncio.sleep(0.02)
+
+        runtime.submit_text("tell me a long story")
+        deadline = time.monotonic() + 2.0
+        while runtime.state is not State.SPEAKING and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+
+        proc.push(*([_hf_frame(1)] * 12 + [_hf_frame(0)] * 6))
+        deadline = time.monotonic() + 2.0
+        while len(log.of("operation.cancel_requested")) < 1 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        await runtime.wait_until_settled()
+        await hf.stop()
+        return log, runtime
+
+    log_wake, rt_wake = run(wake_question_scenario())
+    cancels = log_wake.of("operation.cancel_requested")
+    assert len(cancels) == 1 and cancels[0].payload["source"] == "barge_in"
+    user_msgs = [m["content"] for m in rt_wake.history if m["role"] == "user"]
+    assert "what time is it right now?" in user_msgs
+
+
 def test_hands_free_respects_hard_mute_and_resumes_on_unmute():
     async def scenario():
         bus = EventBus("s")

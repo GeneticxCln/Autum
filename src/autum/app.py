@@ -474,7 +474,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
                         detector,
                         target=in_target,
                         voice_barge_in=False,
-                        post_speech_cooldown_s=0.60,
+                        smart_barge_in=True,
+                        post_speech_cooldown_s=0.45,
                     )
                 return hands_free
 

@@ -200,8 +200,10 @@ ADR 0001.
 {"command": "stop"}                              drop the current utterance and cancel the response
 {"command": "text", "text": "..."}               typed message, 1-2000 characters
 {"command": "set_mode", "mode": "hands_free"}    switch between "push_to_talk" and "hands_free"
+{"command": "approve"}                           grant the pending approval request (§5.2)
+{"command": "deny"}                              reject the pending approval request (§5.2)
 ```
 
 Commands are user actions in a window the user controls, so they carry
-the same authority as keys in Autum's terminal. Approval commands will be
-added with WP6 and follow §5.2 of the plan.
+the same authority as keys in Autum's terminal. Approval commands follow
+§5.2 of the plan (single-use, time-bounded, user-provenance only).

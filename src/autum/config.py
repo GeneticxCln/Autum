@@ -34,6 +34,9 @@ class Config:
     model: str = "lfm3-omni:2b"
     voice: str = "female-american-english"
     log_level: str = "INFO"
+    data_dir: str = ""
+    require_reversible_approval: bool = False
+    approval_timeout_s: float = 20.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, Mode):
@@ -46,8 +49,13 @@ class Config:
             raise ValueError("max_history must be between 2 and 200")
         if self.max_context_chars < 500 or self.max_context_chars > 200_000:
             raise ValueError("max_context_chars must be between 500 and 200000")
+        if self.approval_timeout_s < 2.0 or self.approval_timeout_s > 120.0:
+            raise ValueError("approval_timeout_s must be between 2 and 120")
         if not self.ollama_url.startswith(("http://127.0.0.1", "http://localhost", "http://[::1]")):
             raise ValueError("ollama_url must point to localhost (plan §5.5)")
+
+    def resolved_data_dir(self) -> Path | None:
+        return Path(self.data_dir).expanduser() if self.data_dir else None
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:

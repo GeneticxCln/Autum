@@ -46,6 +46,9 @@ class FakeRuntime:
         self.mode = mode
         self.calls.append(("mode", mode))
 
+    def resolve_approval(self, response, **kwargs):
+        self.calls.append(("approval", response, kwargs.get("source")))
+
 
 def test_presence_commands():
     voice, runtime = FakeVoice(), FakeRuntime()
@@ -71,6 +74,8 @@ def test_mode_switching_and_hands_free_manual_interrupt():
         await handle({"command": "talk_finish"})  # no-op in hands-free mode
         await handle({"command": "set_mode", "mode": "push_to_talk"})
         await handle({"command": "talk_start"})
+        await handle({"command": "approve"})
+        await handle({"command": "deny"})
 
     asyncio.run(scenario())
     assert hf.calls == ["start", "stop"]
@@ -79,4 +84,6 @@ def test_mode_switching_and_hands_free_manual_interrupt():
         ("mode", Mode.HANDS_FREE),
         ("cancel", "push_to_talk"),
         ("mode", Mode.PUSH_TO_TALK),
+        ("approval", "yes", "command"),
+        ("approval", "no", "command"),
     ]

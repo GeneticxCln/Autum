@@ -869,6 +869,18 @@ unit/soak acceptance tests (`tests/test_config_and_logging.py`,
 `tests/test_stability.py`). Multi-hour live soak on the reference machine
 remains to be measured for R1.
 
+**M6 & M7 status (2026-11-22):** implemented WP5 conversational agent loop
+(`src/autum/runtime.py`, `src/autum/ollama.py`) and WP6 capability, approval,
+and audit framework (`src/autum/tools.py`, `src/autum/capabilities.py`).
+Initial environment-neutral capabilities live under Autum's data folder:
+`get_time`, `set_timer`, `list_timers`, `cancel_timer`, `create_note` (never
+overwrites, rejects secrets), `list_notes`, `read_note` (tagged `observed`
+untrusted data per §5.1), and `delete_note` (fixed `irreversible`, always
+requires explicit user approval per §5.2, with playback-completion and
+hands-free anti-spoofing). Verified with unit/acceptance tests
+(`tests/test_agent_and_tools.py`, 122 passed total) and live end-to-end tool
+calling + verification on local `lfm3-omni:2b`.
+
 M0 and M1 run in parallel. M0's skeleton is the codebase M2 builds on;
 M1's benchmark harness is the first running voice pipeline. Visual work
 (M4) runs in parallel with hands-free work (M3), and agent work (M6)

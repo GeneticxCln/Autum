@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import inspect
+import json
 import logging
 import time
 from collections import deque
@@ -20,6 +22,7 @@ from typing import Any, AsyncIterator, Callable, Mapping, Protocol, Sequence
 from autum.bus import EventBus
 from autum.events import Event, Provenance, new_id
 from autum.text import SentenceChunker, speakable
+from autum.tools import ApprovalGate, Capability, PermissionLevel, ToolCall, ToolRegistry
 
 log = logging.getLogger("autum.runtime")
 
@@ -84,7 +87,7 @@ TRANSITIONS: Mapping[State, frozenset[State]] = {
     S.SPEECH_DETECTED: frozenset({S.PROCESSING, S.LISTENING, S.IDLE, S.ERROR}),
     S.PROCESSING: frozenset({S.THINKING, S.SPEECH_DETECTED, S.LISTENING, S.IDLE, S.ERROR}),
     S.THINKING: frozenset({S.SPEAKING, S.WAITING_FOR_APPROVAL, S.INTERRUPTED, S.LISTENING, S.IDLE, S.ERROR}),
-    S.SPEAKING: frozenset({S.INTERRUPTED, S.LISTENING, S.IDLE, S.ERROR}),
+    S.SPEAKING: frozenset({S.WAITING_FOR_APPROVAL, S.INTERRUPTED, S.LISTENING, S.IDLE, S.ERROR}),
     S.INTERRUPTED: frozenset({S.SPEECH_DETECTED, S.THINKING, S.LISTENING, S.IDLE, S.ERROR}),
     S.WAITING_FOR_APPROVAL: frozenset({S.THINKING, S.INTERRUPTED, S.LISTENING, S.IDLE, S.ERROR}),
     S.ERROR: frozenset({S.IDLE, S.LISTENING, S.LOADING}),
@@ -114,6 +117,10 @@ class Runtime:
         max_history: int = 20,
         max_context_chars: int = 10_000,
         cancel_timeout_s: float = 1.0,
+        tools: ToolRegistry | None = None,
+        approval_gate: ApprovalGate | None = None,
+        transcriber: Any | None = None,
+        max_agent_steps: int = 5,
     ) -> None:
         self.bus = bus
         self.inference = inference
@@ -123,11 +130,16 @@ class Runtime:
         self.history: deque[dict[str, Any]] = deque(maxlen=max_history)
         self.max_context_chars = max_context_chars
         self.cancel_timeout_s = cancel_timeout_s
+        self.tools = tools
+        self.approval_gate = approval_gate or ApprovalGate()
+        self.transcriber = transcriber
+        self.max_agent_steps = max_agent_steps
         self.state = State.IDLE
         self.muted = False
         self.capturing = False
         self._op: _Operation | None = None
         self._input_turn: str | None = None
+        self._approval_turn: tuple[str, str, int] | None = None  # (turn_id, source_mode, started_mono_ns)
         self._response_errored = False
         self._tasks: set[asyncio.Task[None]] = set()
         bus.subscribe(
@@ -212,6 +224,16 @@ class Runtime:
             case "audio.transcribed":
                 if not event.payload["final"]:
                     return
+                if self._approval_turn is not None and event.turn_id == self._approval_turn[0]:
+                    _, src_mode, started_ns = self._approval_turn
+                    self._approval_turn = None
+                    self.resolve_approval(
+                        str(event.payload["text"]),
+                        provenance=event.provenance,
+                        source=src_mode,
+                        captured_at_ns=started_ns,
+                    )
+                    return
                 if event.turn_id == self._input_turn:
                     self._on_final_transcript(event)
                 else:
@@ -229,6 +251,17 @@ class Runtime:
     def _on_speech_started(self, event: Event) -> None:
         if self.muted:
             return  # the voice engine should not report speech while muted
+        # While waiting for approval after the prompt finished playing, capture
+        # the user's yes/no reply without cancelling the pending approval.
+        pending = self.approval_gate.pending
+        if (
+            self.state is State.WAITING_FOR_APPROVAL
+            and pending is not None
+            and pending.ready_at_ns is not None
+            and event.mono_ns >= pending.ready_at_ns
+        ):
+            self._approval_turn = (event.turn_id or new_id(), str(event.payload["mode"]), event.mono_ns)
+            return
         self._input_turn = event.turn_id
         if self._op is not None:
             source = "push_to_talk" if event.payload["mode"] == Mode.PUSH_TO_TALK else "barge_in"
@@ -270,21 +303,86 @@ class Runtime:
         """A finished utterance for a pipeline whose model hears audio directly.
 
         The transcript, when the voice engine publishes it, replaces the
-        audio in the history.
+        audio in the history. If waiting for approval, transcribes the reply
+        to resolve the pending approval instead of starting a new turn.
         """
+        if self._approval_turn is not None and turn_id == self._approval_turn[0]:
+            _, src_mode, started_ns = self._approval_turn
+            self._approval_turn = None
+            if self.transcriber is not None:
+                task = asyncio.get_running_loop().create_task(
+                    self._resolve_approval_audio(audio, src_mode, started_ns)
+                )
+                self._track(task)
+            return
         if turn_id != self._input_turn:
             return  # superseded by a newer utterance
         self._input_turn = None
         self._start_response("", "speech", turn_id, cause, audio=audio)
 
+    async def _resolve_approval_audio(self, wav: bytes, source: str, started_ns: int) -> None:
+        try:
+            text = await self.transcriber.transcribe(wav)
+        except Exception as exc:
+            self.bus.emit("runtime.component_error", {"component": "transcription", "error": str(exc)})
+            return
+        self.resolve_approval(text, provenance=Provenance.USER, source=source, captured_at_ns=started_ns)
+
     def submit_text(self, text: str) -> None:
-        """Text input (plan §3.1): same path as a spoken turn."""
+        """Text input (plan §3.1): resolves a pending approval or starts a spoken turn."""
         text = text.strip()
         if not text:
+            return
+        if self.state is State.WAITING_FOR_APPROVAL and self.approval_gate.pending is not None:
+            self.resolve_approval(text, provenance=Provenance.USER, source="text")
             return
         if self._op is not None:
             self._begin_cancel("user_command", None)
         self._start_response(text, "text", new_id(), None)
+
+    def resolve_approval(
+        self,
+        response: str,
+        *,
+        provenance: Provenance = Provenance.USER,
+        source: str = "command",
+        captured_at_ns: int | None = None,
+    ) -> str | None:
+        """Resolve a pending permission request through ApprovalGate (§5.2)."""
+        return self.approval_gate.resolve(
+            response,
+            provenance=provenance,
+            source=source,
+            hands_free_mode=(self.mode is Mode.HANDS_FREE),
+            captured_at_ns=captured_at_ns,
+        )
+
+    def announce(self, text: str) -> None:
+        """Speak a short system announcement (such as a finished timer) when idle."""
+        spoken = speakable(text)
+        if not spoken or self._op is not None or self.state not in (State.IDLE, State.LISTENING):
+            return
+        op_id = new_id()
+        self.bus.fence.open(op_id)
+        self._set_state(State.THINKING, "announcement")
+        task = asyncio.get_running_loop().create_task(self._speak_announcement(op_id, spoken))
+        self._op = _Operation(op_id, new_id(), task)
+        self._track(task)
+
+    async def _speak_announcement(self, op_id: str, text: str) -> None:
+        try:
+            self.speech.enqueue(text, operation_id=op_id, turn_id=None)
+            await self.speech.drain(op_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._fail(op_id, exc)
+            return
+        if self._op is None or self._op.id != op_id:
+            return
+        self._op = None
+        self.bus.fence.close(op_id)
+        self._set_state(self.rest_state, "announcement_finished")
 
     async def cancel(self, source: str = "user_command") -> bool:
         """Cancel the active response. Returns False if nothing was active."""
@@ -299,7 +397,7 @@ class Runtime:
         while self._tasks:
             await asyncio.wait(set(self._tasks))
 
-    # ----- responses -----------------------------------------------------
+    # ----- responses & agent loop (WP3 / WP5 / WP6) ----------------------
 
     def _start_response(
         self, text: str, source: str, turn_id: str, cause: Event | None, audio: bytes | None = None
@@ -324,38 +422,137 @@ class Runtime:
         self._op = _Operation(op_id, turn_id, task)
         self._track(task)
 
+    def _stream_inference(self, messages: Sequence[Message], op_id: str, tools: list[dict[str, Any]] | None):
+        if tools:
+            sig = inspect.signature(self.inference.stream)
+            if "tools" in sig.parameters:
+                return self.inference.stream(messages, operation_id=op_id, tools=tools)
+        return self.inference.stream(messages, operation_id=op_id)
+
+    async def _request_approval(
+        self, cap: Capability, args: dict[str, Any], op_id: str, tc_id: str
+    ) -> str:
+        target = cap.target_summary(args)
+        pending = self.approval_gate.open(
+            action=cap.name,
+            target=target,
+            level=cap.permission_level,
+            operation_id=op_id,
+            tool_call_id=tc_id,
+        )
+        if cap.permission_level is PermissionLevel.IRREVERSIBLE and self.mode is Mode.HANDS_FREE:
+            prompt = f"Should I {target}? Hold your talk key and say yes to confirm, or no to cancel."
+        else:
+            prompt = f"Should I {target}? Say yes to confirm, or no to cancel."
+        self._speak([prompt], op_id, None)
+        await self.speech.drain(op_id)
+        if not self.bus.fence.is_live(op_id):
+            self.approval_gate.cancel()
+            return "denied"
+        self.approval_gate.mark_prompt_finished()
+        if State.WAITING_FOR_APPROVAL in TRANSITIONS[self.state]:
+            self._set_state(State.WAITING_FOR_APPROVAL, "approval_required")
+        outcome = await self.approval_gate.wait(pending)
+        if self.state is State.WAITING_FOR_APPROVAL and self.bus.fence.is_live(op_id):
+            self._set_state(State.THINKING, f"approval_{outcome}")
+        return outcome
+
     async def _respond(self, op_id: str, turn_id: str, cause: Event | None) -> None:
-        messages: list[Message] = []
+        messages: list[dict[str, Any]] = []
         prompt = self.system_prompt() if callable(self.system_prompt) else self.system_prompt
         if prompt:
             messages.append({"role": "system", "content": prompt})
         messages.extend(dict(entry) for entry in self.history)
-        chunker = SentenceChunker()
-        parts: list[str] = []
+        tool_schemas = self.tools.openai_tools() if self.tools is not None else None
+        max_steps = self.max_agent_steps if tool_schemas else 1
+        final_text = ""
         try:
             started = self.bus.emit(
                 "conversation.response_started", turn_id=turn_id, operation_id=op_id, cause=cause
             )
-            async for delta in self.inference.stream(messages, operation_id=op_id):
+            for step in range(max_steps):
                 if not self.bus.fence.is_live(op_id):
-                    break  # cancelled, but the component ignored it
-                parts.append(delta)
-                self.bus.emit(
-                    "conversation.response_chunk",
-                    {"text": delta},
-                    provenance=Provenance.MODEL,
-                    turn_id=turn_id,
-                    operation_id=op_id,
-                    cause=started,
-                )
-                self._speak(chunker.feed(delta), op_id, turn_id)
-            if not self.bus.fence.is_live(op_id):
-                return
-            self._speak(chunker.flush(), op_id, turn_id)
-            text = "".join(parts)
+                    return
+                if tool_schemas:
+                    self.bus.emit("agent.thinking", turn_id=turn_id, operation_id=op_id, cause=started)
+                chunker = SentenceChunker()
+                parts: list[str] = []
+                tool_calls: list[ToolCall] = []
+                active_tools = tool_schemas if step < max_steps - 1 else None
+                async for item in self._stream_inference(messages, op_id, active_tools):
+                    if not self.bus.fence.is_live(op_id):
+                        break  # cancelled, but the component ignored it
+                    if isinstance(item, ToolCall):
+                        tool_calls.append(item)
+                        continue
+                    parts.append(item)
+                    if not tool_schemas:
+                        self.bus.emit(
+                            "conversation.response_chunk",
+                            {"text": item},
+                            provenance=Provenance.MODEL,
+                            turn_id=turn_id,
+                            operation_id=op_id,
+                            cause=started,
+                        )
+                        self._speak(chunker.feed(item), op_id, turn_id)
+                if not self.bus.fence.is_live(op_id):
+                    return
+                if tool_calls and self.tools is not None:
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": "".join(parts),
+                            "tool_calls": [
+                                {
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.name,
+                                        "arguments": json.dumps(tc.arguments, separators=(",", ":")),
+                                    },
+                                }
+                                for tc in tool_calls
+                            ],
+                        }
+                    )
+                    for tc in tool_calls:
+                        if not self.bus.fence.is_live(op_id):
+                            return
+                        outcome = await self.tools.execute(
+                            tc,
+                            bus=self.bus,
+                            operation_id=op_id,
+                            turn_id=turn_id,
+                            approval_gate=self.approval_gate,
+                            request_approval=self._request_approval,
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": json.dumps(outcome.to_model_payload(), separators=(",", ":")),
+                            }
+                        )
+                    continue
+                if tool_schemas:
+                    for part in parts:
+                        self.bus.emit(
+                            "conversation.response_chunk",
+                            {"text": part},
+                            provenance=Provenance.MODEL,
+                            turn_id=turn_id,
+                            operation_id=op_id,
+                            cause=started,
+                        )
+                        self._speak(chunker.feed(part), op_id, turn_id)
+                self._speak(chunker.flush(), op_id, turn_id)
+                final_text = "".join(parts)
+                break
+
             finished = self.bus.emit(
                 "conversation.response_finished",
-                {"text": text},
+                {"text": final_text},
                 provenance=Provenance.MODEL,
                 turn_id=turn_id,
                 operation_id=op_id,
@@ -372,7 +569,7 @@ class Runtime:
             self._drop_turn_audio(turn_id)
             return  # superseded while draining
         self._drop_turn_audio(turn_id)
-        self.history.append({"role": "assistant", "content": text})
+        self.history.append({"role": "assistant", "content": final_text})
         self._trim_history()
         self._op = None
         self.bus.fence.close(op_id)
@@ -381,7 +578,7 @@ class Runtime:
             self.bus.emit("runtime.component_recovered", {"component": "response"})
         self._set_state(self.rest_state, "response_finished", finished)
 
-    def _speak(self, chunks: list[str], op_id: str, turn_id: str) -> None:
+    def _speak(self, chunks: list[str], op_id: str, turn_id: str | None) -> None:
         for chunk in chunks:
             spoken = speakable(chunk)
             if spoken and self.bus.fence.is_live(op_id):
@@ -391,6 +588,7 @@ class Runtime:
         if self._op is None or self._op.id != op_id:
             return
         turn_id = self._op.turn_id
+        self.approval_gate.cancel()
         self.speech.stop()
         self._drop_turn_audio(turn_id)
         self._response_errored = True
@@ -417,6 +615,8 @@ class Runtime:
             return None
         requested_ns = time.monotonic_ns()
         self._op = None
+        self._approval_turn = None
+        self.approval_gate.cancel()
         self._drop_turn_audio(op.turn_id)
         spoken = self.speech.stop()
         self.bus.fence.begin_cancel(op.id)

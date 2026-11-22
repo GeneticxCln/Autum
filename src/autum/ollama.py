@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import base64
 import json
-from typing import AsyncIterator, Sequence
+from typing import Any, AsyncIterator, Sequence
 
 import httpx
 
+from autum.events import new_id
 from autum.runtime import Message
+from autum.tools import ToolCall
 
 OLLAMA = "http://127.0.0.1:11434"
 MODEL = "lfm3-omni:2b"
@@ -32,41 +34,80 @@ def to_openai(message: Message) -> dict:
     if message.get("audio") is not None:
         data = base64.b64encode(message["audio"]).decode()
         return {"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": data, "format": "wav"}}]}
+    if message["role"] == "tool":
+        return {
+            "role": "tool",
+            "tool_call_id": message.get("tool_call_id", ""),
+            "content": str(message.get("content") or ""),
+        }
     content = message.get("content") or ""
     if message["role"] == "assistant":
         # Strip the runtime's internal interruption marker so small models do not
         # echo "[interrupted by the user]" aloud on the next turn.
         content = content.replace(" [interrupted by the user]", "").strip()
+        if message.get("tool_calls"):
+            return {"role": "assistant", "content": content, "tool_calls": list(message["tool_calls"])}
     if message["role"] == "user" and not content:
         content = "(unclear speech)"  # an earlier spoken turn whose transcript never arrived
     return {"role": message["role"], "content": content}
 
 
 class OmniChat:
-    """Inference: streams the reply text."""
+    """Inference: streams reply text chunks and optional ToolCall proposals."""
 
     def __init__(self, client: httpx.AsyncClient, model: str = MODEL, base_url: str = OLLAMA) -> None:
         self.client = client
         self.model = model
         self.base_url = base_url.rstrip("/")
 
-    async def stream(self, messages: Sequence[Message], *, operation_id: str) -> AsyncIterator[str]:
-        body = {
+    async def stream(
+        self,
+        messages: Sequence[Message],
+        *,
+        operation_id: str,
+        tools: Sequence[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[str | ToolCall]:
+        body: dict[str, Any] = {
             "model": self.model,
             "messages": [to_openai(m) for m in messages],
             "stream": True,
             "temperature": 0,
             "seed": SEED,
         }
+        if tools:
+            body["tools"] = list(tools)
+        pending_calls: dict[int, dict[str, str]] = {}
         async with self.client.stream("POST", f"{self.base_url}/v1/chat/completions", json=body) as r:
             if r.status_code != 200:
                 raise RuntimeError(f"Ollama chat failed ({r.status_code}): {(await r.aread())[:200]!r}")
             async for line in r.aiter_lines():
                 if not line.startswith("data: ") or line == "data: [DONE]":
                     continue
-                delta = json.loads(line[6:])["choices"][0].get("delta", {})
+                choice = json.loads(line[6:])["choices"][0]
+                delta = choice.get("delta", {})
                 if delta.get("content"):
                     yield delta["content"]
+                for tc in delta.get("tool_calls") or ():
+                    idx = int(tc.get("index", 0))
+                    slot = pending_calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                    if tc.get("id"):
+                        slot["id"] = str(tc["id"])
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] += str(fn["name"])
+                    if fn.get("arguments"):
+                        slot["arguments"] += str(fn["arguments"])
+        for idx in sorted(pending_calls):
+            slot = pending_calls[idx]
+            if not slot["name"]:
+                continue
+            try:
+                args = json.loads(slot["arguments"]) if slot["arguments"] else {}
+            except ValueError:
+                args = {"_raw": slot["arguments"]}
+            if not isinstance(args, dict):
+                args = {"_raw": args}
+            yield ToolCall(id=slot["id"] or new_id(), name=slot["name"], arguments=args)
 
 
 class OmniSpeech:

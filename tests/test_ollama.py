@@ -7,6 +7,7 @@ import json
 import httpx
 
 from autum.ollama import OmniChat, OmniSpeech, OmniTranscriber, check_ready, to_openai
+from autum.tools import ToolCall
 
 
 def run(coro):
@@ -72,3 +73,30 @@ def test_transcription_and_readiness():
     text, problem = run(scenario())
     assert text == "What time is it?"
     assert "does not have lfm3-omni:2b" in problem
+
+
+def test_chat_streams_tool_calls_and_formats_tool_messages():
+    seen = {}
+
+    def handler(request):
+        seen.update(json.loads(request.content))
+        chunks = [
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "set_timer", "arguments": "{\"seconds\":"}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "60,\"label\":\"tea\"}"}}]}}]},
+        ]
+        body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+        return httpx.Response(200, text=body)
+
+    async def scenario():
+        async with fake_ollama(handler) as client:
+            tools = [{"type": "function", "function": {"name": "set_timer", "parameters": {"type": "object"}}}]
+            return [t async for t in OmniChat(client).stream([{"role": "user", "content": "set timer"}], operation_id="op", tools=tools)]
+
+    out = run(scenario())
+    assert out == [ToolCall(id="call_1", name="set_timer", arguments={"seconds": 60, "label": "tea"})]
+    assert seen["tools"][0]["function"]["name"] == "set_timer"
+    assert to_openai({"role": "tool", "tool_call_id": "call_1", "content": '{"ok":true}'}) == {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": '{"ok":true}',
+    }

@@ -216,12 +216,12 @@ def build_default_registry(
     registry.register(
         Capability(
             name="set_timer",
-            description="Start a local countdown timer for a given number of seconds.",
+            description="Start a countdown timer in seconds.",
             input_schema={
                 "type": "object",
                 "properties": {
-                    "seconds": {"type": "integer", "minimum": 1, "maximum": 86400, "description": "Duration in seconds"},
-                    "label": {"type": "string", "minLength": 1, "maxLength": 60, "description": "Optional short timer label"},
+                    "seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+                    "label": {"type": "string", "minLength": 1, "maxLength": 60},
                 },
                 "required": ["seconds"],
                 "additionalProperties": False,
@@ -244,7 +244,7 @@ def build_default_registry(
     registry.register(
         Capability(
             name="list_timers",
-            description="List all currently active countdown timers and their remaining seconds.",
+            description="List active timers and remaining seconds.",
             input_schema={"type": "object", "properties": {}, "additionalProperties": False},
             output_schema={"type": "object", "required": ["timers"]},
             permission_level=PermissionLevel.READ_ONLY,
@@ -296,12 +296,12 @@ def build_default_registry(
     registry.register(
         Capability(
             name="create_note",
-            description="Create a new plain-text note in Autum's local notes folder (never overwrites existing notes).",
+            description="Create a new plain-text note (never overwrites existing notes).",
             input_schema={
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "minLength": 1, "maxLength": 80, "description": "Short note title"},
-                    "content": {"type": "string", "minLength": 1, "maxLength": 8000, "description": "Note body text"},
+                    "title": {"type": "string", "minLength": 1, "maxLength": 80},
+                    "content": {"type": "string", "minLength": 1, "maxLength": 8000},
                 },
                 "required": ["title", "content"],
                 "additionalProperties": False,
@@ -325,7 +325,7 @@ def build_default_registry(
     registry.register(
         Capability(
             name="list_notes",
-            description="List the titles of notes saved in Autum's local notes folder.",
+            description="List saved note titles.",
             input_schema={"type": "object", "properties": {}, "additionalProperties": False},
             output_schema={"type": "object", "required": ["notes"]},
             permission_level=PermissionLevel.READ_ONLY,
@@ -345,11 +345,11 @@ def build_default_registry(
     registry.register(
         Capability(
             name="read_note",
-            description="Read a saved note from Autum's local notes folder.",
+            description="Read a saved local note.",
             input_schema={
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "minLength": 1, "maxLength": 80, "description": "Note title or slug"},
+                    "title": {"type": "string", "minLength": 1, "maxLength": 80},
                 },
                 "required": ["title"],
                 "additionalProperties": False,
@@ -373,11 +373,11 @@ def build_default_registry(
     registry.register(
         Capability(
             name="delete_note",
-            description="Permanently delete a note from Autum's local notes folder (requires explicit user approval).",
+            description="Permanently delete a note (irreversible; requires approval).",
             input_schema={
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "minLength": 1, "maxLength": 80, "description": "Note title or slug"},
+                    "title": {"type": "string", "minLength": 1, "maxLength": 80},
                 },
                 "required": ["title"],
                 "additionalProperties": False,

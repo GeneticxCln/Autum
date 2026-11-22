@@ -8,6 +8,7 @@ component error. Holding the bubble sends talk commands to the runtime.
 
 from __future__ import annotations
 
+from collections import deque
 import json
 import statistics
 import time
@@ -49,9 +50,10 @@ class PresenceModel(QObject):
         self._error = ""
         self._connected = False
         self._buffer = b""
-        self._pending: list[int] = []  # mono_ns of state changes not yet on screen
-        self.applied_ms: list[float] = []  # event -> model updated
-        self.shown_ms: list[float] = []  # event -> next frame on screen
+        cap = max(256, int(measure)) if measure else 256
+        self._pending: deque[int] = deque(maxlen=cap)  # mono_ns of state changes not yet on screen
+        self.applied_ms: deque[float] = deque(maxlen=cap)  # event -> model updated
+        self.shown_ms: deque[float] = deque(maxlen=cap)  # event -> next frame on screen
         self._socket = QLocalSocket(self)
         self._socket.readyRead.connect(self._read)
         self._socket.connected.connect(self._on_connected)

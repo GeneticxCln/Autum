@@ -33,6 +33,7 @@ DEVICE_TIMEOUT_S = 3.0
 PLAY_AHEAD_S = 0.15
 LEVEL_EVERY_S = 0.05
 MIN_UTTERANCE_S = 0.3
+MIN_APPROVAL_UTTERANCE_S = 0.12
 AEC_SOURCE = "autum_aec_source"
 AEC_SINK = "autum_aec_sink"
 MIC_HELP = (
@@ -179,13 +180,16 @@ class VoiceInput:
         turn = self._turn
         pcm = await self._stop_capture()
         ended = self.bus.emit("audio.speech_ended", {"confidence": 1.0}, provenance=Provenance.USER, turn_id=turn)
-        if len(pcm) < MIN_UTTERANCE_S * MIC_RATE * 2:
+        waiting_approval = str(getattr(self.runtime, "state", "")) == "waiting_for_approval"
+        min_s = MIN_APPROVAL_UTTERANCE_S if waiting_approval else MIN_UTTERANCE_S
+        if len(pcm) < min_s * MIC_RATE * 2:
             self._nothing_heard(turn)
             return
         wav = wav_bytes(highpass_pcm(pcm, MIC_RATE), MIC_RATE)
-        while len(self._awaiting_transcript) >= 8:
-            self._awaiting_transcript.pop(next(iter(self._awaiting_transcript)))
-        self._awaiting_transcript[turn] = wav
+        if not waiting_approval:
+            while len(self._awaiting_transcript) >= 8:
+                self._awaiting_transcript.pop(next(iter(self._awaiting_transcript)))
+            self._awaiting_transcript[turn] = wav
         self.runtime.submit_speech(turn, wav, ended)
 
     async def abort(self, error: str | None = None) -> None:
@@ -316,6 +320,7 @@ class SpeechPlayer:
                 await asyncio.wait_for(proc.wait(), remaining + DEVICE_TIMEOUT_S)
             except asyncio.TimeoutError:
                 _kill(proc)
+                await proc.wait()
                 raise RuntimeError("the speakers did not finish playing; check the audio output") from None
         started = self._t0 is not None
         self._reset()
@@ -417,6 +422,7 @@ async def read_source_muted() -> bool | None:
         out, _ = await asyncio.wait_for(proc.communicate(), 2.0)
     except asyncio.TimeoutError:
         _kill(proc)
+        await proc.wait()
         return None
     return b"[MUTED]" in out
 
@@ -572,9 +578,8 @@ class HandsFreeInput:
         got_audio = False
         try:
             while self._active and not self.muted:
-                timeout = self.stall_s if not got_audio else None
                 try:
-                    frame = await asyncio.wait_for(proc.stdout.readexactly(VAD_FRAME_BYTES), timeout)
+                    frame = await asyncio.wait_for(proc.stdout.readexactly(VAD_FRAME_BYTES), self.stall_s)
                 except asyncio.TimeoutError:
                     self._report_error(MIC_HELP)
                     return False
@@ -613,13 +618,16 @@ class HandsFreeInput:
                 provenance=Provenance.USER,
                 turn_id=turn,
             )
-            if len(event.pcm) < MIN_UTTERANCE_S * MIC_RATE * 2:
+            waiting_approval = str(getattr(self.runtime, "state", "")) == "waiting_for_approval"
+            min_s = MIN_APPROVAL_UTTERANCE_S if waiting_approval else MIN_UTTERANCE_S
+            if len(event.pcm) < min_s * MIC_RATE * 2:
                 self._nothing_heard(turn)
                 return
             wav = wav_bytes(highpass_pcm(event.pcm, MIC_RATE), MIC_RATE)
-            while len(self._awaiting_transcript) >= 8:
-                self._awaiting_transcript.pop(next(iter(self._awaiting_transcript)))
-            self._awaiting_transcript[turn] = wav
+            if not waiting_approval:
+                while len(self._awaiting_transcript) >= 8:
+                    self._awaiting_transcript.pop(next(iter(self._awaiting_transcript)))
+                self._awaiting_transcript[turn] = wav
             self.runtime.submit_speech(turn, wav, ended)
 
     async def _close_capture(self) -> None:

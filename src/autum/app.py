@@ -347,6 +347,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
             register_memory_capabilities(registry, memory)
             vision = OllamaVision(client, model=cfg.model, base_url=cfg.ollama_url)
             set_obs = lambda src: runtime_ref[0].set_observation(src) if runtime_ref else None  # noqa: E731
+            end_obs = lambda src: runtime_ref[0].end_observation(src) if runtime_ref else None  # noqa: E731
             register_perception_capabilities(
                 registry,
                 vision=vision,
@@ -362,6 +363,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                     allowed_read_dirs=cfg.resolved_allowed_read_dirs(),
                     excluded_windows=cfg.excluded_windows,
                     set_observation=set_obs,
+                    end_observation=end_obs,
                 ),
                 cfg.enabled_integrations,
             )
@@ -418,16 +420,18 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 await make_hands_free().start()
                 if aec is None:
                     log("hands-free mode active (use headphones or pass --aec when using speakers).")
-            PushToTalkKey(
+            hotkey = PushToTalkKey(
                 loop,
                 on_press=lambda: loop.create_task(handle_command({"command": "talk_start"})),
                 on_release=lambda: loop.create_task(handle_command({"command": "talk_finish"})),
                 on_status=log,
-            ).start()
+            )
+            hotkey.start()
             log(f"running ({mode.value}, provisional pipeline D). Stop with Ctrl+C.")
             try:
                 await stop.wait()
             finally:
+                hotkey.stop()
                 await bubble.stop()
                 await integrations.shutdown()
                 await server.close()

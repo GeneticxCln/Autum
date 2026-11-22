@@ -217,14 +217,14 @@ def register_memory_capabilities(registry: ToolRegistry, store: MemoryStore) -> 
     registry.register(
         Capability(
             name="remember_fact",
-            description="Save or update a user-selected persistent fact across sessions (never store secrets or full conversations).",
+            description="Save or update a user-selected persistent fact across sessions (no secrets).",
             input_schema={
                 "type": "object",
                 "properties": {
-                    "key": {"type": "string", "minLength": 1, "maxLength": 80, "description": "Short label for the fact"},
-                    "value": {"type": "string", "minLength": 1, "maxLength": 500, "description": "Fact content to remember"},
-                    "category": {"type": "string", "minLength": 1, "maxLength": 40, "description": "Category such as preference, project, or general"},
-                    "from_observed": {"type": "boolean", "description": "True if this fact came from observed content rather than directly from the user"},
+                    "key": {"type": "string", "minLength": 1, "maxLength": 80},
+                    "value": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "category": {"type": "string", "minLength": 1, "maxLength": 40},
+                    "from_observed": {"type": "boolean"},
                 },
                 "required": ["key", "value"],
                 "additionalProperties": False,
@@ -250,12 +250,12 @@ def register_memory_capabilities(registry: ToolRegistry, store: MemoryStore) -> 
     registry.register(
         Capability(
             name="recall_memories",
-            description="Search or inspect saved persistent memories, returning each entry with its provenance.",
+            description="Search or list saved persistent memories.",
             input_schema={
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "maxLength": 200, "description": "Keywords to search for (omit to list all)"},
-                    "category": {"type": "string", "maxLength": 40, "description": "Optional category filter"},
+                    "query": {"type": "string", "maxLength": 200},
+                    "category": {"type": "string", "maxLength": 40},
                 },
                 "additionalProperties": False,
             },
@@ -279,11 +279,11 @@ def register_memory_capabilities(registry: ToolRegistry, store: MemoryStore) -> 
     registry.register(
         Capability(
             name="forget_memory",
-            description="Permanently delete a saved persistent memory by ID or key (requires explicit user approval).",
+            description="Permanently delete a saved memory by ID or key (irreversible; requires approval).",
             input_schema={
                 "type": "object",
                 "properties": {
-                    "identifier": {"type": "string", "minLength": 1, "maxLength": 80, "description": "Memory ID or key"},
+                    "identifier": {"type": "string", "minLength": 1, "maxLength": 80},
                 },
                 "required": ["identifier"],
                 "additionalProperties": False,

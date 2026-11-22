@@ -848,16 +848,18 @@ optional PipeWire WebRTC echo cancellation (`--aec`). Final silence/barge-in
 thresholds and the speaker vs. headphone policy remain provisional until M1's
 recorded set and attended echo test complete.
 
-**M4 status (2026-11-22):** the visual presence is a 300 px particle cloud in
-the bottom-right screen corner and nothing else (user's choice of design;
-secondary WP4 items — captions, text input, menus, and extra controls — are
-explicitly deferred by user decision): its own process, pinned across all
-virtual desktops and windows via Wayland `wlr-layer-shell` (with an X11
-fallback), kept off the taskbar, fed by the event socket. The microphone
-indicator is part of the cloud: a warm edge glow while open, grey with a gap
-while muted. Measured on native Wayland `wlr-layer-shell` (300 px cloud):
-steady CPU about 14% of one core, ~302 MiB RSS, and state change to screen
-in 6.0 ms median / 71.2 ms max (`n=20`, objective: 100 ms or less).
+**M4 status (2026-11-22):** the visual presence is a 300 px 3D stippled face
+suspended inside a frosted stardust orb (`src/autum/presence/cloud_item.py`,
+`face_cloud.npz`) in the bottom-right screen corner and nothing else (user's
+choice of design; secondary WP4 items — captions, text input, menus, and extra
+controls — are explicitly deferred by user decision): its own process, pinned
+across all virtual desktops and windows via Wayland `wlr-layer-shell` (with an
+X11 fallback), kept off the taskbar, fed by the event socket. The microphone
+and observation indicators are built into the orb: a warm amber edge aura while
+open, grey with a lower-right gap while muted, and a cool cyan-teal halo while
+observing. Measured on native Wayland `wlr-layer-shell` (300 px physical):
+steady CPU ~16.5% of one core, and state change to screen in 10.3 ms median /
+15.5 ms max (`n=20`, objective: 100 ms or less).
 
 **M5 status (2026-11-22):** implemented WP3 session stability and recovery:
 character-bounded conversation context (`max_context_chars`) with immediate
@@ -914,12 +916,13 @@ warnings) and live `system_info` tool verification on local `lfm3-omni:2b`.
 
 **WP11 / R2 acceptance suite status (2026-11-22):** added explicit
 `AUT-01`–`AUT-11` traceability acceptance tests (`tests/test_r2_acceptance.py`)
-and documented the verification matrix in `docs/acceptance-matrix.md`. All
-automated unit, integration, security, and acceptance tests pass with zero
-warnings. Remaining hardware/human gates before formal R1/R2 sign-off: M1
-real-voice corpus (`recorded-v1`), attended echo/barge-in run, ADR 0002, and
-an 8-hour continuous live soak. M11 (human character prototype) remains
-optional and unstarted.
+and documented the verification matrix in `docs/acceptance-matrix.md`. ADR 0002
+is accepted (`docs/adr/0002-voice-pipeline-and-resource-budget.md`). All
+automated unit, integration, security, and acceptance tests pass. Remaining
+deferred hardware/human gates before a formal external R1/R2 sign-off: M1
+real-voice corpus (`recorded-v1`), attended speaker echo/barge-in run, and an
+8-hour continuous live soak. M11 (full animated human character prototype)
+remains optional and unstarted.
 
 M0 and M1 run in parallel. M0's skeleton is the codebase M2 builds on;
 M1's benchmark harness is the first running voice pipeline. Visual work

@@ -91,12 +91,28 @@ class Capability:
     precondition: Callable[[dict[str, Any]], str | None] | None = None
 
     def openai_tool(self) -> dict[str, Any]:
+        # Strip pure runtime-validation constraints (minLength, maxLength,
+        # minimum, maximum, additionalProperties) from the prompt schema to
+        # preserve local context budget; validate_arguments() still enforces them.
+        compact_props: dict[str, Any] = {}
+        for key, spec in (self.input_schema.get("properties") or {}).items():
+            if not isinstance(spec, Mapping):
+                continue
+            entry: dict[str, Any] = {}
+            for keep in ("type", "description", "enum"):
+                if keep in spec:
+                    entry[keep] = spec[keep]
+            compact_props[key] = entry
+        params: dict[str, Any] = {"type": "object", "properties": compact_props}
+        req = self.input_schema.get("required")
+        if req:
+            params["required"] = list(req)
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.input_schema,
+                "parameters": params,
             },
         }
 

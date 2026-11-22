@@ -56,16 +56,38 @@ class PushToTalkKey:
     ) -> None:
         self.loop = loop
         self.on_status = on_status
+        self._stopped = threading.Event()
+        self._glib_loop = None
+        self._glib_context = None
         self.router = KeyRouter(
-            lambda: loop.call_soon_threadsafe(on_press),
-            lambda: loop.call_soon_threadsafe(on_release),
+            lambda: self._dispatch(on_press),
+            lambda: self._dispatch(on_release),
         )
+
+    def _dispatch(self, fn: Callable, *args) -> None:
+        if self._stopped.is_set() or self.loop.is_closed():
+            return
+        try:
+            self.loop.call_soon_threadsafe(fn, *args)
+        except RuntimeError:
+            pass
 
     def start(self) -> None:
         threading.Thread(target=self._run, name="autum-hotkey", daemon=True).start()
 
+    def stop(self) -> None:
+        """Stop the GLib portal loop cleanly on shutdown."""
+        self._stopped.set()
+        loop = self._glib_loop
+        ctx = self._glib_context
+        if loop is not None and ctx is not None:
+            try:
+                ctx.invoke(loop.quit)
+            except Exception:
+                pass
+
     def _status(self, message: str) -> None:
-        self.loop.call_soon_threadsafe(self.on_status, message)
+        self._dispatch(self.on_status, message)
 
     def _run(self) -> None:
         try:
@@ -75,10 +97,13 @@ class PushToTalkKey:
             return
         context = GLib.MainContext.new()
         context.push_thread_default()
+        self._glib_context = context
         try:
             bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
             self._register(bus, Gio, GLib)
             session = self._create_session(bus, context, Gio, GLib)
+            if self._stopped.is_set():
+                return
             for name in ("Activated", "Deactivated"):
                 bus.signal_subscribe(
                     PORTAL, SHORTCUTS, name, PORTAL_PATH, None, Gio.DBusSignalFlags.NONE,
@@ -86,10 +111,20 @@ class PushToTalkKey:
                 )
             self.router.session = session
             key = self._bind(bus, context, session, Gio, GLib)
+            if self._stopped.is_set():
+                return
             self._status(f"Hold {key} anywhere to talk to Autum (or hold the bubble).")
-            GLib.MainLoop.new(context, False).run()
+            glib_loop = GLib.MainLoop.new(context, False)
+            self._glib_loop = glib_loop
+            if not self._stopped.is_set():
+                glib_loop.run()
         except Exception as exc:  # the portal is optional: Autum still works with the bubble
-            self._status(f"Hold-to-talk key unavailable ({exc}); hold the bubble to talk.")
+            if not self._stopped.is_set():
+                self._status(f"Hold-to-talk key unavailable ({exc}); hold the bubble to talk.")
+        finally:
+            self._glib_loop = None
+            self._glib_context = None
+            context.pop_thread_default()
 
     def _register(self, bus, Gio, GLib) -> None:
         """Tell the portal who we are, so the desktop remembers the key for Autum."""

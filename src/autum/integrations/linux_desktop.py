@@ -290,6 +290,7 @@ class LinuxDesktopIntegration:
         self.screen_watcher = screen_watcher if screen_watcher is not None else ScreenWatcher()
         self.window_controller = window_controller if window_controller is not None else KWinController()
         self._set_obs: Callable[[str], None] | None = None
+        self._end_obs: Callable[[str], None] | None = None
 
     def is_available(self) -> bool:
         return platform.system() == "Linux"
@@ -297,16 +298,25 @@ class LinuxDesktopIntegration:
     async def shutdown(self) -> None:
         if getattr(self.screen_watcher, "active", False):
             await self.screen_watcher.stop()
-            if self._set_obs is not None:
+            if self._end_obs is not None:
+                self._end_obs("screen")
+            elif self._set_obs is not None:
                 self._set_obs("none")
 
     def register(self, registry: ToolRegistry, context: IntegrationContext) -> list[str]:
         registered: list[str] = []
         self._set_obs = context.set_observation
+        self._end_obs = context.end_observation
 
         def _notify(source: str) -> None:
             if context.set_observation is not None:
                 context.set_observation(source)
+
+        def _end_screen_obs() -> None:
+            if context.end_observation is not None:
+                context.end_observation("screen")
+            elif context.set_observation is not None:
+                context.set_observation("none")
 
         # 1. System info (READ_ONLY, observed)
         async def _system_info(_args: dict[str, Any]) -> dict[str, Any]:
@@ -438,11 +448,11 @@ class LinuxDesktopIntegration:
         registry.register(
             Capability(
                 name="open_application",
-                description="Open an installed desktop application by name (for example firefox, dolphin, calculator).",
+                description="Launch a new desktop app that is not running yet (never use this to move, resize, or focus an already-open window).",
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "app": {"type": "string", "minLength": 1, "maxLength": 80, "description": "Installed desktop application name or .desktop ID"},
+                        "app": {"type": "string", "minLength": 1, "maxLength": 80, "description": "App name or .desktop ID"},
                     },
                     "required": ["app"],
                     "additionalProperties": False,
@@ -459,11 +469,15 @@ class LinuxDesktopIntegration:
 
         # 5. Eyes: opt-in real-time screen watch (REVERSIBLE / READ_ONLY, observed)
         watcher = self.screen_watcher
+        wm = self.window_controller
 
         async def _start_watch(args: dict[str, Any]) -> dict[str, Any]:
             source = str(args.get("source", "both"))
             if source not in ("monitor", "window", "both"):
                 raise ValueError("source must be 'monitor', 'window', or 'both'")
+            loop = asyncio.get_running_loop()
+            if hasattr(watcher, "set_on_ended"):
+                watcher.set_on_ended(lambda: loop.call_soon_threadsafe(_end_screen_obs) if not loop.is_closed() else None)
             res = await watcher.start(source)
             _notify("screen")
             return res
@@ -474,11 +488,11 @@ class LinuxDesktopIntegration:
         registry.register(
             Capability(
                 name="start_screen_watch",
-                description="Start opt-in real-time screen or window watching via the desktop share picker so Autum can see your screen live until you stop it.",
+                description="Start live opt-in screen sharing so Autum can see your desktop in real time until stopped.",
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "source": {"type": "string", "description": "What to share: 'monitor', 'window', or 'both' (default)"},
+                        "source": {"type": "string", "enum": ["monitor", "window", "both"], "description": "Share target"},
                     },
                     "additionalProperties": False,
                 },
@@ -496,6 +510,16 @@ class LinuxDesktopIntegration:
         async def _look_at_screen(args: dict[str, Any]) -> dict[str, Any]:
             if context.vision is None:
                 raise RuntimeError("local vision analyzer is not configured")
+            # §5.3: refuse live screen vision while an excluded password/wallet window is active
+            if wm is not None and hasattr(wm, "active_excluded_window") and context.excluded_windows:
+                try:
+                    hit = await wm.active_excluded_window(context.excluded_windows)
+                except Exception:
+                    hit = None
+                if hit is not None:
+                    raise PermissionError(
+                        f"cannot inspect live screen while excluded sensitive window matching {hit!r} is active (plan §5.3)"
+                    )
             frame = watcher.latest_frame()
             question = str(args.get("question") or "Describe what is currently visible on the screen concisely.")
             observation = await context.vision(frame, "image/jpeg", question)
@@ -512,11 +536,11 @@ class LinuxDesktopIntegration:
         registry.register(
             Capability(
                 name="look_at_screen",
-                description="Inspect the latest live frame from active screen watching (call start_screen_watch first if not watching).",
+                description="Inspect the latest live screen frame (use when screen watching is active to see what is on screen).",
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "question": {"type": "string", "minLength": 1, "maxLength": 400, "description": "What to look for on the screen"},
+                        "question": {"type": "string", "minLength": 1, "maxLength": 400, "description": "What to look for"},
                     },
                     "additionalProperties": False,
                 },
@@ -533,7 +557,7 @@ class LinuxDesktopIntegration:
 
         async def _stop_watch(_args: dict[str, Any]) -> dict[str, Any]:
             res = await watcher.stop()
-            _notify("none")
+            _end_screen_obs()
             return res
 
         async def _verify_stop_watch(_args: dict[str, Any], _res: dict[str, Any]) -> bool:
@@ -542,7 +566,7 @@ class LinuxDesktopIntegration:
         registry.register(
             Capability(
                 name="stop_screen_watch",
-                description="Stop live screen watching immediately and close the screen-sharing session.",
+                description="Stop live screen watching and close the share session.",
                 input_schema={"type": "object", "properties": {}, "additionalProperties": False},
                 output_schema={"type": "object", "required": ["active"]},
                 permission_level=PermissionLevel.REVERSIBLE,
@@ -555,7 +579,6 @@ class LinuxDesktopIntegration:
         registered.append("stop_screen_watch")
 
         # 6. Hands: KDE KWin window control (list, focus, move/tile/desktop, state, close)
-        wm = self.window_controller
         if wm is not None and wm.is_available():
             async def _list_windows(_args: dict[str, Any]) -> dict[str, Any]:
                 wins = await wm.list_windows(context.excluded_windows)
@@ -567,7 +590,7 @@ class LinuxDesktopIntegration:
             registry.register(
                 Capability(
                     name="list_windows",
-                    description="List currently open desktop application windows with their app name, title, geometry, and virtual desktop.",
+                    description="List open desktop windows with app name, title, position, size, and virtual desktop.",
                     input_schema={"type": "object", "properties": {}, "additionalProperties": False},
                     output_schema={"type": "object", "required": ["windows", "count"]},
                     permission_level=PermissionLevel.READ_ONLY,
@@ -588,11 +611,11 @@ class LinuxDesktopIntegration:
             registry.register(
                 Capability(
                     name="focus_window",
-                    description="Bring an open application window to the front and focus it by app name, title, or ID.",
+                    description="Focus and bring an already-open window to the front.",
                     input_schema={
                         "type": "object",
                         "properties": {
-                            "window": {"type": "string", "minLength": 1, "maxLength": 120, "description": "App name, window title substring, or window ID"},
+                            "window": {"type": "string", "minLength": 1, "maxLength": 120, "description": "App name, title, or ID"},
                         },
                         "required": ["window"],
                         "additionalProperties": False,
@@ -620,29 +643,43 @@ class LinuxDesktopIntegration:
                 )
 
             async def _verify_move(args: dict[str, Any], res: dict[str, Any]) -> bool:
-                if not res.get("id"):
+                wid = res.get("id")
+                if not wid:
                     return False
-                if args.get("desktop") is not None and res.get("desktop") not in (0, int(args["desktop"])):
+                # Wayland clients apply KWin geometry/desktop configures asynchronously;
+                # re-query briefly to verify the resulting window state.
+                await asyncio.sleep(0.12)
+                try:
+                    wins = await wm.list_windows(context.excluded_windows)
+                    cur = next((w for w in wins if w.get("id") == wid), None)
+                except Exception:
+                    cur = None
+                check = cur if cur is not None else res
+                if args.get("desktop") is not None and check.get("desktop") not in (0, int(args["desktop"])):
                     return False
+                if args.get("x") is not None and abs(int(check.get("x", 0)) - int(args["x"])) > 80:
+                    return False
+                if args.get("y") is not None and abs(int(check.get("y", 0)) - int(args["y"])) > 80:
+                    return False
+                if "target_x" in res and args.get("position") in ("left", "right", "top", "bottom"):
+                    if abs(int(check.get("x", 0)) - int(res["target_x"])) > 120 or abs(int(check.get("y", 0)) - int(res["target_y"])) > 120:
+                        return False
                 return True
 
             registry.register(
                 Capability(
                     name="move_window",
-                    description=(
-                        "Move, resize, snap/tile (left, right, top, bottom, center, top_left, top_right, "
-                        "bottom_left, bottom_right), or send an open window to another virtual desktop."
-                    ),
+                    description="Move, resize, snap/tile (left, right, top, bottom, center, corners), or send an open window to another virtual desktop.",
                     input_schema={
                         "type": "object",
                         "properties": {
-                            "window": {"type": "string", "minLength": 1, "maxLength": 120, "description": "App name, window title substring, or window ID"},
-                            "position": {"type": "string", "description": f"Snap preset: {', '.join(sorted(SNAP_POSITIONS))}"},
+                            "window": {"type": "string", "minLength": 1, "maxLength": 120, "description": "App name, title, or ID"},
+                            "position": {"type": "string", "enum": sorted(SNAP_POSITIONS), "description": "Snap preset"},
                             "x": {"type": "integer", "minimum": -4096, "maximum": 16384},
                             "y": {"type": "integer", "minimum": -4096, "maximum": 16384},
                             "width": {"type": "integer", "minimum": 100, "maximum": 8192},
                             "height": {"type": "integer", "minimum": 100, "maximum": 8192},
-                            "desktop": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Target virtual desktop number (1-based)"},
+                            "desktop": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Virtual desktop (1-based)"},
                         },
                         "required": ["window"],
                         "additionalProperties": False,
@@ -661,19 +698,31 @@ class LinuxDesktopIntegration:
                 return await wm.set_window_state(str(args["window"]), str(args["action"]), context.excluded_windows)
 
             async def _verify_state(args: dict[str, Any], res: dict[str, Any]) -> bool:
+                wid = res.get("id")
+                if not wid:
+                    return False
+                await asyncio.sleep(0.10)
+                try:
+                    wins = await wm.list_windows(context.excluded_windows)
+                    cur = next((w for w in wins if w.get("id") == wid), None)
+                except Exception:
+                    cur = None
+                check = cur if cur is not None else res
                 if args["action"] == "minimize":
-                    return bool(res.get("minimized"))
-                return bool(res.get("id")) and not bool(res.get("minimized"))
+                    return bool(check.get("minimized"))
+                if args["action"] == "maximize" and "maximized" in check:
+                    return not bool(check.get("minimized")) and bool(check.get("maximized"))
+                return not bool(check.get("minimized"))
 
             registry.register(
                 Capability(
                     name="window_state",
-                    description="Minimize, maximize, or restore an open application window.",
+                    description="Minimize, maximize, or restore an open window.",
                     input_schema={
                         "type": "object",
                         "properties": {
-                            "window": {"type": "string", "minLength": 1, "maxLength": 120, "description": "App name, window title substring, or window ID"},
-                            "action": {"type": "string", "description": "One of: minimize, maximize, restore"},
+                            "window": {"type": "string", "minLength": 1, "maxLength": 120, "description": "App name, title, or ID"},
+                            "action": {"type": "string", "enum": ["minimize", "maximize", "restore"]},
                         },
                         "required": ["window", "action"],
                         "additionalProperties": False,
@@ -699,11 +748,11 @@ class LinuxDesktopIntegration:
             registry.register(
                 Capability(
                     name="close_window",
-                    description="Close an open application window (irreversible: may lose unsaved work; always requires explicit user approval).",
+                    description="Close an open window (irreversible; requires explicit approval).",
                     input_schema={
                         "type": "object",
                         "properties": {
-                            "window": {"type": "string", "minLength": 1, "maxLength": 120, "description": "App name, window title substring, or window ID"},
+                            "window": {"type": "string", "minLength": 1, "maxLength": 120, "description": "App name, title, or ID"},
                         },
                         "required": ["window"],
                         "additionalProperties": False,

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import tomllib
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,7 +61,8 @@ class Config:
             raise ValueError("max_context_chars must be between 500 and 200000")
         if self.approval_timeout_s < 2.0 or self.approval_timeout_s > 120.0:
             raise ValueError("approval_timeout_s must be between 2 and 120")
-        if not self.ollama_url.startswith(("http://127.0.0.1", "http://localhost", "http://[::1]")):
+        parsed = urllib.parse.urlparse(self.ollama_url)
+        if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
             raise ValueError("ollama_url must point to localhost (plan §5.5)")
 
     def resolved_data_dir(self) -> Path | None:

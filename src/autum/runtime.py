@@ -87,7 +87,7 @@ TRANSITIONS: Mapping[State, frozenset[State]] = {
     S.SPEECH_DETECTED: frozenset({S.PROCESSING, S.LISTENING, S.IDLE, S.ERROR}),
     S.PROCESSING: frozenset({S.THINKING, S.SPEECH_DETECTED, S.LISTENING, S.IDLE, S.ERROR}),
     S.THINKING: frozenset({S.SPEAKING, S.WAITING_FOR_APPROVAL, S.INTERRUPTED, S.LISTENING, S.IDLE, S.ERROR}),
-    S.SPEAKING: frozenset({S.WAITING_FOR_APPROVAL, S.INTERRUPTED, S.LISTENING, S.IDLE, S.ERROR}),
+    S.SPEAKING: frozenset({S.THINKING, S.WAITING_FOR_APPROVAL, S.INTERRUPTED, S.LISTENING, S.IDLE, S.ERROR}),
     S.INTERRUPTED: frozenset({S.SPEECH_DETECTED, S.THINKING, S.LISTENING, S.IDLE, S.ERROR}),
     S.WAITING_FOR_APPROVAL: frozenset({S.THINKING, S.INTERRUPTED, S.LISTENING, S.IDLE, S.ERROR}),
     S.ERROR: frozenset({S.IDLE, S.LISTENING, S.LOADING}),
@@ -140,6 +140,7 @@ class Runtime:
         self.muted = False
         self.capturing = False
         self.observation = "none"
+        self._obs_stack: list[str] = []
         self._op: _Operation | None = None
         self._input_turn: str | None = None
         self._approval_turn: tuple[str, str, int] | None = None  # (turn_id, source_mode, started_mono_ns)
@@ -193,16 +194,37 @@ class Runtime:
             self._set_state(self.rest_state, "model_ready", ev)
 
     def set_observation(self, source: str) -> None:
-        """Update the active observation indicator and emit perception events (§3.2, §5.4)."""
+        """Update the active observation indicator and emit perception events (§3.2, §5.4).
+
+        Tracks nested observations (e.g. reading a document while live screen
+        watching is active) so ending a transient observation never clears an
+        ongoing screen watch indicator.
+        """
         clean = (source or "none").strip() or "none"
-        prev = self.observation
-        if clean == prev:
-            return
-        self.observation = clean
         if clean != "none":
+            if self._obs_stack and self._obs_stack[-1] == clean:
+                return
+            self._obs_stack.append(clean)
+            self.observation = clean
             cause = self.bus.emit("perception.started", {"source": clean})
-        else:
-            cause = self.bus.emit("perception.completed", {"source": prev})
+            self._set_state(self.state, "observation", cause)
+            return
+        if not self._obs_stack:
+            return
+        ended = self._obs_stack.pop()
+        self.observation = self._obs_stack[-1] if self._obs_stack else "none"
+        cause = self.bus.emit("perception.completed", {"source": ended})
+        self._set_state(self.state, "observation", cause)
+
+    def end_observation(self, source: str) -> None:
+        """Remove a specific active observation source (e.g. stopping live screen watch)."""
+        clean = (source or "").strip()
+        if not clean or clean not in self._obs_stack:
+            return
+        idx = len(self._obs_stack) - 1 - self._obs_stack[::-1].index(clean)
+        self._obs_stack.pop(idx)
+        self.observation = self._obs_stack[-1] if self._obs_stack else "none"
+        cause = self.bus.emit("perception.completed", {"source": clean})
         self._set_state(self.state, "observation", cause)
 
     def _set_state(self, new: State, reason: str, cause: Event | None = None) -> None:
@@ -276,7 +298,15 @@ class Runtime:
             and pending.ready_at_ns is not None
             and event.mono_ns >= pending.ready_at_ns
         ):
-            self._approval_turn = (event.turn_id or new_id(), str(event.payload["mode"]), event.mono_ns)
+            src_mode = str(event.payload["mode"])
+            # §5.2: never let open-mic hands-free speech clobber a push-to-talk
+            # approval or steal an irreversible approval in hands-free mode.
+            if src_mode == Mode.HANDS_FREE and (
+                (pending.level is PermissionLevel.IRREVERSIBLE and self.mode is Mode.HANDS_FREE)
+                or (self._approval_turn is not None and self._approval_turn[1] == Mode.PUSH_TO_TALK)
+            ):
+                return
+            self._approval_turn = (event.turn_id or new_id(), src_mode, event.mono_ns)
             return
         self._input_turn = event.turn_id
         if self._op is not None:
@@ -492,6 +522,7 @@ class Runtime:
         messages.extend(dict(entry) for entry in self.history)
         tool_schemas = self.tools.openai_tools() if self.tools is not None else None
         max_steps = self.max_agent_steps if tool_schemas else 1
+        emitted_parts: list[str] = []
         final_text = ""
         try:
             started = self.bus.emit(
@@ -526,10 +557,20 @@ class Runtime:
                 if not self.bus.fence.is_live(op_id):
                     return
                 if tool_calls and self.tools is not None:
+                    preamble = "".join(parts)
+                    if preamble:
+                        self._speak(chunker.flush(), op_id, turn_id)
+                        emitted_parts.append(preamble)
+                        if self.state is State.SPEAKING:
+                            await self.speech.drain(op_id)
+                            if not self.bus.fence.is_live(op_id):
+                                return
+                            if self.state is State.SPEAKING:
+                                self._set_state(State.THINKING, "tool_execution", started)
                     messages.append(
                         {
                             "role": "assistant",
-                            "content": "".join(parts),
+                            "content": preamble,
                             "tool_calls": [
                                 {
                                     "id": tc.id,
@@ -563,7 +604,12 @@ class Runtime:
                         )
                     continue
                 self._speak(chunker.flush(), op_id, turn_id)
-                final_text = "".join(parts)
+                step_text = "".join(parts)
+                final_text = (
+                    " ".join(p.strip() for p in (*emitted_parts, step_text) if p.strip())
+                    if emitted_parts
+                    else step_text
+                )
                 break
 
             finished = self.bus.emit(

@@ -23,16 +23,16 @@ PYTHONPATH=src python3 -m autum --hands-free          # with headphones
 PYTHONPATH=src python3 -m autum --hands-free --aec    # with speakers (PipeWire WebRTC AEC)
 ```
 
-Autum runs in the background. Her visual presence is a 300 px particle cloud in
-the bottom-right corner that follows you across windows and virtual desktops via
-Wayland `wlr-layer-shell`:
+Autum runs in the background. Her visual presence is a 300 px 3D stippled face
+suspended inside a frosted stardust orb in the bottom-right corner that follows
+you across windows and virtual desktops via Wayland `wlr-layer-shell`:
 
-- **Idle:** slow drift
-- **Listening / speech detected:** gathers tight with a warm open-mic edge glow
-- **Thinking / processing:** swirls in orbital bands
-- **Speaking:** bursts outward with her voice level
+- **Idle:** frosted silver-ice, slow stardust orbit and gentle 3D breathing sway
+- **Listening / speech detected:** cool ice-cyan, gathered inward, attentive gaze, warm open-mic edge aura
+- **Thinking / processing:** silver-violet swirling stardust bands with subtle crown wave
+- **Speaking:** luminous silver-blue with audio-reactive jaw articulation and outward stardust burst
 - **Waiting for approval:** warm gold tint
-- **Observing (image / document / window):** cool cyan-teal outer halo
+- **Observing (image / document / window / screen):** cool cyan-teal outer halo and attentive eye sheen
 - **Muted:** grey with a lower-right gap (controlled only by your OS mic mute; Autum never unmutes it)
 
 In push-to-talk mode, hold the global shortcut (KDE GlobalShortcuts portal,
@@ -57,9 +57,9 @@ Autum speaks interrupts her immediately.
   - **Info & files:** `system_info`, scoped `list_directory` (`allowed_read_dirs`).
   - **Eyes (opt-in live screen vision):** `start_screen_watch` (one-time KDE ScreenCast share picker; keeps a single downscaled JPEG in RAM while the cloud's cyan-teal halo stays lit), `look_at_screen` (instant local vision on the latest live frame), `stop_screen_watch`, and one-shot `inspect_selected_window`.
   - **Hands (KDE KWin window control & apps):** `open_application`, `list_windows`, `focus_window`, `move_window` (snap/tile left/right/top/bottom/center/corners, coordinates, or move to another virtual desktop), `window_state` (minimize/maximize/restore), and `close_window` *(irreversible — requires approval)*. Password managers and wallets are excluded.
-- **Approvals & audit:** irreversible actions (`delete_note`, `forget_memory`)
-  always require explicit user approval (single-use, timed, anti-spoofed).
-  Actions are recorded in a redacted audit log at
+- **Approvals & audit:** irreversible actions (`delete_note`, `forget_memory`,
+  `close_window`) always require explicit user approval (single-use, timed,
+  anti-spoofed). Actions are recorded in a redacted audit log at
   `~/.local/share/autum/audit.jsonl`.
 
 ## Configuration

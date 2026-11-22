@@ -127,6 +127,22 @@ class KWinController:
         except Exception:
             return False
 
+    async def active_excluded_window(self, excluded: Sequence[str] = ()) -> str | None:
+        """Return the matched exclusion pattern if the active window is excluded (§5.3), else None."""
+        if not excluded:
+            return None
+        js = """
+var w = workspace.activeWindow;
+if (!w) { __reply({title: "", app: ""}); }
+else { __reply({title: String(w.caption || ""), app: String(w.resourceClass || "")}); }
+"""
+        info = await asyncio.to_thread(_run_kwin_js_sync, js)
+        hay = f"{info.get('title', '')} {info.get('app', '')}".lower()
+        for pat in excluded:
+            if pat and pat.lower() in hay:
+                return pat
+        return None
+
     async def list_windows(self, excluded: Sequence[str] = ()) -> list[dict[str, Any]]:
         js = """
 var out = [];
@@ -136,6 +152,8 @@ for (var i = 0; i < ws.length; i++) {
     var w = ws[i];
     if (!w.normalWindow || w.skipTaskbar) continue;
     var g = w.frameGeometry;
+    var area = workspace.clientArea(KWin.MaximizeArea, w);
+    var isMax = (Math.abs(g.width - area.width) <= 24 && Math.abs(g.height - area.height) <= 48);
     var dnum = (w.desktops && w.desktops.length > 0 && w.desktops[0].x11DesktopNumber) ? w.desktops[0].x11DesktopNumber : 0;
     out.push({
         id: String(w.internalId),
@@ -144,6 +162,7 @@ for (var i = 0; i < ws.length; i++) {
         x: Math.round(g.x), y: Math.round(g.y),
         width: Math.round(g.width), height: Math.round(g.height),
         minimized: Boolean(w.minimized),
+        maximized: Boolean(isMax),
         desktop: dnum,
         active: String(w.internalId) === activeId
     });
@@ -241,7 +260,7 @@ else {{
     }}
     var g = w.frameGeometry;
     var dnum = (w.desktops && w.desktops.length > 0 && w.desktops[0].x11DesktopNumber) ? w.desktops[0].x11DesktopNumber : 0;
-    __reply({{id: String(w.internalId), title: String(w.caption), app: String(w.resourceClass), x: Math.round(g.x), y: Math.round(g.y), width: Math.round(g.width), height: Math.round(g.height), desktop: dnum}});
+    __reply({{id: String(w.internalId), title: String(w.caption), app: String(w.resourceClass), x: Math.round(g.x), y: Math.round(g.y), width: Math.round(g.width), height: Math.round(g.height), target_x: Math.round(nx), target_y: Math.round(ny), target_width: Math.round(nw), target_height: Math.round(nh), desktop: dnum}});
 }}
 """
         return await asyncio.to_thread(_run_kwin_js_sync, js)
@@ -261,7 +280,10 @@ else {{
     if ({json.dumps(action)} === "minimize") {{ w.minimized = true; }}
     else if ({json.dumps(action)} === "maximize") {{ w.minimized = false; w.setMaximize(true, true); }}
     else {{ w.minimized = false; w.setMaximize(false, false); }}
-    __reply({{id: String(w.internalId), title: String(w.caption), app: String(w.resourceClass), action: {json.dumps(action)}, minimized: Boolean(w.minimized)}});
+    var g = w.frameGeometry;
+    var area = workspace.clientArea(KWin.MaximizeArea, w);
+    var isMax = (Math.abs(g.width - area.width) <= 24 && Math.abs(g.height - area.height) <= 48);
+    __reply({{id: String(w.internalId), title: String(w.caption), app: String(w.resourceClass), action: {json.dumps(action)}, minimized: Boolean(w.minimized), maximized: Boolean(isMax)}});
 }}
 """
         return await asyncio.to_thread(_run_kwin_js_sync, js)

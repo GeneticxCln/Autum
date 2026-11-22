@@ -27,6 +27,7 @@ class IntegrationContext:
         "keepassxc", "1password", "bitwarden", "kwallet", "polkit", "pinentry", "password",
     )
     set_observation: ObservationHook | None = None
+    end_observation: ObservationHook | None = None
 
 
 class Integration(Protocol):

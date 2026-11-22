@@ -217,12 +217,12 @@ def register_perception_capabilities(
     registry.register(
         Capability(
             name="inspect_image",
-            description="Inspect a user-supplied screenshot or image file locally and report what is visibly present.",
+            description="Inspect a user-supplied image file locally and describe what is visible.",
             input_schema={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Path to the image or screenshot file"},
-                    "question": {"type": "string", "minLength": 1, "maxLength": 400, "description": "Optional specific question about the image"},
+                    "path": {"type": "string", "minLength": 1, "maxLength": 512},
+                    "question": {"type": "string", "minLength": 1, "maxLength": 400},
                 },
                 "required": ["path"],
                 "additionalProperties": False,
@@ -260,12 +260,12 @@ def register_perception_capabilities(
     registry.register(
         Capability(
             name="read_document",
-            description="Read a user-supplied local text, markdown, JSON, code, or PDF document as observed data.",
+            description="Read a user-supplied local text, code, or PDF document.",
             input_schema={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Path to the document file"},
-                    "max_chars": {"type": "integer", "minimum": 100, "maximum": MAX_DOC_CHARS, "description": "Maximum characters to return"},
+                    "path": {"type": "string", "minLength": 1, "maxLength": 512},
+                    "max_chars": {"type": "integer", "minimum": 100, "maximum": MAX_DOC_CHARS},
                 },
                 "required": ["path"],
                 "additionalProperties": False,

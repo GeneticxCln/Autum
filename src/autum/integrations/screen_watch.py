@@ -18,7 +18,7 @@ import os
 import secrets
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 PORTAL_BUS = "org.freedesktop.portal.Desktop"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
@@ -158,11 +158,20 @@ def _close_portal_session(session_handle: str) -> None:
 class ScreenWatcher:
     """Maintains a single live downscaled JPEG frame in RAM from a PipeWire ScreenCast."""
 
-    def __init__(self, *, max_width: int = 1280, max_height: int = 720, fps: int = 2) -> None:
+    def __init__(
+        self,
+        *,
+        max_width: int = 1280,
+        max_height: int = 720,
+        fps: int = 2,
+        on_ended: Callable[[], None] | None = None,
+    ) -> None:
         self.max_width = max_width
         self.max_height = max_height
         self.fps = fps
+        self._on_ended = on_ended
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
         self._frame: bytes | None = None
         self._frame_ts: float = 0.0
         self._frame_ready = threading.Event()
@@ -170,6 +179,9 @@ class ScreenWatcher:
         self._pw_fd: int | None = None
         self._pipeline = None
         self._active = False
+
+    def set_on_ended(self, callback: Callable[[], None] | None) -> None:
+        self._on_ended = callback
 
     @property
     def active(self) -> bool:
@@ -216,6 +228,7 @@ class ScreenWatcher:
 
         self._pipeline = pipeline
         self._active = True
+        threading.Thread(target=self._watch_bus, args=(pipeline,), name="autum-screenwatch-bus", daemon=True).start()
         got_first = self._frame_ready.wait(timeout=5.0)
         if not got_first:
             self._cleanup_sync()
@@ -223,6 +236,26 @@ class ScreenWatcher:
         with self._lock:
             size = len(self._frame or b"")
         return {"active": True, "node_id": node_id, "frame_bytes": size}
+
+    def _watch_bus(self, pipeline) -> None:
+        """Detect OS-side revocation (e.g. KDE tray 'Stop sharing') or stream errors."""
+        from gi.repository import Gst
+
+        bus = pipeline.get_bus()
+        if bus is None:
+            return
+        mask = Gst.MessageType.EOS | Gst.MessageType.ERROR
+        while self._active and self._pipeline is pipeline:
+            msg = bus.timed_pop_filtered(500 * Gst.MSECOND, mask)
+            if msg is not None:
+                self._cleanup_sync()
+                cb = self._on_ended
+                if cb is not None:
+                    try:
+                        cb()
+                    except Exception:
+                        pass
+                return
 
     def _on_sample(self, sink):
         from gi.repository import Gst
@@ -254,25 +287,26 @@ class ScreenWatcher:
         return {"active": False}
 
     def _cleanup_sync(self) -> None:
-        self._active = False
-        pipeline, self._pipeline = self._pipeline, None
-        if pipeline is not None:
-            try:
-                from gi.repository import Gst
+        with self._lifecycle_lock:
+            self._active = False
+            pipeline, self._pipeline = self._pipeline, None
+            if pipeline is not None:
+                try:
+                    from gi.repository import Gst
 
-                pipeline.set_state(Gst.State.NULL)
-            except Exception:
-                pass
-        pw_fd, self._pw_fd = self._pw_fd, None
-        if pw_fd is not None:
-            try:
-                os.close(pw_fd)
-            except OSError:
-                pass
-        session, self._session_handle = self._session_handle, None
-        if session is not None:
-            _close_portal_session(session)
-        with self._lock:
-            self._frame = None
-            self._frame_ts = 0.0
-        self._frame_ready.clear()
+                    pipeline.set_state(Gst.State.NULL)
+                except Exception:
+                    pass
+            pw_fd, self._pw_fd = self._pw_fd, None
+            if pw_fd is not None:
+                try:
+                    os.close(pw_fd)
+                except OSError:
+                    pass
+            session, self._session_handle = self._session_handle, None
+            if session is not None:
+                _close_portal_session(session)
+            with self._lock:
+                self._frame = None
+                self._frame_ts = 0.0
+            self._frame_ready.clear()

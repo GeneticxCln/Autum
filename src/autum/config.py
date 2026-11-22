@@ -34,7 +34,8 @@ class Config:
     ollama_url: str = "http://127.0.0.1:11434"
     model: str = "lfm3-omni:2b"
     chat_model: str = "gemma4:12b"
-    vision_model: str = ""
+    vision_model: str = "qwen3-vl:8b"
+    dynamic_swap: bool = True
     chat_think: bool = False
     voice: str = "female-american-english"
     log_level: str = "INFO"

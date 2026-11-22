@@ -43,7 +43,7 @@ from autum.integrations import IntegrationContext, IntegrationManager
 from autum.integrations.linux_desktop import LinuxDesktopIntegration
 from autum.logging import configure_logging
 from autum.memory import MemoryStore, register_memory_capabilities
-from autum.ollama import OmniChat, OmniSpeech, OmniTranscriber, check_ready, preload
+from autum.ollama import ModelSwapper, OmniChat, OmniSpeech, OmniTranscriber, check_ready, preload
 from autum.perception import OllamaVision, register_perception_capabilities
 from autum.runtime import Mode, Runtime, State
 from autum.tools import ApprovalGate
@@ -327,6 +327,15 @@ async def main(argv: Sequence[str] | None = None) -> int:
             vision_effort = None if cfg.chat_think else ("none" if any(k in vision_model.lower() for k in ("gemma4", "qwen3")) else None)
             direct_audio = any(k in chat_model.lower() for k in ("omni", "gemma4"))
 
+            swapper: ModelSwapper | None = None
+            if cfg.dynamic_swap and len({m for m in (chat_model, vision_model) if m != cfg.model}) > 1:
+                swapper = ModelSwapper(
+                    client,
+                    base_url=cfg.ollama_url,
+                    pinned=(cfg.model,),
+                    on_swap=lambda new, old: log(f"swapped GPU model {old} -> {new}"),
+                )
+
             bus = EventBus(new_id())
             bus.subscribe(
                 lambda e: log(f"{e.payload['component']}: {e.payload['error']}"),
@@ -354,7 +363,11 @@ async def main(argv: Sequence[str] | None = None) -> int:
             memory = MemoryStore(data_dir / "memory.json")
             register_memory_capabilities(registry, memory)
             vision = OllamaVision(
-                client, model=vision_model, base_url=cfg.ollama_url, reasoning_effort=vision_effort
+                client,
+                model=vision_model,
+                base_url=cfg.ollama_url,
+                reasoning_effort=vision_effort,
+                swapper=swapper,
             )
             set_obs = lambda src: runtime_ref[0].set_observation(src) if runtime_ref else None  # noqa: E731
             end_obs = lambda src: runtime_ref[0].end_observation(src) if runtime_ref else None  # noqa: E731
@@ -383,7 +396,13 @@ async def main(argv: Sequence[str] | None = None) -> int:
             )
             runtime = Runtime(
                 bus,
-                OmniChat(client, model=chat_model, base_url=cfg.ollama_url, reasoning_effort=chat_effort),
+                OmniChat(
+                    client,
+                    model=chat_model,
+                    base_url=cfg.ollama_url,
+                    reasoning_effort=chat_effort,
+                    swapper=swapper,
+                ),
                 speech,
                 mode=mode,
                 system_prompt=system_prompt,
@@ -424,8 +443,12 @@ async def main(argv: Sequence[str] | None = None) -> int:
 
             runtime.begin_model_load(chat_model)
             t_load = time.monotonic()
-            for req_model in dict.fromkeys((cfg.model, chat_model, vision_model)):
-                await preload(client, model=req_model, base_url=cfg.ollama_url)
+            # Preload pinned voice engine + primary chat brain; vision_model swaps in dynamically on demand
+            await preload(client, model=cfg.model, base_url=cfg.ollama_url)
+            if chat_model != cfg.model:
+                if swapper is not None:
+                    await swapper.ensure_active(chat_model)
+                await preload(client, model=chat_model, base_url=cfg.ollama_url)
             runtime.finish_model_load(chat_model, (time.monotonic() - t_load) * 1000.0)
 
             if use_hands_free:
@@ -439,7 +462,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 on_status=log,
             )
             hotkey.start()
-            log(f"running ({mode.value}, chat/vision={chat_model}, voice={cfg.model}). Stop with Ctrl+C.")
+            swap_note = ", dynamic VRAM swap" if swapper is not None else ""
+            log(f"running ({mode.value}, chat={chat_model}, vision={vision_model}, voice={cfg.model}{swap_note}). Stop with Ctrl+C.")
             try:
                 await stop.wait()
             finally:

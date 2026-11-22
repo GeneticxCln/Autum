@@ -399,5 +399,41 @@ def test_kwin_fuzzy_matching_position_aliases_and_switch_desktop():
     cfg = Config()
     assert cfg.model == "lfm3-omni:2b"
     assert cfg.resolved_chat_model() == "gemma4:12b"
-    assert cfg.resolved_vision_model() == "gemma4:12b"
-    assert Config(chat_model="lfm3-omni:2b").resolved_vision_model() == "lfm3-omni:2b"
+    assert cfg.resolved_vision_model() == "qwen3-vl:8b"
+    assert cfg.dynamic_swap is True
+    assert Config(chat_model="lfm3-omni:2b", vision_model="").resolved_vision_model() == "lfm3-omni:2b"
+
+
+# 13. Dynamic VRAM ModelSwapper unloads outgoing heavy model and never evicts pinned voice model
+def test_model_swapper_dynamically_swaps_heavy_models_and_pins_voice():
+    import httpx
+    from autum.ollama import ModelSwapper
+
+    unloaded: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("keep_alive") == 0:
+            unloaded.append(body["model"])
+        return httpx.Response(200, json={"done": True})
+
+    async def scenario():
+        swaps: list[tuple[str, str | None]] = []
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            swapper = ModelSwapper(
+                client,
+                pinned=("lfm3-omni:2b",),
+                on_swap=lambda new, old: swaps.append((new, old)),
+            )
+            await swapper.ensure_active("lfm3-omni:2b")  # pinned: ignored
+            await swapper.ensure_active("gemma4:12b")    # initial heavy load: no unload
+            await swapper.ensure_active("gemma4:12b")    # same model: no-op
+            await swapper.ensure_active("qwen3-vl:8b")   # unloads gemma4:12b
+            await swapper.ensure_active("qwen3-vl:8b")   # stays hot: no unload
+            await swapper.ensure_active("gemma4:12b")    # unloads qwen3-vl:8b
+        return swaps
+
+    swaps = run(scenario())
+    assert unloaded == ["gemma4:12b", "qwen3-vl:8b"]
+    assert "lfm3-omni:2b" not in unloaded
+    assert swaps == [("qwen3-vl:8b", "gemma4:12b"), ("gemma4:12b", "qwen3-vl:8b")]

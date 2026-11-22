@@ -115,13 +115,17 @@ class OllamaVision:
         base_url: str = "http://127.0.0.1:11434",
         *,
         reasoning_effort: str | None = None,
+        swapper: Any | None = None,
     ) -> None:
         self.client = client
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.reasoning_effort = reasoning_effort
+        self.swapper = swapper
 
     async def __call__(self, image_bytes: bytes, mime: str, question: str) -> str:
+        if self.swapper is not None:
+            await self.swapper.ensure_active(self.model)
         b64 = base64.b64encode(image_bytes).decode()
         body: dict[str, Any] = {
             "model": self.model,

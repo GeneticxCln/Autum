@@ -12,9 +12,10 @@ with the same 4,096 context, so switching between them never reloads it
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
-from typing import Any, AsyncIterator, Sequence
+from typing import Any, AsyncIterator, Callable, Iterable, Sequence
 
 import httpx
 
@@ -52,6 +53,45 @@ def to_openai(message: Message) -> dict:
     return {"role": message["role"], "content": content}
 
 
+class ModelSwapper:
+    """Coordinates dynamic VRAM swapping between mutually exclusive heavy GPU models.
+
+    Pinned lightweight models (such as the voice engine `lfm3-omni:2b`) stay
+    resident in VRAM, while heavy chat (`gemma4:12b`) and vision (`qwen3-vl:8b`)
+    models cleanly unload each other via `keep_alive: 0` before loading so both
+    always run 100% on GPU within a 16 GB VRAM budget.
+    """
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        base_url: str = OLLAMA,
+        pinned: Iterable[str] = (),
+        on_swap: Callable[[str, str | None], None] | None = None,
+    ) -> None:
+        self.client = client
+        self.base_url = base_url.rstrip("/")
+        self.pinned = frozenset(pinned)
+        self.on_swap = on_swap
+        self.active: str | None = None
+        self._lock = asyncio.Lock()
+
+    async def ensure_active(self, model: str) -> None:
+        """Ensure `model` is the active heavy model, unloading any prior heavy model first."""
+        if model in self.pinned:
+            return
+        async with self._lock:
+            if self.active == model:
+                return
+            prev = self.active
+            if prev is not None and prev not in self.pinned:
+                await unload(self.client, model=prev, base_url=self.base_url)
+            self.active = model
+            if self.on_swap is not None and prev is not None:
+                self.on_swap(model, prev)
+
+
 class OmniChat:
     """Inference: streams reply text chunks and optional ToolCall proposals."""
 
@@ -62,11 +102,13 @@ class OmniChat:
         base_url: str = OLLAMA,
         *,
         reasoning_effort: str | None = None,
+        swapper: ModelSwapper | None = None,
     ) -> None:
         self.client = client
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.reasoning_effort = reasoning_effort
+        self.swapper = swapper
 
     async def stream(
         self,
@@ -75,6 +117,8 @@ class OmniChat:
         operation_id: str,
         tools: Sequence[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str | ToolCall]:
+        if self.swapper is not None:
+            await self.swapper.ensure_active(self.model)
         body: dict[str, Any] = {
             "model": self.model,
             "messages": [to_openai(m) for m in messages],
@@ -161,6 +205,14 @@ class OmniTranscriber:
 async def preload(client: httpx.AsyncClient, model: str = MODEL, base_url: str = OLLAMA) -> None:
     """Load the model now (default context, like the endpoints above) so the first turn is fast."""
     await client.post(f"{base_url.rstrip('/')}/api/generate", json={"model": model, "keep_alive": "30m"}, timeout=60)
+
+
+async def unload(client: httpx.AsyncClient, model: str, base_url: str = OLLAMA) -> None:
+    """Immediately release a model from Ollama GPU VRAM (`keep_alive: 0`)."""
+    try:
+        await client.post(f"{base_url.rstrip('/')}/api/generate", json={"model": model, "keep_alive": 0}, timeout=10)
+    except httpx.HTTPError:
+        pass
 
 
 async def check_ready(client: httpx.AsyncClient, model: str = MODEL, base_url: str = OLLAMA) -> str | None:

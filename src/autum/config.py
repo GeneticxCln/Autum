@@ -36,14 +36,20 @@ class Config:
     log_level: str = "INFO"
     data_dir: str = ""
     allowed_read_dirs: tuple[str, ...] = ()
+    enabled_integrations: tuple[str, ...] = ("linux_desktop",)
+    excluded_windows: tuple[str, ...] = (
+        "keepassxc", "1password", "bitwarden", "kwallet", "polkit", "pinentry", "password",
+    )
     require_reversible_approval: bool = False
     approval_timeout_s: float = 20.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, Mode):
             object.__setattr__(self, "mode", Mode(self.mode))
-        if isinstance(self.allowed_read_dirs, list):
-            object.__setattr__(self, "allowed_read_dirs", tuple(str(p) for p in self.allowed_read_dirs))
+        for tuple_field in ("allowed_read_dirs", "enabled_integrations", "excluded_windows"):
+            val = getattr(self, tuple_field)
+            if isinstance(val, list):
+                object.__setattr__(self, tuple_field, tuple(str(p) for p in val))
         if self.silence_ms < 100 or self.silence_ms > 5000:
             raise ValueError("silence_ms must be between 100 and 5000")
         if self.barge_in_ms < 64 or self.barge_in_ms > 2000:

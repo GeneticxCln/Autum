@@ -893,6 +893,19 @@ context selection). Verified with `tests/test_perception_and_memory.py` (128
 passed, 0 warnings) and live end-to-end vision + memory tests on local
 `lfm3-omni:2b`.
 
+**M10 status (2026-11-22):** implemented WP10 replaceable environment
+integration layer (`src/autum/integrations/__init__.py`: `Integration`
+protocol + `IntegrationManager`) and the initial Linux/Freedesktop
+integration (`src/autum/integrations/linux_desktop.py`: `system_info`,
+scoped `list_directory` enforcing `allowed_read_dirs` and secret exclusion,
+interactive user-selected `inspect_selected_window` via the XDG Desktop
+Screenshot portal with excluded-window blocking and immediate temp-file
+deletion, and `open_application` via `.desktop` discovery blocking shells).
+All integration outputs carry `Provenance.OBSERVED` (§5.1) and the core
+runtime stays decoupled and usable when integrations are disabled or
+unavailable. Verified with `tests/test_integrations.py` (132 passed, 0
+warnings) and live `system_info` tool verification on local `lfm3-omni:2b`.
+
 M0 and M1 run in parallel. M0's skeleton is the codebase M2 builds on;
 M1's benchmark harness is the first running voice pipeline. Visual work
 (M4) runs in parallel with hands-free work (M3), and agent work (M6)

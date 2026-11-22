@@ -37,7 +37,8 @@ from pathlib import Path
 import numpy as np
 
 from bench.common import (
-    DATA, RESULTS, SR, Vad, load_corpus, read_wav, resample, speech_starts, write_wav,
+    DATA, MIC_HELP, RESULTS, SR, MicrophoneSilent, Vad, check_microphone, load_corpus, read_wav,
+    resample, speech_starts, write_wav,
 )
 
 RATE = 48_000
@@ -240,7 +241,18 @@ def play_and_record(playback: Path, out: Path, aec: bool, cues: list[tuple[float
         rec.send_signal(signal.SIGINT)
         rec.wait(timeout=5)
     audio, sr = read_wav(out)
-    return resample(audio, sr, RATE), play_start - rec_start
+    audio = resample(audio, sr, RATE)
+    check_recording(audio, PLAYBACK_S)
+    return audio, play_start - rec_start
+
+
+def check_recording(audio: np.ndarray, expected_s: float, rate: int = RATE) -> None:
+    """A run must contain at least 90% of the playback time, or the microphone stalled."""
+    if len(audio) < 0.9 * expected_s * rate:
+        raise MicrophoneSilent(
+            f"Only {len(audio) / rate:.1f} s of the expected {expected_s:.0f} s arrived from the microphone.\n"
+            + MIC_HELP.format(timeout=expected_s).split("\n", 1)[1]
+        )
 
 
 # ----- session ----------------------------------------------------------
@@ -252,7 +264,13 @@ def loopback() -> dict:
     clicks = click_train()
     trips = []
     for _ in range(3):
-        recorded = sd.playrec(np.column_stack([clicks, clicks]), RATE, channels=2, dtype="float32", blocking=True)
+        recorded = sd.playrec(np.column_stack([clicks, clicks]), RATE, channels=2, dtype="float32")
+        deadline = time.monotonic() + len(clicks) / RATE + 3.0
+        while sd.get_stream().active:
+            if time.monotonic() > deadline:
+                sd.stop()
+                raise MicrophoneSilent(MIC_HELP.format(timeout=3.0))
+            time.sleep(0.05)
         trips.append(roundtrip_ms(clicks, recorded.mean(axis=1)))
     with sd.Stream(samplerate=RATE, channels=(2, 2), dtype="float32") as stream:
         reported_in, reported_out = (x * 1000 for x in stream.latency)
@@ -272,7 +290,15 @@ def ask(question: str) -> bool:
     return input(f"{question} [y/N] ").strip().lower() == "y"
 
 
-def main() -> None:
+def main() -> int:
+    try:
+        return session()
+    except MicrophoneSilent as exc:
+        print(f"\n{exc}")
+        return 1
+
+
+def session() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-aec", action="store_true", help="do not load echo cancellation")
     parser.add_argument("--only", choices=["loopback", "echo", "interruption", "backchannel"])
@@ -284,11 +310,24 @@ def main() -> None:
     sink, source = node_info("SINK"), node_info("SOURCE")
     print(f"Speakers:   {sink['device']}   volume {sink['volume']}")
     print(f"Microphone: {source['device']}   level {source['volume']}")
+    import sounddevice as sd
+
+    check_microphone(sd)
+    print("Microphone check: audio is arriving.")
     print("Audio will play aloud. Use speakers, not headphones, at your normal listening")
     print("volume, and keep that volume for the whole session.")
     if not ask("Continue?"):
-        return
-    report: dict = {"date": stamp, "speakers": sink, "microphone": source, "runs": {}}
+        return 0
+    report: dict = {"date": stamp, "speakers": sink, "microphone": source, "runs": {}, "complete": False}
+    try:
+        return run_session(args, report, session_dir)
+    finally:
+        if report.get("loopback") or report["runs"]:
+            save(report, session_dir)
+
+
+def run_session(args, report: dict, session_dir: Path) -> int:
+    sink = report["speakers"]
 
     if args.only in (None, "loopback"):
         input("\nLoopback: a few clicks will play. Stay quiet. Press Enter.")
@@ -328,14 +367,21 @@ def main() -> None:
                         probs = vad.probabilities(resample(audio, RATE, SR))
                         report["runs"].setdefault(label, {})[kind] = analyse(kind, audio, probs, offset, prompts[kind])
                         print(json.dumps(report["runs"][label][kind], indent=1))
+            except MicrophoneSilent:
+                raise
             except RuntimeError as exc:
                 print(f"{label} stopped: {exc}")
                 report["runs"][label] = {"error": str(exc)}
+    report["complete"] = True
+    return 0
 
+
+def save(report: dict, session_dir: Path) -> None:
     RESULTS.mkdir(parents=True, exist_ok=True)
-    path = RESULTS / f"{stamp}-attended.json"
+    path = RESULTS / f"{report['date']}-attended.json"
     path.write_text(json.dumps(report, indent=1))
-    print(f"\nwrote {path}\nrecordings in {session_dir} (local only)")
+    state = "" if report.get("complete") else " (incomplete: the session stopped early)"
+    print(f"\nwrote {path}{state}\nrecordings in {session_dir} (local only)")
 
 
 @contextmanager
@@ -344,4 +390,4 @@ def _nothing():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

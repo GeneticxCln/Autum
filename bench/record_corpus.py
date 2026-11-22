@@ -27,14 +27,15 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 from bench.common import (
-    DATA, FRAME, NOISE_SNR_DB, SR, Item, Vad, active_span, load_corpus, mix_at_snr,
-    noise_for, resample, write_wav,
+    DATA, FRAME, NOISE_SNR_DB, SR, Item, MicrophoneSilent, Vad, active_span, capture_blocks,
+    check_microphone, load_corpus, mix_at_snr, noise_for, resample, write_wav,
 )
 
 RATE = 48_000
@@ -170,16 +171,14 @@ def pipewire_source() -> dict:
 def record(sd, noise_floor: float | None) -> np.ndarray:
     blocks = []
     stopper = AutoStop(noise_floor if noise_floor is not None else -60.0)
-    with sd.InputStream(samplerate=RATE, channels=2, dtype="float32", blocksize=BLOCK) as stream:
-        while True:
-            data, _ = stream.read(BLOCK)
-            mono = data.mean(axis=1)
-            blocks.append(mono.copy())
-            if noise_floor is None:
-                if len(blocks) * BLOCK >= 2 * RATE:
-                    break
-            elif stopper.feed(dbfs(mono)):
+    for data in capture_blocks(sd, RATE, 2, BLOCK):
+        mono = data.mean(axis=1)
+        blocks.append(mono)
+        if noise_floor is None:
+            if len(blocks) * BLOCK >= 2 * RATE:
                 break
+        elif stopper.feed(dbfs(mono)):
+            break
     return np.concatenate(blocks)
 
 
@@ -196,7 +195,15 @@ def show(item: Item) -> None:
     print(f"\n    {text}\n")
 
 
-def main() -> None:
+def main() -> int:
+    try:
+        return session()
+    except MicrophoneSilent as exc:
+        print(f"\n{exc}\nAccepted clips so far are kept.")
+        return 1
+
+
+def session() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--set", default="recorded-v1")
     parser.add_argument("--redo", action="append", default=[], help="prompt ID to record again")
@@ -212,6 +219,8 @@ def main() -> None:
 
     source = pipewire_source()
     print(f"Microphone: {source['device']}   input level: {source['source_volume']}")
+    check_microphone(sd)
+    print("Microphone check: audio is arriving.")
     if source["filtered"]:
         print("WARNING: the default source looks like a noise-suppression or echo-cancel filter.")
         print("The primary set must be recorded without processing (methodology §2.2).")
@@ -221,7 +230,7 @@ def main() -> None:
             print(f"WARNING: earlier sittings used {first['device']} at level {first['source_volume']}.")
             print("Change it back, or this sitting is not consistent with the rest of the set.")
     if input("Continue? [y/N] ").strip().lower() != "y":
-        return
+        return 0
 
     input("\nNoise floor check: stay quiet for 2 seconds. Press Enter to start.")
     floor = dbfs(record(sd, None))
@@ -282,6 +291,16 @@ def main() -> None:
         print("\nStopped.")
     remaining = sum(1 for i in load_corpus() if not i.recorded_only and i.id not in labels)
     print(f"{len(labels)} clips accepted, {remaining} still to record. Saved in {out}")
+    return 0
+
+
+def play_with_timeout(sd, audio: np.ndarray, rate: int = RATE) -> None:
+    """Play a clip; give up a few seconds after it should have ended."""
+    sd.play(audio, rate)
+    deadline = time.monotonic() + len(audio) / rate + 3.0
+    while sd.get_stream().active and time.monotonic() < deadline:
+        time.sleep(0.05)
+    sd.stop()
 
 
 def review(sd, master: np.ndarray, lab: Labels):
@@ -294,8 +313,7 @@ def review(sd, master: np.ndarray, lab: Labels):
         if answer == "" and not lab.flagged:
             return "energy", lab.energy
         if answer == "p":
-            sd.play(master, RATE)
-            sd.wait()
+            play_with_timeout(sd, master)
         elif answer in ("r", "q"):
             return answer
         elif answer == "e":

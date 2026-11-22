@@ -268,6 +268,46 @@ def summarize(values: list[float]) -> dict:
     }
 
 
+# ----- microphone -------------------------------------------------------
+
+MIC_HELP = (
+    "The microphone is not delivering any audio (nothing arrived for {timeout:.0f} s).\n"
+    "Stop any program still stuck on it (Ctrl+C in its terminal), unplug the\n"
+    "microphone and plug it back in, then run this again."
+)
+
+
+class MicrophoneSilent(RuntimeError):
+    pass
+
+
+def capture_blocks(sd, rate: int, channels: int, block: int, timeout_s: float = 2.0):
+    """Yield captured blocks (frames x channels) until the caller stops.
+
+    Raises MicrophoneSilent if no block arrives within timeout_s, instead
+    of waiting forever on a device that has stopped sending audio.
+    """
+    import queue
+
+    blocks: queue.Queue = queue.Queue()
+
+    def callback(indata, frames, time_info, status):
+        blocks.put(indata.copy())
+
+    with sd.InputStream(samplerate=rate, channels=channels, dtype="float32", blocksize=block, callback=callback):
+        while True:
+            try:
+                yield blocks.get(timeout=timeout_s)
+            except queue.Empty:
+                raise MicrophoneSilent(MIC_HELP.format(timeout=timeout_s)) from None
+
+
+def check_microphone(sd, rate: int = 48_000, timeout_s: float = 2.0) -> None:
+    """Fail fast, with instructions, if the microphone sends nothing."""
+    for _ in capture_blocks(sd, rate, 2, rate // 100, timeout_s):
+        return
+
+
 # ----- GPU memory -------------------------------------------------------
 
 

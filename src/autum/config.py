@@ -33,6 +33,9 @@ class Config:
     max_context_chars: int = 10_000
     ollama_url: str = "http://127.0.0.1:11434"
     model: str = "lfm3-omni:2b"
+    chat_model: str = "gemma4:12b"
+    vision_model: str = ""
+    chat_think: bool = False
     voice: str = "female-american-english"
     log_level: str = "INFO"
     data_dir: str = ""
@@ -67,6 +70,12 @@ class Config:
 
     def resolved_data_dir(self) -> Path | None:
         return Path(self.data_dir).expanduser() if self.data_dir else None
+
+    def resolved_chat_model(self) -> str:
+        return (self.chat_model or self.model).strip()
+
+    def resolved_vision_model(self) -> str:
+        return (self.vision_model or self.chat_model or self.model).strip()
 
     def resolved_allowed_read_dirs(self) -> tuple[Path, ...]:
         return tuple(Path(p).expanduser() for p in self.allowed_read_dirs if p)

@@ -113,14 +113,17 @@ class OllamaVision:
         client: httpx.AsyncClient,
         model: str = "lfm3-omni:2b",
         base_url: str = "http://127.0.0.1:11434",
+        *,
+        reasoning_effort: str | None = None,
     ) -> None:
         self.client = client
         self.model = model
         self.base_url = base_url.rstrip("/")
+        self.reasoning_effort = reasoning_effort
 
     async def __call__(self, image_bytes: bytes, mime: str, question: str) -> str:
         b64 = base64.b64encode(image_bytes).decode()
-        body = {
+        body: dict[str, Any] = {
             "model": self.model,
             "stream": False,
             "temperature": 0,
@@ -136,6 +139,8 @@ class OllamaVision:
                 },
             ],
         }
+        if self.reasoning_effort is not None:
+            body["reasoning_effort"] = self.reasoning_effort
         r = await self.client.post(f"{self.base_url}/v1/chat/completions", json=body, timeout=60.0)
         if r.status_code != 200:
             raise RuntimeError(f"local vision request failed ({r.status_code}): {r.text[:200]}")

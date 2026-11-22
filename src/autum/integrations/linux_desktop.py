@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
 from autum.integrations import IntegrationContext
-from autum.integrations.kwin_windows import SNAP_POSITIONS, KWinController
+from autum.integrations.kwin_windows import SNAP_POSITIONS, KWinController, normalize_position
 from autum.integrations.screen_watch import ScreenWatcher
 from autum.logging import redact_sensitive
 from autum.perception import is_excluded_path
@@ -661,7 +661,8 @@ class LinuxDesktopIntegration:
                     return False
                 if args.get("y") is not None and abs(int(check.get("y", 0)) - int(args["y"])) > 80:
                     return False
-                if "target_x" in res and args.get("position") in ("left", "right", "top", "bottom"):
+                norm_pos = normalize_position(args.get("position")) if args.get("position") is not None else None
+                if "target_x" in res and norm_pos in ("left", "right", "top", "bottom"):
                     if abs(int(check.get("x", 0)) - int(res["target_x"])) > 120 or abs(int(check.get("y", 0)) - int(res["target_y"])) > 120:
                         return False
                 return True
@@ -767,5 +768,34 @@ class LinuxDesktopIntegration:
                 )
             )
             registered.append("close_window")
+
+            if hasattr(wm, "switch_desktop"):
+                async def _switch_desktop(args: dict[str, Any]) -> dict[str, Any]:
+                    return await wm.switch_desktop(int(args["desktop"]))
+
+                async def _verify_switch(args: dict[str, Any], res: dict[str, Any]) -> bool:
+                    return int(res.get("desktop", 0)) >= 1
+
+                registry.register(
+                    Capability(
+                        name="switch_desktop",
+                        description="Switch to a different virtual desktop by number (1-based).",
+                        input_schema={
+                            "type": "object",
+                            "properties": {
+                                "desktop": {"type": "integer", "minimum": 1, "maximum": 20},
+                            },
+                            "required": ["desktop"],
+                            "additionalProperties": False,
+                        },
+                        output_schema={"type": "object", "required": ["desktop", "total"]},
+                        permission_level=PermissionLevel.REVERSIBLE,
+                        observed_output=True,
+                        execute=_switch_desktop,
+                        verify=_verify_switch,
+                        target_summary=lambda a: f"switch to desktop {a['desktop']}",
+                    )
+                )
+                registered.append("switch_desktop")
 
         return registered

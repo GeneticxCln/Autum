@@ -366,3 +366,38 @@ def test_local_data_files_are_owner_only_permissions(tmp_path):
     assert stat.S_IMODE((data_dir / "memory.json").stat().st_mode) == 0o600
     assert stat.S_IMODE((data_dir / "notes").stat().st_mode) == 0o700
     assert stat.S_IMODE((data_dir / "notes" / "private-note.txt").stat().st_mode) == 0o600
+
+
+# 12. Fuzzy KWin window resolution, position aliases, switch_desktop, and multi-model config
+def test_kwin_fuzzy_matching_position_aliases_and_switch_desktop():
+    from autum.integrations.kwin_windows import KWinController, normalize_position
+
+    assert normalize_position("left_half") == "left"
+    assert normalize_position("upper right") == "top_right"
+    assert normalize_position("middle") == "center"
+    with pytest.raises(ValueError):
+        normalize_position("diagonal")
+
+    wm = KWinController()
+
+    async def fake_list(_excluded=()):
+        return [
+            {"id": "w1", "app": "google-chrome", "title": "DISTRUG VACANȚELE ROMÂNILOR - ZANZIBAR - YouTube", "desktop": 1},
+            {"id": "w2", "app": "antigravity", "title": "Autum", "desktop": 2},
+        ]
+
+    wm.list_windows = fake_list  # type: ignore[method-assign]
+
+    async def scenario():
+        r1 = await wm._resolve_window("google chrome", ())
+        r2 = await wm._resolve_window("browser", ())
+        r3 = await wm._resolve_window("DISTRUG VACANÇÉ ROMÂNILOR - ZANZIBAR", ())
+        return r1["id"], r2["id"], r3["id"]
+
+    assert run(scenario()) == ("w1", "w1", "w1")
+
+    cfg = Config()
+    assert cfg.model == "lfm3-omni:2b"
+    assert cfg.resolved_chat_model() == "gemma4:12b"
+    assert cfg.resolved_vision_model() == "gemma4:12b"
+    assert Config(chat_model="lfm3-omni:2b").resolved_vision_model() == "lfm3-omni:2b"

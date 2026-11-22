@@ -186,7 +186,7 @@ class VoiceInput:
             self._nothing_heard(turn)
             return
         wav = wav_bytes(highpass_pcm(pcm, MIC_RATE), MIC_RATE)
-        if not waiting_approval:
+        if not waiting_approval and getattr(self.runtime, "direct_audio", True):
             while len(self._awaiting_transcript) >= 8:
                 self._awaiting_transcript.pop(next(iter(self._awaiting_transcript)))
             self._awaiting_transcript[turn] = wav
@@ -624,7 +624,7 @@ class HandsFreeInput:
                 self._nothing_heard(turn)
                 return
             wav = wav_bytes(highpass_pcm(event.pcm, MIC_RATE), MIC_RATE)
-            if not waiting_approval:
+            if not waiting_approval and getattr(self.runtime, "direct_audio", True):
                 while len(self._awaiting_transcript) >= 8:
                     self._awaiting_transcript.pop(next(iter(self._awaiting_transcript)))
                 self._awaiting_transcript[turn] = wav

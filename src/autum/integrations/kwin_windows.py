@@ -15,7 +15,9 @@ Privacy & safety (§5.2 / §5.3):
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
+import re
 import secrets
 import tempfile
 from pathlib import Path
@@ -29,6 +31,60 @@ KWIN_SCRIPT_IFACE = "org.kde.kwin.Script"
 SNAP_POSITIONS: frozenset[str] = frozenset(
     {"left", "right", "top", "bottom", "center", "top_left", "top_right", "bottom_left", "bottom_right"}
 )
+
+_POSITION_ALIASES: dict[str, str] = {
+    "left half": "left",
+    "left_half": "left",
+    "left side": "left",
+    "right half": "right",
+    "right_half": "right",
+    "right side": "right",
+    "top half": "top",
+    "top_half": "top",
+    "upper half": "top",
+    "bottom half": "bottom",
+    "bottom_half": "bottom",
+    "lower half": "bottom",
+    "middle": "center",
+    "centre": "center",
+    "upper left": "top_left",
+    "upper_left": "top_left",
+    "top left": "top_left",
+    "upper right": "top_right",
+    "upper_right": "top_right",
+    "top right": "top_right",
+    "lower left": "bottom_left",
+    "lower_left": "bottom_left",
+    "bottom left": "bottom_left",
+    "lower right": "bottom_right",
+    "lower_right": "bottom_right",
+    "bottom right": "bottom_right",
+}
+
+
+def normalize_position(position: str | None) -> str | None:
+    if position is None:
+        return None
+    clean = position.strip().lower().replace("-", "_")
+    mapped = _POSITION_ALIASES.get(clean, _POSITION_ALIASES.get(clean.replace("_", " "), clean))
+    if mapped not in SNAP_POSITIONS:
+        raise ValueError(f"position must be one of {sorted(SNAP_POSITIONS)}")
+    return mapped
+
+_NORM_RE = re.compile(r"[^a-z0-9]+")
+_APP_ALIASES: dict[str, tuple[str, ...]] = {
+    "browser": ("chrome", "chromium", "firefox", "brave", "vivaldi", "edge", "zen", "librewolf"),
+    "web browser": ("chrome", "chromium", "firefox", "brave", "vivaldi", "edge", "zen", "librewolf"),
+    "terminal": ("konsole", "kitty", "alacritty", "wezterm", "ghostty", "foot", "xterm"),
+    "files": ("dolphin", "nautilus", "thunar", "nemo"),
+    "file manager": ("dolphin", "nautilus", "thunar", "nemo"),
+    "editor": ("antigravity", "code", "vscode", "zed", "kate"),
+    "ide": ("antigravity", "code", "vscode", "zed"),
+}
+
+
+def _norm(text: str) -> str:
+    return _NORM_RE.sub(" ", text.lower()).strip()
 
 
 def _is_excluded_window(title: str, app_class: str, excluded: Sequence[str]) -> bool:
@@ -157,8 +213,8 @@ for (var i = 0; i < ws.length; i++) {
     var dnum = (w.desktops && w.desktops.length > 0 && w.desktops[0].x11DesktopNumber) ? w.desktops[0].x11DesktopNumber : 0;
     out.push({
         id: String(w.internalId),
-        title: String(w.caption || ""),
         app: String(w.resourceClass || ""),
+        title: String(w.caption || "").slice(0, 60),
         x: Math.round(g.x), y: Math.round(g.y),
         width: Math.round(g.width), height: Math.round(g.height),
         minimized: Boolean(w.minimized),
@@ -174,19 +230,50 @@ __reply(out);
 
     async def _resolve_window(self, query: str, excluded: Sequence[str]) -> dict[str, Any]:
         needle = query.strip().lower()
-        if not needle:
+        needle_n = _norm(query)
+        if not needle or not needle_n:
             raise ValueError("window query must be non-empty")
         for pat in excluded:
             if pat and pat.lower() in needle:
                 raise PermissionError(f"control of excluded window matching {pat!r} is blocked (plan §5.3)")
         windows = await self.list_windows(excluded)
-        # Exact ID, then exact app, then substring on app or title
+        if not windows:
+            raise LookupError(f"no controllable window matching {query!r}")
+
+        # 1. Exact ID or normalized app name ("google chrome" -> "google-chrome")
         for w in windows:
-            if w["id"].lower() == needle or w["app"].lower() == needle:
+            if w["id"].lower() == needle or _norm(w["app"]) == needle_n:
                 return w
+        # 2. Substring match on normalized app or title
         for w in windows:
-            if needle in w["app"].lower() or needle in w["title"].lower():
+            if needle_n in _norm(w["app"]) or needle_n in _norm(w["title"]):
                 return w
+        # 3. Friendly category aliases (browser, terminal, files, editor)
+        aliases = _APP_ALIASES.get(needle_n, ())
+        if aliases:
+            for w in windows:
+                hay = f"{_norm(w['app'])} {_norm(w['title'])}"
+                if any(alias in hay for alias in aliases):
+                    return w
+        # 4. Token overlap or fuzzy similarity (handles minor typos/diacritics)
+        q_tokens = set(needle_n.split())
+        best_score = 0.0
+        best_win: dict[str, Any] | None = None
+        for w in windows:
+            app_n = _norm(w["app"])
+            title_n = _norm(w["title"])
+            hay_tokens = set(f"{app_n} {title_n}".split())
+            overlap = len(q_tokens & hay_tokens) / max(len(q_tokens), 1)
+            sim = max(
+                difflib.SequenceMatcher(None, needle_n, app_n).ratio(),
+                difflib.SequenceMatcher(None, needle_n, title_n).ratio(),
+            )
+            score = max(overlap, sim)
+            if score > best_score:
+                best_score = score
+                best_win = w
+        if best_win is not None and best_score >= 0.45:
+            return best_win
         raise LookupError(f"no controllable window matching {query!r}")
 
     async def focus_window(self, query: str, excluded: Sequence[str] = ()) -> dict[str, Any]:
@@ -218,8 +305,7 @@ else {{
         desktop: int | None = None,
         excluded: Sequence[str] = (),
     ) -> dict[str, Any]:
-        if position is not None and position not in SNAP_POSITIONS:
-            raise ValueError(f"position must be one of {sorted(SNAP_POSITIONS)}")
+        position = normalize_position(position)
         target = await self._resolve_window(query, excluded)
         spec = {"id": target["id"], "position": position, "x": x, "y": y, "width": width, "height": height, "desktop": desktop}
         js = f"""
@@ -238,8 +324,11 @@ else {{
     }}
     var area = workspace.clientArea(KWin.MaximizeArea, w);
     var nx = w.frameGeometry.x, ny = w.frameGeometry.y, nw = w.frameGeometry.width, nh = w.frameGeometry.height;
-    if (spec.position) {{
+    var wantsGeom = Boolean(spec.position || spec.x !== null || spec.y !== null || spec.width !== null || spec.height !== null);
+    if (wantsGeom) {{
         w.setMaximize(false, false);
+    }}
+    if (spec.position) {{
         var halfW = Math.round(area.width / 2), halfH = Math.round(area.height / 2);
         if (spec.position === "left") {{ nx = area.x; ny = area.y; nw = halfW; nh = area.height; }}
         else if (spec.position === "right") {{ nx = area.x + halfW; ny = area.y; nw = area.width - halfW; nh = area.height; }}
@@ -249,18 +338,40 @@ else {{
         else if (spec.position === "top_right") {{ nx = area.x + halfW; ny = area.y; nw = area.width - halfW; nh = halfH; }}
         else if (spec.position === "bottom_left") {{ nx = area.x; ny = area.y + halfH; nw = halfW; nh = area.height - halfH; }}
         else if (spec.position === "bottom_right") {{ nx = area.x + halfW; ny = area.y + halfH; nw = area.width - halfW; nh = area.height - halfH; }}
-        else if (spec.position === "center") {{ nx = area.x + Math.round((area.width - nw) / 2); ny = area.y + Math.round((area.height - nh) / 2); }}
+        else if (spec.position === "center") {{
+            if (nw >= area.width - 40 && spec.width === null) nw = Math.round(area.width * 0.72);
+            if (nh >= area.height - 60 && spec.height === null) nh = Math.round(area.height * 0.78);
+            nx = area.x + Math.round((area.width - nw) / 2);
+            ny = area.y + Math.round((area.height - nh) / 2);
+        }}
     }}
     if (spec.x !== null) nx = spec.x;
     if (spec.y !== null) ny = spec.y;
     if (spec.width !== null) nw = spec.width;
     if (spec.height !== null) nh = spec.height;
-    if (spec.position || spec.x !== null || spec.y !== null || spec.width !== null || spec.height !== null) {{
+    if (wantsGeom) {{
         w.frameGeometry = {{x: nx, y: ny, width: nw, height: nh}};
+    }}
+    if (spec.desktop === null) {{
+        workspace.activeWindow = w;
     }}
     var g = w.frameGeometry;
     var dnum = (w.desktops && w.desktops.length > 0 && w.desktops[0].x11DesktopNumber) ? w.desktops[0].x11DesktopNumber : 0;
     __reply({{id: String(w.internalId), title: String(w.caption), app: String(w.resourceClass), x: Math.round(g.x), y: Math.round(g.y), width: Math.round(g.width), height: Math.round(g.height), target_x: Math.round(nx), target_y: Math.round(ny), target_width: Math.round(nw), target_height: Math.round(nh), desktop: dnum}});
+}}
+"""
+        return await asyncio.to_thread(_run_kwin_js_sync, js)
+
+    async def switch_desktop(self, desktop: int) -> dict[str, Any]:
+        """Switch KWin's active virtual desktop (1-based)."""
+        js = f"""
+var ds = workspace.desktops || [];
+if (ds.length === 0) {{ __reply({{error: "no virtual desktops available"}}); }}
+else {{
+    var idx = Math.max(0, Math.min(ds.length - 1, {int(desktop)} - 1));
+    workspace.currentDesktop = ds[idx];
+    var cur = workspace.currentDesktop ? workspace.currentDesktop.x11DesktopNumber : 0;
+    __reply({{desktop: cur, total: ds.length}});
 }}
 """
         return await asyncio.to_thread(_run_kwin_js_sync, js)

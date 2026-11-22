@@ -122,6 +122,7 @@ class Runtime:
         transcriber: Any | None = None,
         memory: Any | None = None,
         max_agent_steps: int = 5,
+        direct_audio: bool = True,
     ) -> None:
         self.bus = bus
         self.inference = inference
@@ -136,6 +137,7 @@ class Runtime:
         self.transcriber = transcriber
         self.memory = memory
         self.max_agent_steps = max_agent_steps
+        self.direct_audio = direct_audio
         self.state = State.IDLE
         self.muted = False
         self.capturing = False
@@ -363,8 +365,23 @@ class Runtime:
             return
         if turn_id != self._input_turn:
             return  # superseded by a newer utterance
+        if not self.direct_audio and self.transcriber is not None:
+            task = asyncio.get_running_loop().create_task(self._transcribe_and_respond(turn_id, audio))
+            self._track(task)
+            return
         self._input_turn = None
         self._start_response("", "speech", turn_id, cause, audio=audio)
+
+    async def _transcribe_and_respond(self, turn_id: str, wav: bytes) -> None:
+        try:
+            text = await self.transcriber.transcribe(wav)
+        except Exception as exc:
+            self.bus.emit("runtime.component_error", {"component": "transcription", "error": str(exc)})
+            if turn_id == self._input_turn:
+                self._input_turn = None
+                self._set_state(self.rest_state, "transcription_failed")
+            return
+        self.bus.emit("audio.transcribed", {"text": text, "final": True}, provenance=Provenance.USER, turn_id=turn_id)
 
     async def _resolve_approval_audio(self, wav: bytes, source: str, started_ns: int) -> None:
         try:

@@ -55,10 +55,18 @@ def to_openai(message: Message) -> dict:
 class OmniChat:
     """Inference: streams reply text chunks and optional ToolCall proposals."""
 
-    def __init__(self, client: httpx.AsyncClient, model: str = MODEL, base_url: str = OLLAMA) -> None:
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        model: str = MODEL,
+        base_url: str = OLLAMA,
+        *,
+        reasoning_effort: str | None = None,
+    ) -> None:
         self.client = client
         self.model = model
         self.base_url = base_url.rstrip("/")
+        self.reasoning_effort = reasoning_effort
 
     async def stream(
         self,
@@ -74,6 +82,8 @@ class OmniChat:
             "temperature": 0,
             "seed": SEED,
         }
+        if self.reasoning_effort is not None:
+            body["reasoning_effort"] = self.reasoning_effort
         if tools:
             body["tools"] = list(tools)
         pending_calls: dict[int, dict[str, str]] = {}

@@ -30,9 +30,9 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(r"\b(?:sk-[A-Za-z0-9_\-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{20,}|xox[baprs]-[A-Za-z0-9\-]{10,})\b"),
         "[REDACTED_KEY]",
     ),
-    # Key-value secret assignments: password=..., token: "...", api_key=...
+    # Key-value secret assignments: password=..., db_password=..., token: "...", service_api_key=...
     (
-        re.compile(r"(?i)(\b(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|private[_-]?key)\b\s*[:=]\s*['\"]?)([^'\"\s,;}{]+)"),
+        re.compile(r"(?i)(\b[A-Za-z0-9_-]*(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|private[_-]?key)\b\s*[:=]\s*['\"]?)([^'\"\s,;}{]+)"),
         r"\1[REDACTED]",
     ),
     # Long base64 blobs (e.g. raw input_audio WAV payloads)

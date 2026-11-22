@@ -906,6 +906,15 @@ runtime stays decoupled and usable when integrations are disabled or
 unavailable. Verified with `tests/test_integrations.py` (132 passed, 0
 warnings) and live `system_info` tool verification on local `lfm3-omni:2b`.
 
+**WP11 / R2 acceptance suite status (2026-11-22):** added explicit
+`AUT-01`–`AUT-11` traceability acceptance tests (`tests/test_r2_acceptance.py`)
+and documented the verification matrix in `docs/acceptance-matrix.md`. All
+automated unit, integration, security, and acceptance tests pass with zero
+warnings. Remaining hardware/human gates before formal R1/R2 sign-off: M1
+real-voice corpus (`recorded-v1`), attended echo/barge-in run, ADR 0002, and
+an 8-hour continuous live soak. M11 (human character prototype) remains
+optional and unstarted.
+
 M0 and M1 run in parallel. M0's skeleton is the codebase M2 builds on;
 M1's benchmark harness is the first running voice pipeline. Visual work
 (M4) runs in parallel with hands-free work (M3), and agent work (M6)

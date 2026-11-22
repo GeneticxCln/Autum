@@ -1,0 +1,43 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Node / Web UI (WP4+)
+node_modules/
+.vite/
+
+# Local runtime state, sockets, logs, and secrets
+.autum/
+*.sock
+*.log
+.env
+.env.*
+
+# Models and large benchmark media artifacts
+models/
+benchmarks/audio_cache/
+*.gguf
+*.safetensors
+*.onnx
+*.bin
+*.pt
+*.pth
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Benchmark audio (recordings of the user's voice, generated speech)
+bench/data/

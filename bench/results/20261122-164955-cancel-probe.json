@@ -1,0 +1,105 @@
+{
+ "ollama": "ollama version is 0.40.16",
+ "results": [
+  {
+   "model": "lfm3-omni:2b",
+   "request": "speech-passage",
+   "cancelled_after_s": 1.0,
+   "idle": {
+    "gpu_util_pct": 7,
+    "short_request_ttft_ms": 20.8
+   },
+   "after_cancel": {
+    "gpu_util_pct": 15.1,
+    "short_request_ttft_ms": 36.2
+   },
+   "still_running": {
+    "gpu_util_pct": 81.6,
+    "short_request_ttft_ms": 15850.1
+   },
+   "trials": {
+    "cancel": [
+     {
+      "gpu_util_after_pct": 15.125,
+      "short_request_ttft_ms": 35.64881499914918
+     },
+     {
+      "gpu_util_after_pct": 7.125,
+      "short_request_ttft_ms": 42.37269499935792
+     },
+     {
+      "gpu_util_after_pct": 17.5,
+      "short_request_ttft_ms": 36.16587200303911
+     }
+    ],
+    "control": [
+     {
+      "gpu_util_after_pct": 81.625,
+      "short_request_ttft_ms": 16046.827654998197
+     },
+     {
+      "gpu_util_after_pct": 82.625,
+      "short_request_ttft_ms": 15515.707960999862
+     },
+     {
+      "gpu_util_after_pct": 81.375,
+      "short_request_ttft_ms": 15850.109191000229
+     }
+    ]
+   },
+   "gpu_quiet_after_cancel": true,
+   "model_free_after_cancel": true,
+   "stops_on_cancel": true
+  },
+  {
+   "model": "lfm3-omni:2b",
+   "request": "speech-sentence",
+   "cancelled_after_s": 0.3,
+   "idle": {
+    "gpu_util_pct": 24.4,
+    "short_request_ttft_ms": 20.1
+   },
+   "after_cancel": {
+    "gpu_util_pct": 20.1,
+    "short_request_ttft_ms": 34.3
+   },
+   "still_running": {
+    "gpu_util_pct": 67.6,
+    "short_request_ttft_ms": 33.4
+   },
+   "trials": {
+    "cancel": [
+     {
+      "gpu_util_after_pct": 20.125,
+      "short_request_ttft_ms": 33.790363999287365
+     },
+     {
+      "gpu_util_after_pct": 20.875,
+      "short_request_ttft_ms": 34.93327699834481
+     },
+     {
+      "gpu_util_after_pct": 18.375,
+      "short_request_ttft_ms": 34.33918099835864
+     }
+    ],
+    "control": [
+     {
+      "gpu_util_after_pct": 67.625,
+      "short_request_ttft_ms": 32.97860799648333
+     },
+     {
+      "gpu_util_after_pct": 63.125,
+      "short_request_ttft_ms": 35.08225599944126
+     },
+     {
+      "gpu_util_after_pct": 71.5,
+      "short_request_ttft_ms": 33.41639599966584
+     }
+    ]
+   },
+   "gpu_quiet_after_cancel": true,
+   "model_free_after_cancel": true,
+   "stops_on_cancel": true
+  }
+ ]
+}

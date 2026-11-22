@@ -202,6 +202,7 @@ ADR 0001.
 {"command": "set_mode", "mode": "hands_free"}    switch between "push_to_talk" and "hands_free"
 {"command": "approve"}                           grant the pending approval request (§5.2)
 {"command": "deny"}                              reject the pending approval request (§5.2)
+{"command": "observe", "path": "...", "question": "..."}  inspect a user-supplied image or document (§6 WP7)
 ```
 
 Commands are user actions in a window the user controls, so they carry

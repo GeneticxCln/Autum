@@ -120,6 +120,7 @@ class Runtime:
         tools: ToolRegistry | None = None,
         approval_gate: ApprovalGate | None = None,
         transcriber: Any | None = None,
+        memory: Any | None = None,
         max_agent_steps: int = 5,
     ) -> None:
         self.bus = bus
@@ -133,10 +134,12 @@ class Runtime:
         self.tools = tools
         self.approval_gate = approval_gate or ApprovalGate()
         self.transcriber = transcriber
+        self.memory = memory
         self.max_agent_steps = max_agent_steps
         self.state = State.IDLE
         self.muted = False
         self.capturing = False
+        self.observation = "none"
         self._op: _Operation | None = None
         self._input_turn: str | None = None
         self._approval_turn: tuple[str, str, int] | None = None  # (turn_id, source_mode, started_mono_ns)
@@ -189,6 +192,19 @@ class Runtime:
         if self.state is State.LOADING:
             self._set_state(self.rest_state, "model_ready", ev)
 
+    def set_observation(self, source: str) -> None:
+        """Update the active observation indicator and emit perception events (§3.2, §5.4)."""
+        clean = (source or "none").strip() or "none"
+        prev = self.observation
+        if clean == prev:
+            return
+        self.observation = clean
+        if clean != "none":
+            cause = self.bus.emit("perception.started", {"source": clean})
+        else:
+            cause = self.bus.emit("perception.completed", {"source": prev})
+        self._set_state(self.state, "observation", cause)
+
     def _set_state(self, new: State, reason: str, cause: Event | None = None) -> None:
         old = self.state
         if new is not old and new not in TRANSITIONS[old]:
@@ -201,7 +217,7 @@ class Runtime:
                 "to": new.value,
                 "reason": reason,
                 "microphone": self.microphone,
-                "observation": "none",
+                "observation": self.observation,
             },
             cause=cause,
         )
@@ -460,6 +476,17 @@ class Runtime:
     async def _respond(self, op_id: str, turn_id: str, cause: Event | None) -> None:
         messages: list[dict[str, Any]] = []
         prompt = self.system_prompt() if callable(self.system_prompt) else self.system_prompt
+        if self.memory is not None:
+            latest_user = ""
+            for entry in reversed(self.history):
+                if entry.get("role") == "user" and entry.get("content"):
+                    latest_user = str(entry["content"])
+                    break
+            selected = self.memory.select_for_context(latest_user)
+            if selected:
+                facts = "; ".join(f"{m.key}: {m.value}" for m in selected)
+                mem_note = f" User-selected persistent memories: {facts}."
+                prompt = f"{prompt}{mem_note}" if prompt else mem_note.strip()
         if prompt:
             messages.append({"role": "system", "content": prompt})
         messages.extend(dict(entry) for entry in self.history)

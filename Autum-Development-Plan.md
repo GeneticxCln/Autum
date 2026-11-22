@@ -881,6 +881,18 @@ hands-free anti-spoofing). Verified with unit/acceptance tests
 (`tests/test_agent_and_tools.py`, 122 passed total) and live end-to-end tool
 calling + verification on local `lfm3-omni:2b`.
 
+**M8 & M9 status (2026-11-22):** implemented WP7 user-requested perception
+(`src/autum/perception.py`: `inspect_image` via local `lfm3-omni:2b` vision
+and `read_document` for text/code/PDF, secret-store exclusion §5.2, secret
+scrubbing §5.3, `perception.started`/`completed` + cloud observation halo,
+`Provenance.OBSERVED` untrusted-data boundary §5.1, plus `observe` socket
+command) and WP8 user-controlled persistent memory (`src/autum/memory.py`:
+`remember_fact`, `recall_memories`, `forget_memory` behind irreversible
+approval, secret exclusion, provenance tagging, and user-only cross-session
+context selection). Verified with `tests/test_perception_and_memory.py` (128
+passed, 0 warnings) and live end-to-end vision + memory tests on local
+`lfm3-omni:2b`.
+
 M0 and M1 run in parallel. M0's skeleton is the codebase M2 builds on;
 M1's benchmark harness is the first running voice pipeline. Visual work
 (M4) runs in parallel with hands-free work (M3), and agent work (M6)

@@ -35,12 +35,15 @@ class Config:
     voice: str = "female-american-english"
     log_level: str = "INFO"
     data_dir: str = ""
+    allowed_read_dirs: tuple[str, ...] = ()
     require_reversible_approval: bool = False
     approval_timeout_s: float = 20.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, Mode):
             object.__setattr__(self, "mode", Mode(self.mode))
+        if isinstance(self.allowed_read_dirs, list):
+            object.__setattr__(self, "allowed_read_dirs", tuple(str(p) for p in self.allowed_read_dirs))
         if self.silence_ms < 100 or self.silence_ms > 5000:
             raise ValueError("silence_ms must be between 100 and 5000")
         if self.barge_in_ms < 64 or self.barge_in_ms > 2000:
@@ -56,6 +59,9 @@ class Config:
 
     def resolved_data_dir(self) -> Path | None:
         return Path(self.data_dir).expanduser() if self.data_dir else None
+
+    def resolved_allowed_read_dirs(self) -> tuple[Path, ...]:
+        return tuple(Path(p).expanduser() for p in self.allowed_read_dirs if p)
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:

@@ -27,7 +27,7 @@ log = logging.getLogger("autum.transport")
 CLIENT_QUEUE = 512
 MAX_LINE = 8192
 MAX_TEXT = 2000
-COMMANDS = {"talk_start", "talk_finish", "stop", "text", "set_mode", "approve", "deny"}
+COMMANDS = {"talk_start", "talk_finish", "stop", "text", "set_mode", "approve", "deny", "observe"}
 MODES = {"push_to_talk", "hands_free"}
 SNAPSHOT_TYPES = ("runtime.state_changed", "audio.mute_changed")
 
@@ -59,6 +59,19 @@ def parse_command(line: bytes) -> dict | None:
         if mode not in MODES or set(data) != {"command", "mode"}:
             return None
         return {"command": "set_mode", "mode": mode}
+    if data["command"] == "observe":
+        path = data.get("path")
+        question = data.get("question", "")
+        if not isinstance(path, str) or not path.strip() or len(path) > 512:
+            return None
+        if not isinstance(question, str) or len(question) > 400:
+            return None
+        if not set(data) <= {"command", "path", "question"}:
+            return None
+        out = {"command": "observe", "path": path.strip()}
+        if question.strip():
+            out["question"] = question.strip()
+        return out
     if set(data) != {"command"}:
         return None
     return {"command": data["command"]}

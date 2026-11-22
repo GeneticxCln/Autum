@@ -21,11 +21,13 @@ from autum.events import new_id  # noqa: E402
 from autum.presence import has_layer_shell  # noqa: E402
 from autum.presence.cloud_item import FaceCloudItem, register_qml_types  # noqa: E402
 from autum.presence.model import PresenceModel  # noqa: E402
+from autum.presence.settings_bridge import SettingsBridge  # noqa: E402
 
 APP = QGuiApplication.instance() or QGuiApplication([])
 register_qml_types()
 QML = Path(__file__).resolve().parents[1] / "src" / "autum" / "presence" / "Presence.qml"
 WAYLAND_QML = QML.with_name("PresenceWayland.qml")
+SETTINGS_QML = QML.with_name("SettingsWindow.qml")
 
 
 def spin(ms: int) -> None:
@@ -75,10 +77,12 @@ def test_leaving_speaking_resets_the_voice_level(tmp_path):
 
 def test_the_qml_loads_without_warnings(tmp_path):
     model = PresenceModel(tmp_path / "none.sock")
+    bridge = SettingsBridge(model, config_path=tmp_path / "config.toml")
     engine = QQmlApplicationEngine()
     warnings = []
     engine.warnings.connect(lambda ws: warnings.extend(w.toString() for w in ws))
     engine.rootContext().setContextProperty("presence", model)
+    engine.rootContext().setContextProperty("settingsBridge", bridge)
     engine.load(QUrl.fromLocalFile(str(QML)))
     for event in events():
         model.apply(event)
@@ -90,14 +94,122 @@ def test_the_qml_loads_without_warnings(tmp_path):
 @pytest.mark.skipif(not has_layer_shell(), reason="layer-shell-qt not installed")
 def test_the_wayland_layer_shell_qml_loads_without_warnings(tmp_path):
     model = PresenceModel(tmp_path / "none.sock")
+    bridge = SettingsBridge(model, config_path=tmp_path / "config.toml")
     engine = QQmlApplicationEngine()
     warnings = []
     engine.warnings.connect(lambda ws: warnings.extend(w.toString() for w in ws))
     engine.rootContext().setContextProperty("presence", model)
+    engine.rootContext().setContextProperty("settingsBridge", bridge)
     engine.load(QUrl.fromLocalFile(str(WAYLAND_QML)))
     spin(100)
     assert engine.rootObjects() and warnings == []
     engine.deleteLater()
+
+
+def test_settings_window_qml_loads_without_warnings(tmp_path):
+    model = PresenceModel(tmp_path / "none.sock")
+    bridge = SettingsBridge(model, config_path=tmp_path / "config.toml")
+    engine = QQmlApplicationEngine()
+    warnings = []
+    engine.warnings.connect(lambda ws: warnings.extend(w.toString() for w in ws))
+    engine.rootContext().setContextProperty("presence", model)
+    engine.rootContext().setContextProperty("settingsBridge", bridge)
+    engine.load(QUrl.fromLocalFile(str(SETTINGS_QML)))
+    spin(100)
+    assert engine.rootObjects() and warnings == []
+    engine.deleteLater()
+
+
+def test_settings_bridge_saves_all_three_models_and_position_with_0600_perms(tmp_path):
+    from autum.config import Config
+
+    cfg_path = tmp_path / "autum" / "config.toml"
+    reloaded = []
+    modes = []
+
+    class DummyModel:
+        def reloadConfig(self):
+            reloaded.append(True)
+
+        def setMode(self, m):
+            modes.append(m)
+
+    bridge = SettingsBridge(DummyModel(), config_path=cfg_path)
+    res = bridge.saveAndApply(
+        {
+            "mode": "hands_free",
+            "aec": True,
+            "silence_ms": 850,
+            "barge_in_ms": 300,
+            "max_history": 25,
+            "max_context_chars": 12000,
+            "ollama_url": "http://127.0.0.1:11434",
+            "model": "custom-voice:latest",
+            "chat_model": "llama3.2:latest",
+            "vision_model": "llava:latest",
+            "dynamic_swap": False,
+            "chat_think": True,
+            "voice": "female-american-english",
+            "log_level": "DEBUG",
+            "allowed_read_dirs": ["/tmp"],
+            "enabled_integrations": ["linux_desktop"],
+            "excluded_windows": ["keepassxc", "vault"],
+            "require_reversible_approval": True,
+            "approval_timeout_s": 30,
+        }
+    )
+    assert res["ok"] is True
+    assert reloaded == [True]
+    assert (cfg_path.stat().st_mode & 0o777) == 0o600
+    assert (cfg_path.parent.stat().st_mode & 0o777) == 0o700
+
+    loaded = Config.load(cfg_path)
+    assert loaded.model == "custom-voice:latest"
+    assert loaded.chat_model == "llama3.2:latest"
+    assert loaded.vision_model == "llava:latest"
+    assert loaded.dynamic_swap is False
+    assert loaded.chat_think is True
+    assert loaded.mode.value == "hands_free"
+    assert loaded.allowed_read_dirs == ("/tmp",)
+    assert loaded.require_reversible_approval is True
+
+    # Invalid URL is rejected cleanly without overwriting valid config
+    bad = bridge.saveAndApply({"ollama_url": "http://example.com:11434"})
+    assert bad["ok"] is False and "error" in bad
+
+    # Mode toggle persists cleanly
+    bridge.setModeAndPersist("push_to_talk")
+    assert modes == ["push_to_talk"]
+    assert Config.load(cfg_path).mode.value == "push_to_talk"
+
+    # Drag position persists with 0600 perms and resets cleanly
+    assert bridge.loadPosition() == {"saved": False}
+    bridge.savePosition(420, 310)
+    pos_path = cfg_path.parent / "presence.json"
+    assert (pos_path.stat().st_mode & 0o777) == 0o600
+    assert bridge.loadPosition() == {"saved": True, "margin_right": 420, "margin_bottom": 310}
+    bridge.resetPosition()
+    assert bridge.loadPosition() == {"saved": False}
+
+
+def test_presence_model_syncs_mode_and_sends_reload_config(tmp_path):
+    model = PresenceModel(tmp_path / "none.sock")
+    assert model.mode == "push_to_talk"
+    bus = EventBus("s")
+    model.apply(
+        bus.emit(
+            "runtime.state_changed",
+            {
+                "from": "idle",
+                "to": "listening",
+                "reason": "mode_changed",
+                "microphone": "open",
+                "observation": "none",
+                "mode": "hands_free",
+            },
+        )
+    )
+    assert model.mode == "hands_free"
 
 
 def test_socket_round_trip_events_in_commands_out(tmp_path):

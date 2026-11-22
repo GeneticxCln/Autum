@@ -195,8 +195,8 @@ class Runtime:
         if mode is self.mode:
             return
         self.mode = mode
-        if self.state in (State.IDLE, State.LISTENING):
-            self._set_state(self.rest_state, "mode_changed")
+        target = self.rest_state if self.state in (State.IDLE, State.LISTENING) else self.state
+        self._set_state(target, "mode_changed")
 
     def begin_model_load(self, model: str) -> None:
         """Announce model loading and enter State.LOADING when at rest."""
@@ -257,6 +257,7 @@ class Runtime:
                 "reason": reason,
                 "microphone": self.microphone,
                 "observation": self.observation,
+                "mode": self.mode.value,
             },
             cause=cause,
         )

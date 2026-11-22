@@ -17,6 +17,7 @@ from PySide6.QtQml import QQmlApplicationEngine
 from autum.presence import has_layer_shell
 from autum.presence.cloud_item import register_qml_types
 from autum.presence.model import PresenceModel
+from autum.presence.settings_bridge import SettingsBridge
 from autum.transport import default_socket_path
 
 
@@ -30,8 +31,10 @@ def main() -> int:
     app.setApplicationName("Autum")
     register_qml_types()
     model = PresenceModel(args.socket or default_socket_path(), measure=args.measure)
+    settings_bridge = SettingsBridge(model)
     engine = QQmlApplicationEngine()
     engine.rootContext().setContextProperty("presence", model)
+    engine.rootContext().setContextProperty("settingsBridge", settings_bridge)
     qml_name = "PresenceWayland.qml" if app.platformName().startswith("wayland") and has_layer_shell() else "Presence.qml"
     engine.load(QUrl.fromLocalFile(str(Path(__file__).with_name(qml_name))))
     if not engine.rootObjects():

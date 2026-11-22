@@ -84,6 +84,7 @@ def command_handler(
     runtime: Runtime,
     voice: VoiceInput,
     hands_free: HandsFreeInput | Callable[[], HandsFreeInput] | None = None,
+    on_reload: Callable[[], asyncio.Future | Any] | None = None,
 ):
     """User actions from the bubble (validated by the transport)."""
     hf_instance: HandsFreeInput | None = hands_free if not callable(hands_free) else None
@@ -136,6 +137,11 @@ def command_handler(
                     if hf is not None:
                         await hf.stop()
                     runtime.set_mode(Mode.PUSH_TO_TALK)
+            case "reload_config":
+                if on_reload is not None:
+                    res = on_reload()
+                    if asyncio.iscoroutine(res):
+                        await res
 
     return handle
 
@@ -348,11 +354,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 {"runtime.component_recovered"},
             )
             mode = Mode.HANDS_FREE if use_hands_free else Mode.PUSH_TO_TALK
-            speech = SpeechPlayer(
-                bus,
-                OmniSpeech(client, model=cfg.model, voice=cfg.voice, base_url=cfg.ollama_url),
-                target=out_target,
-            )
+            speech_synth = OmniSpeech(client, model=cfg.model, voice=cfg.voice, base_url=cfg.ollama_url)
+            speech = SpeechPlayer(bus, speech_synth, target=out_target)
             transcriber = OmniTranscriber(client, model=cfg.model, base_url=cfg.ollama_url)
             runtime_ref: list[Runtime] = []
             data_dir = cfg.resolved_data_dir() or default_data_dir()
@@ -368,6 +371,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 memory,
                 is_observed_turn=lambda: runtime_ref[0].turn_observed if runtime_ref else False,
             )
+            live_allowed_dirs: list[Path] = list(cfg.resolved_allowed_read_dirs())
+            live_excluded_windows: list[str] = list(cfg.excluded_windows)
             vision = OllamaVision(
                 client,
                 model=vision_model,
@@ -380,7 +385,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
             register_perception_capabilities(
                 registry,
                 vision=vision,
-                allowed_dirs=cfg.resolved_allowed_read_dirs(),
+                allowed_dirs=live_allowed_dirs,
                 set_observation=set_obs,
             )
             integrations = IntegrationManager()
@@ -389,8 +394,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 registry,
                 IntegrationContext(
                     vision=vision,
-                    allowed_read_dirs=cfg.resolved_allowed_read_dirs(),
-                    excluded_windows=cfg.excluded_windows,
+                    allowed_read_dirs=live_allowed_dirs,  # type: ignore[arg-type]
+                    excluded_windows=live_excluded_windows,  # type: ignore[arg-type]
                     set_observation=set_obs,
                     end_observation=end_obs,
                 ),
@@ -400,15 +405,16 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 require_reversible=cfg.require_reversible_approval,
                 timeout_s=cfg.approval_timeout_s,
             )
+            chat = OmniChat(
+                client,
+                model=chat_model,
+                base_url=cfg.ollama_url,
+                reasoning_effort=chat_effort,
+                swapper=swapper,
+            )
             runtime = Runtime(
                 bus,
-                OmniChat(
-                    client,
-                    model=chat_model,
-                    base_url=cfg.ollama_url,
-                    reasoning_effort=chat_effort,
-                    swapper=swapper,
-                ),
+                chat,
                 speech,
                 mode=mode,
                 system_prompt=system_prompt,
@@ -436,7 +442,81 @@ async def main(argv: Sequence[str] | None = None) -> int:
                     hands_free = HandsFreeInput(bus, runtime, transcriber, detector, target=in_target)
                 return hands_free
 
-            handle_command = command_handler(runtime, voice, make_hands_free)
+            async def reload_live_config() -> None:
+                nonlocal swapper, silence_ms, barge_in_ms
+                try:
+                    new_cfg = Config.load(args.config)
+                except (OSError, ValueError) as exc:
+                    bus.emit("runtime.component_error", {"component": "config", "error": str(exc)})
+                    return
+                configure_logging(new_cfg.log_level)
+                new_chat = new_cfg.resolved_chat_model()
+                new_vis = new_cfg.resolved_vision_model()
+                new_voice = new_cfg.model
+                for req_m in dict.fromkeys((new_voice, new_chat, new_vis)):
+                    prob = await check_ready(client, model=req_m, base_url=new_cfg.ollama_url)
+                    if prob:
+                        bus.emit("runtime.component_error", {"component": "config", "error": prob})
+                        return
+
+                base = new_cfg.ollama_url.rstrip("/")
+                c_eff = None if new_cfg.chat_think else ("none" if any(k in new_chat.lower() for k in ("gemma4", "qwen3")) else None)
+                v_eff = None if new_cfg.chat_think else ("none" if any(k in new_vis.lower() for k in ("gemma4", "qwen3")) else None)
+
+                need_swap = new_cfg.dynamic_swap and len({m for m in (new_chat, new_vis) if m != new_voice}) > 1
+                if need_swap:
+                    if swapper is None:
+                        swapper = ModelSwapper(
+                            client,
+                            base_url=base,
+                            pinned=(new_voice,),
+                            on_swap=lambda new, old: log(f"swapped GPU model {old} -> {new}"),
+                        )
+                    else:
+                        swapper.base_url = base
+                        swapper.pinned = frozenset((new_voice,))
+                else:
+                    swapper = None
+
+                chat.model = new_chat
+                chat.base_url = base
+                chat.reasoning_effort = c_eff
+                chat.swapper = swapper
+
+                vision.model = new_vis
+                vision.base_url = base
+                vision.reasoning_effort = v_eff
+                vision.swapper = swapper
+
+                speech_synth.model = new_voice
+                speech_synth.voice = new_cfg.voice
+                speech_synth.base_url = base
+                transcriber.model = new_voice
+                transcriber.base_url = base
+
+                runtime.direct_audio = new_chat == new_voice and "omni" in new_chat.lower()
+                runtime.max_context_chars = new_cfg.max_context_chars
+                approval_gate.require_reversible = new_cfg.require_reversible_approval
+                approval_gate.timeout_s = new_cfg.approval_timeout_s
+                live_allowed_dirs[:] = new_cfg.resolved_allowed_read_dirs()
+                live_excluded_windows[:] = new_cfg.excluded_windows
+                silence_ms = new_cfg.silence_ms
+                barge_in_ms = new_cfg.barge_in_ms
+                if hands_free is not None:
+                    hands_free.detector.silence_frames = max(1, int((silence_ms + 31) // 32))
+                    hands_free.detector.barge_in_frames = max(1, int((barge_in_ms + 31) // 32))
+
+                if new_cfg.mode is not runtime.mode:
+                    await handle_command({"command": "set_mode", "mode": new_cfg.mode.value})
+
+                if swapper is not None:
+                    await swapper.ensure_active(new_chat)
+                log(
+                    f"reloaded settings (mode={new_cfg.mode.value}, chat={new_chat}, "
+                    f"vision={new_vis}, voice={new_voice}, swap={bool(swapper)})."
+                )
+
+            handle_command = command_handler(runtime, voice, make_hands_free, on_reload=reload_live_config)
             server = EventServer(bus, handle_command)
             try:
                 await server.start()

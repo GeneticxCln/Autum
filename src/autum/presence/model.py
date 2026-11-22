@@ -46,6 +46,7 @@ class PresenceModel(QObject):
         self._state = "idle"
         self._microphone = "off"
         self._observation = "none"
+        self._mode = "push_to_talk"
         self._level = 0.0
         self._error = ""
         self._connected = False
@@ -70,6 +71,7 @@ class PresenceModel(QObject):
     stateLabel = Property(str, lambda self: LABELS.get(self._state, self._state), notify=changed)
     microphone = Property(str, lambda self: self._microphone, notify=changed)
     observation = Property(str, lambda self: self._observation, notify=changed)
+    mode = Property(str, lambda self: self._mode, notify=changed)
     level = Property(float, lambda self: self._level, notify=levelChanged)
     error = Property(str, lambda self: self._error, notify=changed)
     connected = Property(bool, lambda self: self._connected, notify=changed)
@@ -83,6 +85,8 @@ class PresenceModel(QObject):
                 if p["to"] != self._state:
                     self._pending.append(event.mono_ns)
                 self._state, self._microphone, self._observation = p["to"], p["microphone"], p["observation"]
+                if "mode" in p and p["mode"] in ("push_to_talk", "hands_free"):
+                    self._mode = str(p["mode"])
                 if self._state != "speaking":
                     self._set_level(0.0)
             case "speech.output_level":
@@ -148,6 +152,19 @@ class PresenceModel(QObject):
     @Slot()
     def talkFinish(self) -> None:
         self._send({"command": "talk_finish"})
+
+    @Slot(str)
+    def setMode(self, mode: str) -> None:
+        if mode in ("push_to_talk", "hands_free"):
+            self._send({"command": "set_mode", "mode": mode})
+
+    @Slot()
+    def stopSpeaking(self) -> None:
+        self._send({"command": "stop"})
+
+    @Slot()
+    def reloadConfig(self) -> None:
+        self._send({"command": "reload_config"})
 
     # ----- measurement (WP4 acceptance: state lag) ----------------------
 

@@ -10,9 +10,18 @@ persistent memory. See [the development plan](Autum-Development-Plan.md),
 
 ## Run Autum
 
-Requires local Ollama with `lfm3-omni:2b` (`127.0.0.1:11434`), PipeWire
-(`pw-record`, `pw-play`, `wpctl`), PySide6 (`qt6-declarative`), and on Wayland
-`layer-shell-qt` (X11 fallback included).
+Autum is **model-agnostic** — this project does not bundle or provide AI models.
+You can use any locally installed Ollama models (`127.0.0.1:11434`) for each of
+the three roles (**Brain/Chat**, **Vision**, and **Voice**) and swap them live
+at any time from **Right-Click → Settings...** (or `~/.config/autum/config.toml`).
+
+*Models tested during development (RTX 4060 Ti 16 GB with dynamic VRAM swap):*
+- **Brain / Chat:** `gemma4:12b`, `qwen3:8b`, `lfm3-omni:2b`
+- **Vision:** `qwen3-vl:8b`, `gemma4:12b`
+- **Voice (STT + TTS):** `lfm3-omni:2b`
+
+Requires local Ollama, PipeWire (`pw-record`, `pw-play`, `wpctl`), PySide6
+(`qt6-declarative`), and on Wayland `layer-shell-qt` (X11 fallback included).
 
 ```bash
 # Push-to-talk (default)
@@ -24,9 +33,12 @@ PYTHONPATH=src python3 -m autum --hands-free --aec    # with speakers (PipeWire 
 ```
 
 Autum runs in the background. Her visual presence is a 300 px 3D stippled face
-suspended inside a frosted stardust orb in the bottom-right corner that follows
-you across windows and virtual desktops via Wayland `wlr-layer-shell`:
+suspended inside a frosted stardust orb that follows you across windows and
+virtual desktops via Wayland `wlr-layer-shell`:
 
+- **Move anywhere:** click and drag the orb anywhere on screen (position is remembered across restarts)
+- **Right-click menu:** toggle **Hands-Free Mode**, **Stop Speaking**, open **Settings...**, or **Reset Position**
+- **Hold to talk:** press and hold the orb briefly (or hold the global shortcut, suggested `Meta+Z`), speak, and release; holding while Autum speaks interrupts her immediately
 - **Idle:** frosted silver-ice, slow stardust orbit and gentle 3D breathing sway
 - **Listening / speech detected:** cool ice-cyan, gathered inward, attentive gaze, warm open-mic edge aura
 - **Thinking / processing:** silver-violet swirling stardust bands with subtle crown wave
@@ -34,10 +46,6 @@ you across windows and virtual desktops via Wayland `wlr-layer-shell`:
 - **Waiting for approval:** warm gold tint
 - **Observing (image / document / window / screen):** cool cyan-teal outer halo and attentive eye sheen
 - **Muted:** grey with a lower-right gap (controlled only by your OS mic mute; Autum never unmutes it)
-
-In push-to-talk mode, hold the global shortcut (KDE GlobalShortcuts portal,
-suggested `Meta+Z`) or hold the cloud, speak, and release. Holding it while
-Autum speaks interrupts her immediately.
 
 ## Capabilities & Privacy
 
@@ -64,16 +72,27 @@ Autum speaks interrupts her immediately.
 
 ## Configuration
 
-Optional TOML file at `~/.config/autum/config.toml` (or `--config PATH`):
+Right-click the orb and choose **Settings...** to edit all settings visually
+(including live Ollama model pickers for **Brain/Chat**, **Vision**, and
+**Voice**, dynamic VRAM swap, thinking mode, Hands-Free/AEC, allowed folders,
+approvals, and excluded windows) and apply changes live without restarting.
+
+Settings are saved with owner-only permissions (`0600`) at
+`~/.config/autum/config.toml` (or `--config PATH`):
 
 ```toml
 mode = "push_to_talk"               # or "hands_free"
+chat_model = "gemma4:12b"           # any local Ollama model for Brain/Chat
+vision_model = "qwen3-vl:8b"        # any local Ollama model for Vision
+model = "lfm3-omni:2b"              # any local Ollama model for Voice (STT/TTS)
+dynamic_swap = true                 # unload Brain/Vision on swap for 16 GB GPUs
+chat_think = false
 aec = false
 silence_ms = 700
 barge_in_ms = 256
 max_history = 20
 max_context_chars = 10000
-allowed_read_dirs = ["~/Documents"] # required for list_directory; optional scope for perception
+allowed_read_dirs = ["~/Documents"] # fail-closed until folders are added
 enabled_integrations = ["linux_desktop"]
 require_reversible_approval = false
 approval_timeout_s = 20.0

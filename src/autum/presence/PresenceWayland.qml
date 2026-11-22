@@ -1,8 +1,7 @@
 // Wayland wrapper around Presence.qml using wlr-layer-shell (layer-shell-qt).
-// Keeps the particle cloud anchored to the bottom-right corner across every
-// virtual desktop, activity, and normal/fullscreen window without stealing
-// focus or appearing on the taskbar. Loaded only on Wayland when
-// org.kde.layershell is available.
+// Keeps the orb floating across every virtual desktop, activity, and
+// normal/fullscreen window without stealing focus or appearing on the taskbar.
+// Dragging updates marginRight/marginBottom dynamically.
 import QtQuick
 import org.kde.layershell as LayerShell
 
@@ -15,6 +14,6 @@ Presence {
     LayerShell.Window.activateOnShow: false
     LayerShell.Window.wantsToBeOnActiveScreen: true
     LayerShell.Window.scope: "autum"
-    LayerShell.Window.margins.right: margin - pad
-    LayerShell.Window.margins.bottom: margin - pad
+    LayerShell.Window.margins.right: marginRight
+    LayerShell.Window.margins.bottom: marginBottom
 }

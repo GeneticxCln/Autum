@@ -8,6 +8,7 @@ clear message rather than silently misconfiguring the runtime.
 
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 import urllib.parse
@@ -80,6 +81,66 @@ class Config:
 
     def resolved_allowed_read_dirs(self) -> tuple[Path, ...]:
         return tuple(Path(p).expanduser() for p in self.allowed_read_dirs if p)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "mode": self.mode.value,
+            "aec": self.aec,
+            "silence_ms": self.silence_ms,
+            "barge_in_ms": self.barge_in_ms,
+            "max_history": self.max_history,
+            "max_context_chars": self.max_context_chars,
+            "ollama_url": self.ollama_url,
+            "model": self.model,
+            "chat_model": self.chat_model,
+            "vision_model": self.vision_model,
+            "dynamic_swap": self.dynamic_swap,
+            "chat_think": self.chat_think,
+            "voice": self.voice,
+            "log_level": self.log_level,
+            "data_dir": self.data_dir,
+            "allowed_read_dirs": list(self.allowed_read_dirs),
+            "enabled_integrations": list(self.enabled_integrations),
+            "excluded_windows": list(self.excluded_windows),
+            "require_reversible_approval": self.require_reversible_approval,
+            "approval_timeout_s": self.approval_timeout_s,
+        }
+
+    def to_toml(self) -> str:
+        """Serialize this validated Config to clean TOML."""
+        def _fmt(val: object) -> str:
+            if isinstance(val, bool):
+                return "true" if val else "false"
+            if isinstance(val, (int, float)):
+                return str(val)
+            if isinstance(val, str):
+                return json.dumps(val)
+            if isinstance(val, (list, tuple)):
+                return "[" + ", ".join(json.dumps(str(x)) for x in val) + "]"
+            raise TypeError(f"unsupported TOML value: {val!r}")
+
+        lines = ["# Autum local configuration (managed by Autum Settings)"]
+        for key, val in self.to_dict().items():
+            lines.append(f"{key} = {_fmt(val)}")
+        return "\n".join(lines) + "\n"
+
+    def save(self, path: Path | None = None) -> Path:
+        """Atomically write validated config to disk with owner-only permissions (0700 / 0600)."""
+        cfg_path = path or default_config_path()
+        cfg_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(cfg_path.parent, 0o700)
+        tmp = cfg_path.with_suffix(".toml.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+        except Exception:
+            os.close(fd)
+            raise
+        with fh:
+            fh.write(self.to_toml())
+        tmp.replace(cfg_path)
+        return cfg_path
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:

@@ -581,8 +581,8 @@ Initial scope:
 - Audio-reactive animation during speech, driven by
   `speech.output_level`.
 - Runtime-driven state changes.
-- User controls for visibility and activation.
-- Captions and text input (§3.1).
+- User controls for visibility and activation *(deferred by user decision, 2026-11-22: keep M4 strictly cloud-only with no menus or extra controls)*.
+- Captions and text input (§3.1) *(deferred by user decision, 2026-11-22: keep M4 strictly cloud-only)*.
 
 The renderer receives state and presentation intent. It does not own
 reasoning, conversation state, or tool execution.
@@ -846,15 +846,17 @@ optional PipeWire WebRTC echo cancellation (`--aec`). Final silence/barge-in
 thresholds and the speaker vs. headphone policy remain provisional until M1's
 recorded set and attended echo test complete.
 
-**M4 status (2026-11-22):** the visual presence is a particle cloud in
-the bottom-right screen corner and nothing else (user's choice of design):
-its own process, pinned across all virtual desktops and windows via Wayland
-`wlr-layer-shell` (with an X11 fallback), kept off the taskbar, fed by the
-event socket. The microphone indicator is part of the cloud: a warm edge glow
-while open, grey with a gap while muted. Steady CPU use about 15% of one
-core. On the reference display
-a state change reaches the screen in 4.6 ms median and 8.7 ms at worst
-(objective: 100 ms or less).
+**M4 status (2026-11-22):** the visual presence is a 300 px particle cloud in
+the bottom-right screen corner and nothing else (user's choice of design;
+secondary WP4 items — captions, text input, menus, and extra controls — are
+explicitly deferred by user decision): its own process, pinned across all
+virtual desktops and windows via Wayland `wlr-layer-shell` (with an X11
+fallback), kept off the taskbar, fed by the event socket. The microphone
+indicator is part of the cloud: a warm edge glow while open, grey with a gap
+while muted. Steady CPU use about 15% of one core (measured under XWayland;
+re-measure under native Wayland during M1/R1 resource measurement). On the
+reference display a state change reached the screen in 4.6 ms median and
+8.7 ms at worst (objective: 100 ms or less).
 
 M0 and M1 run in parallel. M0's skeleton is the codebase M2 builds on;
 M1's benchmark harness is the first running voice pipeline. Visual work

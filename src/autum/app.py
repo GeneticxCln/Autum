@@ -14,10 +14,13 @@ import argparse
 import asyncio
 import datetime as dt
 import importlib.util
+import logging
 import os
 import shutil
 import signal
 import sys
+import time
+from pathlib import Path
 from typing import Callable, Sequence
 
 import httpx
@@ -32,12 +35,16 @@ from autum.audio import (
     check_microphone,
 )
 from autum.bus import EventBus
+from autum.config import Config
 from autum.events import new_id
 from autum.hotkey import PushToTalkKey
+from autum.logging import configure_logging
 from autum.ollama import OmniChat, OmniSpeech, OmniTranscriber, check_ready, preload
 from autum.runtime import Mode, Runtime
 from autum.transport import EventServer
 from autum.vad import SileroVad, TurnDetector
+
+_logger = logging.getLogger("autum.app")
 
 PERSONA = (
     "You are Autum, a friendly local voice assistant. "
@@ -50,7 +57,7 @@ PERSONA = (
 
 
 def log(message: str) -> None:
-    print(f"autum: {message}", file=sys.stderr, flush=True)
+    _logger.info("%s", message)
 
 
 def system_prompt() -> str:
@@ -134,37 +141,128 @@ async def start_bubble() -> asyncio.subprocess.Process | None:
         return proc  # still running: it started
 
 
+class BubbleSupervisor:
+    """Keeps the optional visual presence alive without coupling runtime stability to it."""
+
+    def __init__(
+        self,
+        bus: EventBus,
+        starter: Callable[[], asyncio.Future] = start_bubble,
+        *,
+        restart_delay_s: float = 2.0,
+        max_restarts: int = 5,
+    ) -> None:
+        self.bus = bus
+        self.starter = starter
+        self.restart_delay_s = restart_delay_s
+        self.max_restarts = max_restarts
+        self.proc: asyncio.subprocess.Process | None = None
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+
+    async def start(self) -> None:
+        self.proc = await self.starter()
+        if self.proc is not None:
+            self._task = asyncio.create_task(self._watch())
+
+    async def _watch(self) -> None:
+        restarts = 0
+        while not self._stop.is_set() and self.proc is not None:
+            waiter = asyncio.create_task(self.proc.wait())
+            stopper = asyncio.create_task(self._stop.wait())
+            done, pending = await asyncio.wait({waiter, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            for p in pending:
+                p.cancel()
+            if self._stop.is_set():
+                return
+            code = waiter.result()
+            self.proc = None
+            restarts += 1
+            self.bus.emit(
+                "runtime.component_error",
+                {"component": "presence", "error": f"visual presence exited unexpectedly (code {code})"},
+            )
+            if restarts > self.max_restarts:
+                log("visual presence crashed repeatedly; continuing without it")
+                return
+            await asyncio.sleep(self.restart_delay_s)
+            if self._stop.is_set():
+                return
+            self.proc = await self.starter()
+            if self.proc is not None:
+                self.bus.emit("runtime.component_recovered", {"component": "presence"})
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        if self.proc is not None and self.proc.returncode is None:
+            self.proc.terminate()
+            try:
+                await asyncio.wait_for(self.proc.wait(), 3.0)
+            except asyncio.TimeoutError:
+                self.proc.kill()
+                await self.proc.wait()
+        self.proc = None
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="python3 -m autum")
     parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Path to TOML configuration file (default: ~/.config/autum/config.toml)",
+    )
+    parser.add_argument(
         "--hands-free",
         action="store_true",
+        default=None,
         help="Start in hands-free mode with Silero VAD turn detection and voice barge-in",
     )
     parser.add_argument(
         "--aec",
         action="store_true",
+        default=None,
         help="Load PipeWire WebRTC echo cancellation for speaker use in hands-free mode",
     )
     parser.add_argument(
         "--silence-ms",
         type=int,
-        default=700,
-        help="Hands-free end-of-turn silence threshold in milliseconds (default: 700)",
+        default=None,
+        help="Hands-free end-of-turn silence threshold in milliseconds",
     )
     parser.add_argument(
         "--barge-in-ms",
         type=int,
-        default=256,
-        help="Hands-free speech duration in milliseconds required to interrupt Autum (default: 256)",
+        default=None,
+        help="Hands-free speech duration in milliseconds required to interrupt Autum",
     )
     return parser.parse_args(argv)
 
 
 async def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    try:
+        cfg = Config.load(args.config)
+    except (OSError, ValueError) as exc:
+        configure_logging()
+        log(f"configuration error: {exc}")
+        return 1
+    configure_logging(cfg.log_level)
+
+    use_hands_free = cfg.mode is Mode.HANDS_FREE if args.hands_free is None else bool(args.hands_free)
+    use_aec = cfg.aec if args.aec is None else bool(args.aec)
+    silence_ms = cfg.silence_ms if args.silence_ms is None else args.silence_ms
+    barge_in_ms = cfg.barge_in_ms if args.barge_in_ms is None else args.barge_in_ms
+
     missing = [tool for tool in ("pw-record", "pw-play", "wpctl") if not shutil.which(tool)]
-    if args.aec and not shutil.which("pactl"):
+    if use_aec and not shutil.which("pactl"):
         missing.append("pactl")
     if missing:
         log(f"missing PipeWire tools: {', '.join(missing)}")
@@ -177,7 +275,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
     aec: EchoCanceller | None = None
     in_target: str | None = None
     out_target: str | None = None
-    if args.aec:
+    if use_aec:
         aec = EchoCanceller()
         if await aec.start():
             in_target, out_target = aec.source, aec.sink
@@ -188,24 +286,39 @@ async def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=3.0)) as client:
-            problem = await check_ready(client)
+            problem = await check_ready(client, model=cfg.model, base_url=cfg.ollama_url)
             if problem:
                 log(problem)
                 return 1
             if not await check_microphone():
                 log(MIC_HELP)
                 return 1
-            await preload(client)
 
             bus = EventBus(new_id())
             bus.subscribe(
                 lambda e: log(f"{e.payload['component']}: {e.payload['error']}"),
                 {"runtime.component_error"},
             )
-            mode = Mode.HANDS_FREE if args.hands_free else Mode.PUSH_TO_TALK
-            speech = SpeechPlayer(bus, OmniSpeech(client), target=out_target)
-            runtime = Runtime(bus, OmniChat(client), speech, mode=mode, system_prompt=system_prompt)
-            transcriber = OmniTranscriber(client)
+            bus.subscribe(
+                lambda e: log(f"{e.payload['component']}: recovered"),
+                {"runtime.component_recovered"},
+            )
+            mode = Mode.HANDS_FREE if use_hands_free else Mode.PUSH_TO_TALK
+            speech = SpeechPlayer(
+                bus,
+                OmniSpeech(client, model=cfg.model, voice=cfg.voice, base_url=cfg.ollama_url),
+                target=out_target,
+            )
+            runtime = Runtime(
+                bus,
+                OmniChat(client, model=cfg.model, base_url=cfg.ollama_url),
+                speech,
+                mode=mode,
+                system_prompt=system_prompt,
+                max_history=cfg.max_history,
+                max_context_chars=cfg.max_context_chars,
+            )
+            transcriber = OmniTranscriber(client, model=cfg.model, base_url=cfg.ollama_url)
             voice = VoiceInput(bus, runtime, transcriber, target=in_target)
 
             hands_free: HandsFreeInput | None = None
@@ -215,8 +328,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 if hands_free is None:
                     detector = TurnDetector(
                         SileroVad(),
-                        silence_ms=args.silence_ms,
-                        barge_in_ms=args.barge_in_ms,
+                        silence_ms=silence_ms,
+                        barge_in_ms=barge_in_ms,
                     )
                     hands_free = HandsFreeInput(bus, runtime, transcriber, detector, target=in_target)
                 return hands_free
@@ -229,8 +342,15 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 log(str(exc))
                 return 1
             mute = asyncio.create_task(MuteMonitor(bus).run())
-            bubble = await start_bubble()
-            if args.hands_free:
+            bubble = BubbleSupervisor(bus)
+            await bubble.start()
+
+            runtime.begin_model_load(cfg.model)
+            t_load = time.monotonic()
+            await preload(client, model=cfg.model, base_url=cfg.ollama_url)
+            runtime.finish_model_load(cfg.model, (time.monotonic() - t_load) * 1000.0)
+
+            if use_hands_free:
                 await make_hands_free().start()
                 if aec is None:
                     log("hands-free mode active (use headphones or pass --aec when using speakers).")
@@ -244,9 +364,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
             try:
                 await stop.wait()
             finally:
-                if bubble is not None and bubble.returncode is None:
-                    bubble.terminate()
-                    await bubble.wait()
+                await bubble.stop()
                 await server.close()
                 mute.cancel()
                 if hands_free is not None:

@@ -183,6 +183,8 @@ class VoiceInput:
             self._nothing_heard(turn)
             return
         wav = wav_bytes(highpass_pcm(pcm, MIC_RATE), MIC_RATE)
+        while len(self._awaiting_transcript) >= 8:
+            self._awaiting_transcript.pop(next(iter(self._awaiting_transcript)))
         self._awaiting_transcript[turn] = wav
         self.runtime.submit_speech(turn, wav, ended)
 
@@ -422,18 +424,43 @@ async def read_source_muted() -> bool | None:
 class MuteMonitor:
     """Publishes the OS microphone mute state whenever it changes. Never changes it."""
 
-    def __init__(self, bus: EventBus, read: Callable[[], Awaitable[bool | None]] = read_source_muted, interval_s: float = 0.5) -> None:
+    def __init__(
+        self,
+        bus: EventBus,
+        read: Callable[[], Awaitable[bool | None]] = read_source_muted,
+        interval_s: float = 0.5,
+        error_after: int = 4,
+    ) -> None:
         self.bus = bus
         self.read = read
         self.interval_s = interval_s
+        self.error_after = error_after
         self.muted: bool | None = None
+        self._failures = 0
+        self._errored = False
 
     async def run(self) -> None:
         while True:
-            muted = await self.read()
-            if muted is not None and muted != self.muted:
-                self.muted = muted
-                self.bus.emit("audio.mute_changed", {"muted": muted})
+            try:
+                muted = await self.read()
+            except Exception:
+                muted = None
+            if muted is None:
+                self._failures += 1
+                if self._failures >= self.error_after and not self._errored:
+                    self._errored = True
+                    self.bus.emit(
+                        "runtime.component_error",
+                        {"component": "mute_monitor", "error": "could not read microphone mute state from PipeWire"},
+                    )
+            else:
+                self._failures = 0
+                if self._errored:
+                    self._errored = False
+                    self.bus.emit("runtime.component_recovered", {"component": "mute_monitor"})
+                if muted != self.muted:
+                    self.muted = muted
+                    self.bus.emit("audio.mute_changed", {"muted": muted})
             await asyncio.sleep(self.interval_s)
 
 
@@ -590,6 +617,8 @@ class HandsFreeInput:
                 self._nothing_heard(turn)
                 return
             wav = wav_bytes(highpass_pcm(event.pcm, MIC_RATE), MIC_RATE)
+            while len(self._awaiting_transcript) >= 8:
+                self._awaiting_transcript.pop(next(iter(self._awaiting_transcript)))
             self._awaiting_transcript[turn] = wav
             self.runtime.submit_speech(turn, wav, ended)
 

@@ -112,6 +112,7 @@ class Runtime:
         mode: Mode = Mode.PUSH_TO_TALK,
         system_prompt: str | Callable[[], str] | None = None,
         max_history: int = 20,
+        max_context_chars: int = 10_000,
         cancel_timeout_s: float = 1.0,
     ) -> None:
         self.bus = bus
@@ -120,12 +121,14 @@ class Runtime:
         self.mode = mode
         self.system_prompt = system_prompt
         self.history: deque[dict[str, Any]] = deque(maxlen=max_history)
+        self.max_context_chars = max_context_chars
         self.cancel_timeout_s = cancel_timeout_s
         self.state = State.IDLE
         self.muted = False
         self.capturing = False
         self._op: _Operation | None = None
         self._input_turn: str | None = None
+        self._response_errored = False
         self._tasks: set[asyncio.Task[None]] = set()
         bus.subscribe(
             self._on_event,
@@ -161,6 +164,18 @@ class Runtime:
         self.mode = mode
         if self.state in (State.IDLE, State.LISTENING):
             self._set_state(self.rest_state, "mode_changed")
+
+    def begin_model_load(self, model: str) -> None:
+        """Announce model loading and enter State.LOADING when at rest."""
+        ev = self.bus.emit("runtime.model_loading", {"model": model})
+        if State.LOADING in TRANSITIONS[self.state]:
+            self._set_state(State.LOADING, "model_loading", ev)
+
+    def finish_model_load(self, model: str, load_ms: float) -> None:
+        """Announce model readiness and return to rest state."""
+        ev = self.bus.emit("runtime.model_ready", {"model": model, "load_ms": round(load_ms, 1)})
+        if self.state is State.LOADING:
+            self._set_state(self.rest_state, "model_ready", ev)
 
     def _set_state(self, new: State, reason: str, cause: Event | None = None) -> None:
         old = self.state
@@ -223,9 +238,23 @@ class Runtime:
     def _fill_transcript(self, event: Event) -> None:
         """A transcript for a turn the model already heard as audio."""
         for entry in self.history:
-            if entry.get("turn_id") == event.turn_id and "audio" in entry:
-                entry.pop("audio")
+            if entry.get("turn_id") == event.turn_id and ("audio" in entry or not entry.get("content")):
+                entry.pop("audio", None)
                 entry["content"] = str(event.payload["text"]).strip()
+        self._trim_history()
+
+    def _drop_turn_audio(self, turn_id: str) -> None:
+        """Release raw WAV bytes once a turn has finished or been cancelled (plan §5.3)."""
+        for entry in self.history:
+            if entry.get("turn_id") == turn_id:
+                entry.pop("audio", None)
+
+    def _trim_history(self) -> None:
+        """Keep conversation context within max_context_chars so long sessions stay bounded."""
+        total = sum(len(str(entry.get("content") or "")) for entry in self.history)
+        while len(self.history) > 1 and total > self.max_context_chars:
+            dropped = self.history.popleft()
+            total -= len(str(dropped.get("content") or ""))
 
     def _on_final_transcript(self, event: Event) -> None:
         self._input_turn = None
@@ -289,6 +318,7 @@ class Runtime:
         if audio is not None:
             entry["audio"] = audio
         self.history.append(entry)
+        self._trim_history()
         self._set_state(State.THINKING, "user_message", message)
         task = asyncio.get_running_loop().create_task(self._respond(op_id, turn_id, message))
         self._op = _Operation(op_id, turn_id, task)
@@ -339,10 +369,16 @@ class Runtime:
             self._fail(op_id, exc)
             return
         if self._op is None or self._op.id != op_id:
+            self._drop_turn_audio(turn_id)
             return  # superseded while draining
+        self._drop_turn_audio(turn_id)
         self.history.append({"role": "assistant", "content": text})
+        self._trim_history()
         self._op = None
         self.bus.fence.close(op_id)
+        if self._response_errored:
+            self._response_errored = False
+            self.bus.emit("runtime.component_recovered", {"component": "response"})
         self._set_state(self.rest_state, "response_finished", finished)
 
     def _speak(self, chunks: list[str], op_id: str, turn_id: str) -> None:
@@ -354,7 +390,10 @@ class Runtime:
     def _fail(self, op_id: str, exc: Exception) -> None:
         if self._op is None or self._op.id != op_id:
             return
+        turn_id = self._op.turn_id
         self.speech.stop()
+        self._drop_turn_audio(turn_id)
+        self._response_errored = True
         error = self.bus.emit(
             "runtime.component_error",
             {"component": "response", "error": f"{type(exc).__name__}: {exc}"},
@@ -378,6 +417,7 @@ class Runtime:
             return None
         requested_ns = time.monotonic_ns()
         self._op = None
+        self._drop_turn_audio(op.turn_id)
         spoken = self.speech.stop()
         self.bus.fence.begin_cancel(op.id)
         self.bus.emit(

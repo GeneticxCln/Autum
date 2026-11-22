@@ -45,9 +45,10 @@ def to_openai(message: Message) -> dict:
 class OmniChat:
     """Inference: streams the reply text."""
 
-    def __init__(self, client: httpx.AsyncClient, model: str = MODEL) -> None:
+    def __init__(self, client: httpx.AsyncClient, model: str = MODEL, base_url: str = OLLAMA) -> None:
         self.client = client
         self.model = model
+        self.base_url = base_url.rstrip("/")
 
     async def stream(self, messages: Sequence[Message], *, operation_id: str) -> AsyncIterator[str]:
         body = {
@@ -57,7 +58,7 @@ class OmniChat:
             "temperature": 0,
             "seed": SEED,
         }
-        async with self.client.stream("POST", f"{OLLAMA}/v1/chat/completions", json=body) as r:
+        async with self.client.stream("POST", f"{self.base_url}/v1/chat/completions", json=body) as r:
             if r.status_code != 200:
                 raise RuntimeError(f"Ollama chat failed ({r.status_code}): {(await r.aread())[:200]!r}")
             async for line in r.aiter_lines():
@@ -71,14 +72,17 @@ class OmniChat:
 class OmniSpeech:
     """Streams 24 kHz 16-bit mono PCM for one piece of text."""
 
-    def __init__(self, client: httpx.AsyncClient, model: str = MODEL, voice: str = VOICE) -> None:
+    def __init__(
+        self, client: httpx.AsyncClient, model: str = MODEL, voice: str = VOICE, base_url: str = OLLAMA
+    ) -> None:
         self.client = client
         self.model = model
         self.voice = voice
+        self.base_url = base_url.rstrip("/")
 
     async def stream(self, text: str) -> AsyncIterator[bytes]:
         body = {"model": self.model, "input": text, "voice": self.voice, "response_format": "pcm"}
-        async with self.client.stream("POST", f"{OLLAMA}/v1/audio/speech", json=body) as r:
+        async with self.client.stream("POST", f"{self.base_url}/v1/audio/speech", json=body) as r:
             if r.status_code != 200:
                 raise RuntimeError(f"Ollama speech failed ({r.status_code}): {(await r.aread())[:200]!r}")
             async for chunk in r.aiter_bytes():
@@ -87,13 +91,14 @@ class OmniSpeech:
 
 
 class OmniTranscriber:
-    def __init__(self, client: httpx.AsyncClient, model: str = MODEL) -> None:
+    def __init__(self, client: httpx.AsyncClient, model: str = MODEL, base_url: str = OLLAMA) -> None:
         self.client = client
         self.model = model
+        self.base_url = base_url.rstrip("/")
 
     async def transcribe(self, wav: bytes) -> str:
         r = await self.client.post(
-            f"{OLLAMA}/v1/audio/transcriptions",
+            f"{self.base_url}/v1/audio/transcriptions",
             data={"model": self.model, "language": "en"},
             files={"file": ("speech.wav", wav, "audio/wav")},
         )
@@ -102,15 +107,15 @@ class OmniTranscriber:
         return r.json()["text"].strip()
 
 
-async def preload(client: httpx.AsyncClient, model: str = MODEL) -> None:
+async def preload(client: httpx.AsyncClient, model: str = MODEL, base_url: str = OLLAMA) -> None:
     """Load the model now (default context, like the endpoints above) so the first turn is fast."""
-    await client.post(f"{OLLAMA}/api/generate", json={"model": model, "keep_alive": "30m"}, timeout=60)
+    await client.post(f"{base_url.rstrip('/')}/api/generate", json={"model": model, "keep_alive": "30m"}, timeout=60)
 
 
-async def check_ready(client: httpx.AsyncClient, model: str = MODEL) -> str | None:
+async def check_ready(client: httpx.AsyncClient, model: str = MODEL, base_url: str = OLLAMA) -> str | None:
     """None if Ollama runs and has the model; otherwise what to do about it."""
     try:
-        r = await client.get(f"{OLLAMA}/api/tags", timeout=3)
+        r = await client.get(f"{base_url.rstrip('/')}/api/tags", timeout=3)
     except httpx.HTTPError:
         return "Ollama is not running. Start it (systemctl start ollama, or `ollama serve`) and try again."
     names = {m["name"] for m in r.json().get("models", [])}

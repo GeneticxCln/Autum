@@ -857,6 +857,18 @@ while muted. Measured on native Wayland `wlr-layer-shell` (300 px cloud):
 steady CPU about 14% of one core, ~302 MiB RSS, and state change to screen
 in 6.0 ms median / 71.2 ms max (`n=20`, objective: 100 ms or less).
 
+**M5 status (2026-11-22):** implemented WP3 session stability and recovery:
+character-bounded conversation context (`max_context_chars`) with immediate
+release of raw WAV audio bytes once each turn finishes/cancels (§5.3),
+local TOML configuration (`src/autum/config.py`, localhost-enforced §5.5),
+sensitive-data-filtered logging (`src/autum/logging.py`, §5.3),
+`runtime.model_loading`/`runtime.model_ready` (`State.LOADING`) lifecycle,
+automatic `runtime.component_recovered` reporting across response, mic,
+mute-monitor, and visual presence crashes (`BubbleSupervisor`), and
+unit/soak acceptance tests (`tests/test_config_and_logging.py`,
+`tests/test_stability.py`). Multi-hour live soak on the reference machine
+remains to be measured for R1.
+
 M0 and M1 run in parallel. M0's skeleton is the codebase M2 builds on;
 M1's benchmark harness is the first running voice pipeline. Visual work
 (M4) runs in parallel with hands-free work (M3), and agent work (M6)

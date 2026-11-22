@@ -44,7 +44,16 @@ from autum.integrations import IntegrationContext, IntegrationManager
 from autum.integrations.linux_desktop import LinuxDesktopIntegration
 from autum.logging import configure_logging
 from autum.memory import MemoryStore, register_memory_capabilities
-from autum.ollama import ModelSwapper, OmniChat, OmniSpeech, OmniTranscriber, check_ready, preload
+from autum.ollama import (
+    ModelSwapper,
+    OmniChat,
+    OmniSpeech,
+    OmniTranscriber,
+    check_ready,
+    preload,
+    resolve_speech_model,
+    tune_large_model_vram,
+)
 from autum.perception import OllamaVision, register_perception_capabilities
 from autum.runtime import Mode, Runtime, State
 from autum.tools import ApprovalGate
@@ -320,7 +329,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
             aec = None
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=3.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=3.0)) as client:
             chat_model = cfg.resolved_chat_model()
             vision_model = cfg.resolved_vision_model()
             for req_model in dict.fromkeys((cfg.model, chat_model, vision_model)):
@@ -332,18 +341,24 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 log(MIC_HELP)
                 return 1
 
-            chat_effort = None if cfg.chat_think else ("none" if any(k in chat_model.lower() for k in ("gemma4", "qwen3")) else None)
-            vision_effort = None if cfg.chat_think else ("none" if any(k in vision_model.lower() for k in ("gemma4", "qwen3")) else None)
+            voice_model = await resolve_speech_model(client, cfg.model, base_url=cfg.ollama_url)
+            if voice_model != cfg.model:
+                log(f"{cfg.model} has no TTS speech weights in Ollama; using {voice_model} for voice audio I/O.")
+            await tune_large_model_vram(client, chat_model, base_url=cfg.ollama_url)
+
+            _FAST_TAGS = ("gemma4", "gemma-4", "qwen3", "qwen-3")
+            chat_effort = None if cfg.chat_think else ("none" if any(k in chat_model.lower() for k in _FAST_TAGS) else None)
+            vision_effort = None if cfg.chat_think else ("none" if any(k in vision_model.lower() for k in _FAST_TAGS) else None)
             # Only send raw WAV directly into chat when the omni voice model itself is the chat model;
-            # otherwise let lfm3-omni:2b transcribe speech cleanly into text for gemma4:12b.
-            direct_audio = chat_model == cfg.model and "omni" in chat_model.lower()
+            # otherwise let lfm3-omni:2b transcribe speech cleanly into text for the chat model.
+            direct_audio = chat_model == voice_model and "omni" in chat_model.lower()
 
             swapper: ModelSwapper | None = None
-            if cfg.dynamic_swap and len({m for m in (chat_model, vision_model) if m != cfg.model}) > 1:
+            if cfg.dynamic_swap and len({m for m in (chat_model, vision_model) if m != voice_model}) > 1:
                 swapper = ModelSwapper(
                     client,
                     base_url=cfg.ollama_url,
-                    pinned=(cfg.model,),
+                    pinned=(voice_model,),
                     on_swap=lambda new, old: log(f"swapped GPU model {old} -> {new}"),
                 )
 
@@ -357,9 +372,9 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 {"runtime.component_recovered"},
             )
             mode = Mode.HANDS_FREE if use_hands_free else Mode.PUSH_TO_TALK
-            speech_synth = OmniSpeech(client, model=cfg.model, voice=cfg.voice, base_url=cfg.ollama_url)
+            speech_synth = OmniSpeech(client, model=voice_model, voice=cfg.voice, base_url=cfg.ollama_url)
             speech = SpeechPlayer(bus, speech_synth, target=out_target)
-            transcriber = OmniTranscriber(client, model=cfg.model, base_url=cfg.ollama_url)
+            transcriber = OmniTranscriber(client, model=voice_model, base_url=cfg.ollama_url)
             runtime_ref: list[Runtime] = []
             data_dir = cfg.resolved_data_dir() or default_data_dir()
             registry, timers, _notes = build_default_registry(
@@ -497,8 +512,14 @@ async def main(argv: Sequence[str] | None = None) -> int:
                         return
 
                 base = new_cfg.ollama_url.rstrip("/")
-                c_eff = None if new_cfg.chat_think else ("none" if any(k in new_chat.lower() for k in ("gemma4", "qwen3")) else None)
-                v_eff = None if new_cfg.chat_think else ("none" if any(k in new_vis.lower() for k in ("gemma4", "qwen3")) else None)
+                resolved_voice = await resolve_speech_model(client, new_voice, base_url=base)
+                if resolved_voice != new_voice:
+                    log(f"{new_voice} has no TTS speech weights in Ollama; using {resolved_voice} for voice audio I/O.")
+                new_voice = resolved_voice
+                await tune_large_model_vram(client, new_chat, base_url=base)
+
+                c_eff = None if new_cfg.chat_think else ("none" if any(k in new_chat.lower() for k in _FAST_TAGS) else None)
+                v_eff = None if new_cfg.chat_think else ("none" if any(k in new_vis.lower() for k in _FAST_TAGS) else None)
 
                 need_swap = new_cfg.dynamic_swap and len({m for m in (new_chat, new_vis) if m != new_voice}) > 1
                 if need_swap:
@@ -548,8 +569,14 @@ async def main(argv: Sequence[str] | None = None) -> int:
                     await handle_command({"command": "set_mode", "mode": new_cfg.mode.value})
 
                 active_cfg[0] = new_cfg
+                runtime.begin_model_load(new_chat)
+                t_rel = time.monotonic()
+                await preload(client, model=new_voice, base_url=base)
                 if swapper is not None:
                     await swapper.ensure_active(new_chat)
+                if new_chat != new_voice:
+                    await preload(client, model=new_chat, base_url=base)
+                runtime.finish_model_load(new_chat, (time.monotonic() - t_rel) * 1000.0)
                 log(
                     f"reloaded settings (mode={new_cfg.mode.value}, chat={new_chat}, "
                     f"vision={new_vis}, voice={new_voice}, swap={bool(swapper)})."
@@ -569,8 +596,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
             runtime.begin_model_load(chat_model)
             t_load = time.monotonic()
             # Preload pinned voice engine + primary chat brain; vision_model swaps in dynamically on demand
-            await preload(client, model=cfg.model, base_url=cfg.ollama_url)
-            if chat_model != cfg.model:
+            await preload(client, model=voice_model, base_url=cfg.ollama_url)
+            if chat_model != voice_model:
                 if swapper is not None:
                     await swapper.ensure_active(chat_model)
                 await preload(client, model=chat_model, base_url=cfg.ollama_url)
@@ -598,7 +625,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
             )
             hotkey.start()
             swap_note = ", dynamic VRAM swap" if swapper is not None else ""
-            log(f"running ({mode.value}, chat={chat_model}, vision={vision_model}, voice={cfg.model}{swap_note}). Stop with Ctrl+C.")
+            log(f"running ({mode.value}, chat={chat_model}, vision={vision_model}, voice={voice_model}{swap_note}). Stop with Ctrl+C.")
             try:
                 await stop.wait()
             finally:

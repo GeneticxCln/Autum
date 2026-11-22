@@ -209,8 +209,22 @@ class OmniSpeech:
         body = {"model": self.model, "input": text, "voice": self.voice, "response_format": "pcm"}
         async with self.client.stream("POST", f"{self.base_url}/v1/audio/speech", json=body) as r:
             if r.status_code != 200:
-                raise RuntimeError(f"Ollama speech failed ({r.status_code}): {(await r.aread())[:200]!r}")
-            async for chunk in r.aiter_bytes():
+                err_bytes = await r.aread()
+                if r.status_code == 400 and b"does not support speech" in err_bytes and self.model != MODEL:
+                    self.model = MODEL
+                else:
+                    raise RuntimeError(f"Ollama speech failed ({r.status_code}): {err_bytes[:200]!r}")
+            else:
+                async for chunk in r.aiter_bytes():
+                    if chunk:
+                        yield chunk
+                return
+        # Automatic fallback to speech-capable voice engine (lfm3-omni:2b)
+        fallback_body = {"model": self.model, "input": text, "voice": self.voice, "response_format": "pcm"}
+        async with self.client.stream("POST", f"{self.base_url}/v1/audio/speech", json=fallback_body) as r2:
+            if r2.status_code != 200:
+                raise RuntimeError(f"Ollama speech failed ({r2.status_code}): {(await r2.aread())[:200]!r}")
+            async for chunk in r2.aiter_bytes():
                 if chunk:
                     yield chunk
 
@@ -234,7 +248,7 @@ class OmniTranscriber:
 
 async def preload(client: httpx.AsyncClient, model: str = MODEL, base_url: str = OLLAMA) -> None:
     """Load the model now (default context, like the endpoints above) so the first turn is fast."""
-    await client.post(f"{base_url.rstrip('/')}/api/generate", json={"model": model, "keep_alive": "30m"}, timeout=60)
+    await client.post(f"{base_url.rstrip('/')}/api/generate", json={"model": model, "keep_alive": "30m"}, timeout=90)
 
 
 async def unload(client: httpx.AsyncClient, model: str, base_url: str = OLLAMA) -> None:
@@ -242,6 +256,47 @@ async def unload(client: httpx.AsyncClient, model: str, base_url: str = OLLAMA) 
     try:
         await client.post(f"{base_url.rstrip('/')}/api/generate", json={"model": model, "keep_alive": 0}, timeout=10)
     except httpx.HTTPError:
+        pass
+
+
+async def resolve_speech_model(client: httpx.AsyncClient, model: str, base_url: str = OLLAMA) -> str:
+    """Return `model` if it supports Ollama TTS (`/v1/audio/speech`), else fall back to `lfm3-omni:2b`."""
+    base = base_url.rstrip("/")
+    try:
+        r = await client.post(f"{base}/api/show", json={"name": model}, timeout=3)
+        if r.status_code == 200:
+            caps = r.json().get("capabilities")
+            if isinstance(caps, list) and caps and "speech" not in caps:
+                await unload(client, model=model, base_url=base)
+                return MODEL
+    except (httpx.HTTPError, ValueError):
+        pass
+    return model
+
+
+async def tune_large_model_vram(client: httpx.AsyncClient, model: str, base_url: str = OLLAMA) -> None:
+    """Ensure >=10.5 GB GGUF models (e.g. 12B Q8_0) leave enough VRAM on 16 GB GPUs for the pinned voice model."""
+    base = base_url.rstrip("/")
+    try:
+        tags = await client.get(f"{base}/api/tags", timeout=3)
+        if tags.status_code != 200:
+            return
+        size_bytes = 0
+        for m in tags.json().get("models", []):
+            if m.get("name") == model:
+                size_bytes = int(m.get("size") or 0)
+                break
+        if size_bytes < int(10.5 * (1024**3)):
+            return
+        show = await client.post(f"{base}/api/show", json={"name": model}, timeout=3)
+        if show.status_code == 200 and "num_gpu" in (show.json().get("parameters") or ""):
+            return
+        await client.post(
+            f"{base}/api/create",
+            json={"model": model, "from": model, "parameters": {"num_ctx": 2048, "num_gpu": 35}, "stream": False},
+            timeout=15,
+        )
+    except (httpx.HTTPError, ValueError):
         pass
 
 

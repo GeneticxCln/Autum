@@ -33,6 +33,9 @@ Window {
 
     property var installedModels: []
     property var allowedDirsList: []
+    property var diagnosticChecks: []
+    property var diagnosticProblems: []
+    property string diagnosticOverall: ""
     property string selectedMode: "push_to_talk"
     property string statusText: ""
     property bool statusError: false
@@ -43,6 +46,37 @@ Window {
         visible = true
         raise()
         requestActivate()
+    }
+
+    function openDiagnostics() {
+        loadFromDisk()
+        runSelfDiagnosis()
+        visible = true
+        raise()
+        requestActivate()
+        Qt.callLater(() => {
+            flick.contentY = Math.max(0, flick.contentHeight - flick.height)
+        })
+    }
+
+    function runSelfDiagnosis() {
+        if (typeof settingsBridge === "undefined" || !settingsBridge)
+            return
+        const rep = settingsBridge.runDiagnostics()
+        if (rep) {
+            diagnosticOverall = rep.overall_status || "ok"
+            diagnosticChecks = rep.checks || []
+            diagnosticProblems = rep.recent_problems || []
+        }
+    }
+
+    function clearProblemLog() {
+        if (typeof settingsBridge === "undefined" || !settingsBridge)
+            return
+        settingsBridge.clearProblems()
+        runSelfDiagnosis()
+        statusError = false
+        statusText = "Cleared diagnostics problem log"
     }
 
     function applyDict(cfg) {
@@ -82,6 +116,7 @@ Window {
         const cfg = settingsBridge.loadSettings()
         applyDict(cfg)
         refreshModels()
+        runSelfDiagnosis()
     }
 
     function refreshModels() {
@@ -150,6 +185,7 @@ Window {
             statusError = false
             statusText = "Saved & applied live"
             refreshModels()
+            runSelfDiagnosis()
         } else {
             statusError = true
             statusText = (res && res.error) ? res.error : "Failed to save settings"
@@ -927,6 +963,231 @@ Window {
                                         implicitHeight: contentHeight
                                         model: logLevelBox.delegateModel
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 5. Self-Diagnosis & Problem Log
+                SectionCard {
+                    id: diagCard
+                    heading: "Self-Diagnosis & Problem Log"
+                    subtitle: "Live health checks across Ollama/VRAM, PipeWire microphone, desktop Eyes & Hands, permissions, and problems logged by Autum (~/.local/share/autum/diagnostics.jsonl)."
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
+
+                        Text {
+                            Layout.fillWidth: true
+                            font.pixelSize: 12
+                            font.weight: Font.Medium
+                            color: root.diagnosticOverall === "error"
+                                   ? root.dangerSoft
+                                   : (root.diagnosticOverall === "warning" ? "#ebd39b" : root.accentGlow)
+                            text: {
+                                if (root.diagnosticChecks.length === 0)
+                                    return "Click Run Self-Diagnosis to inspect all systems."
+                                const label = root.diagnosticOverall === "error"
+                                    ? "Action Required"
+                                    : (root.diagnosticOverall === "warning" ? "Healthy with Warnings" : "All Systems Healthy")
+                                return "Status: " + label + "  •  Logged problems: " + root.diagnosticProblems.length
+                            }
+                        }
+
+                        Button {
+                            text: "Run Self-Diagnosis"
+                            onClicked: root.runSelfDiagnosis()
+                            contentItem: Text {
+                                text: parent.text
+                                color: root.accentIce
+                                font.pixelSize: 12
+                                font.weight: Font.Medium
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                implicitHeight: 30
+                                implicitWidth: 138
+                                radius: 8
+                                color: parent.hovered ? root.bgHover : root.bgInput
+                                border.width: 1
+                                border.color: root.borderSubtle
+                            }
+                        }
+
+                        Button {
+                            visible: root.diagnosticProblems.length > 0
+                            text: "Clear Log"
+                            onClicked: root.clearProblemLog()
+                            contentItem: Text {
+                                text: parent.text
+                                color: root.dangerSoft
+                                font.pixelSize: 12
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                implicitHeight: 30
+                                implicitWidth: 84
+                                radius: 8
+                                color: parent.hovered ? "#2a1b24" : root.bgInput
+                                border.width: 1
+                                border.color: root.borderSubtle
+                            }
+                        }
+                    }
+
+                    // Subsystem health check cards
+                    Repeater {
+                        model: root.diagnosticChecks
+                        delegate: Rectangle {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            implicitHeight: checkCol.implicitHeight + 18
+                            radius: 8
+                            color: root.bgInput
+                            border.width: 1
+                            border.color: modelData.status === "error"
+                                          ? "#6b2d39"
+                                          : (modelData.status === "warning" ? "#5c4d26" : root.borderSubtle)
+
+                            ColumnLayout {
+                                id: checkCol
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.top
+                                anchors.margins: 9
+                                spacing: 3
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 8
+                                    Rectangle {
+                                        radius: 6
+                                        implicitWidth: 46
+                                        implicitHeight: 18
+                                        color: modelData.status === "error"
+                                               ? "#3d1a22"
+                                               : (modelData.status === "warning" ? "#382f16" : "#13332b")
+                                        Text {
+                                            anchors.centerIn: parent
+                                            text: (modelData.status || "ok").toUpperCase()
+                                            font.pixelSize: 10
+                                            font.weight: Font.DemiBold
+                                            color: modelData.status === "error"
+                                                   ? root.dangerSoft
+                                                   : (modelData.status === "warning" ? "#ebd39b" : root.accentGlow)
+                                        }
+                                    }
+                                    Text {
+                                        text: modelData.title || ""
+                                        color: root.textPrimary
+                                        font.pixelSize: 12
+                                        font.weight: Font.DemiBold
+                                    }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: modelData.summary || ""
+                                        color: root.textSecondary
+                                        font.pixelSize: 12
+                                        elide: Text.ElideRight
+                                    }
+                                }
+
+                                Text {
+                                    visible: Boolean(modelData.details)
+                                    text: modelData.details || ""
+                                    color: root.textSecondary
+                                    font.pixelSize: 11
+                                    wrapMode: Text.WordWrap
+                                    Layout.fillWidth: true
+                                }
+
+                                Text {
+                                    visible: Boolean(modelData.suggestion)
+                                    text: "Fix: " + (modelData.suggestion || "")
+                                    color: root.accentIce
+                                    font.pixelSize: 11
+                                    wrapMode: Text.WordWrap
+                                    Layout.fillWidth: true
+                                }
+                            }
+                        }
+                    }
+
+                    // Logged problems list
+                    Text {
+                        text: root.diagnosticProblems.length > 0
+                              ? "Recent Logged Problems (from runtime & Autum agent):"
+                              : "No runtime or agent problems logged in diagnostics.jsonl."
+                        color: root.textPrimary
+                        font.pixelSize: 12
+                        font.weight: Font.Medium
+                    }
+
+                    Repeater {
+                        model: root.diagnosticProblems
+                        delegate: Rectangle {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            implicitHeight: probCol.implicitHeight + 16
+                            radius: 8
+                            color: "#0e1522"
+                            border.width: 1
+                            border.color: modelData.severity === "error" ? "#6b2d39" : "#2b3b54"
+
+                            ColumnLayout {
+                                id: probCol
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.top
+                                anchors.margins: 8
+                                spacing: 2
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 6
+                                    Text {
+                                        text: "[" + (modelData.severity || "warning").toUpperCase() + "] " + (modelData.component || "general")
+                                        color: modelData.severity === "error" ? root.dangerSoft : "#ebd39b"
+                                        font.pixelSize: 11
+                                        font.weight: Font.DemiBold
+                                    }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        horizontalAlignment: Text.AlignRight
+                                        text: (modelData.timestamp || "") + (modelData.source ? (" • " + modelData.source) : "")
+                                        color: root.textSecondary
+                                        font.pixelSize: 10
+                                    }
+                                }
+
+                                Text {
+                                    text: modelData.summary || ""
+                                    color: root.textPrimary
+                                    font.pixelSize: 12
+                                    wrapMode: Text.WordWrap
+                                    Layout.fillWidth: true
+                                }
+
+                                Text {
+                                    visible: Boolean(modelData.details)
+                                    text: modelData.details || ""
+                                    color: root.textSecondary
+                                    font.pixelSize: 11
+                                    wrapMode: Text.WordWrap
+                                    Layout.fillWidth: true
+                                }
+
+                                Text {
+                                    visible: Boolean(modelData.suggestion)
+                                    text: "Suggested fix: " + (modelData.suggestion || "")
+                                    color: root.accentIce
+                                    font.pixelSize: 11
+                                    wrapMode: Text.WordWrap
+                                    Layout.fillWidth: true
                                 }
                             }
                         }

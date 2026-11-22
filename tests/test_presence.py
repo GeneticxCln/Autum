@@ -292,3 +292,113 @@ def test_face_cloud_renders_valid_premultiplied_frames_and_reacts_to_states():
     item.observeGlow = 0.8
     obs = item.render_rgba(180, 180, 60.0)
     assert obs[25, 90, 2] > idle[25, 90, 2] + 20
+
+
+def test_self_awareness_self_diagnose_and_problem_logging(tmp_path):
+    import asyncio
+    from autum.config import Config
+    from autum.diagnostics import DiagnosticsLog, SelfDiagnostics, register_diagnostic_capabilities
+    from autum.tools import AuditLog, ToolCall, ToolRegistry
+
+    data_dir = tmp_path / "data"
+    cfg_path = tmp_path / "config.toml"
+    cfg = Config(
+        mode="hands_free",
+        model="lfm3-omni:2b",
+        chat_model="gemma4:12b",
+        vision_model="qwen3-vl:8b",
+        data_dir=str(data_dir),
+    )
+    cfg.save(cfg_path)
+
+    live_state = {
+        "chat_model": "gemma4:12b",
+        "vision_model": "qwen3-vl:8b",
+        "voice_model": "lfm3-omni:2b",
+        "dynamic_swap": True,
+        "mode": "hands_free",
+        "state": "listening",
+        "microphone": "open",
+        "allowed_read_dirs": [],
+    }
+    log_store = DiagnosticsLog(data_dir / "diagnostics.jsonl", state_snapshot=lambda: live_state)
+    bus = EventBus("diag-test")
+    bus.fence.open("op1")
+    log_store.attach_bus(bus)
+
+    # 1. EventBus component errors and tool failures are automatically logged & secret-redacted
+    bus.emit(
+        "runtime.component_error",
+        {"component": "microphone", "error": "USB drop api_key=sk-1234567890abcdef123456"},
+    )
+    bus.emit(
+        "agent.tool_failed",
+        {"tool": "read_document", "error": "allowed_read_dirs is empty"},
+        operation_id="op1",
+    )
+
+    problems = log_store.recent_problems(limit=10)
+    assert len(problems) == 2
+    assert (log_store.path.stat().st_mode & 0o777) == 0o600
+    assert "[REDACTED" in problems[1]["summary"] and "sk-123456" not in problems[1]["summary"]
+    assert "Settings" in problems[0].get("suggestion", "")
+
+    # 2. Self-awareness prompt reflects active models, mode, mic, and last problem
+    self_diag = SelfDiagnostics(log_store, get_config=lambda: cfg, get_live_state=lambda: live_state)
+    awareness = self_diag.awareness_prompt()
+    assert "Brain/Chat=gemma4:12b" in awareness
+    assert "Vision=qwen3-vl:8b" in awareness
+    assert "Voice=lfm3-omni:2b" in awareness
+    assert "mode=hands_free" in awareness
+    assert "self_diagnose" in awareness and "log_problem" in awareness
+
+    # 3. Agent tools: log_problem, list_problems, self_diagnose
+    reg = ToolRegistry(AuditLog(data_dir / "audit.jsonl"))
+    register_diagnostic_capabilities(reg, self_diag)
+
+    async def _run_tools():
+        out_log = await reg.execute(
+            ToolCall(
+                "tc1",
+                "log_problem",
+                {
+                    "component": "desktop_windows",
+                    "summary": "Chrome window did not move to desktop 2",
+                    "details": "User asked to move Chrome; KWin reported 1 desktop configured",
+                    "suggestion": "Add virtual desktops in KDE System Settings",
+                    "severity": "warning",
+                },
+            ),
+            bus=bus,
+            operation_id="op1",
+            turn_id="t1",
+        )
+        assert out_log.succeeded and out_log.verified
+        assert out_log.result["problem"]["snapshot"]["chat_model"] == "gemma4:12b"
+
+        out_list = await reg.execute(
+            ToolCall("tc2", "list_problems", {"limit": 5}),
+            bus=bus,
+            operation_id="op1",
+            turn_id="t1",
+        )
+        assert out_list.succeeded and out_list.result["count"] == 3
+
+        out_diag = await reg.execute(
+            ToolCall("tc3", "self_diagnose", {"focus": "permissions"}),
+            bus=bus,
+            operation_id="op1",
+            turn_id="t1",
+        )
+        assert out_diag.succeeded and out_diag.verified
+        assert out_diag.result["checks"][0]["section"] == "permissions"
+
+    asyncio.run(_run_tools())
+
+    # 4. SettingsBridge runDiagnostics and clearProblems work end-to-end
+    bridge = SettingsBridge(None, config_path=cfg_path)
+    rep = bridge.runDiagnostics()
+    assert "checks" in rep and len(rep["recent_problems"]) == 3
+    cleared = bridge.clearProblems()
+    assert cleared["ok"] is True and cleared["cleared"] == 3
+    assert len(bridge.runDiagnostics()["recent_problems"]) == 0

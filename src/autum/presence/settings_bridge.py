@@ -217,3 +217,32 @@ class SettingsBridge(QObject):
             path.unlink(missing_ok=True)
         except OSError:
             pass
+
+    def _diagnostics_path(self) -> Path:
+        from autum.capabilities import default_data_dir
+
+        try:
+            cfg = Config.load(self._config_path)
+            base = cfg.resolved_data_dir() or default_data_dir()
+        except Exception:
+            base = default_data_dir()
+        return base / "diagnostics.jsonl"
+
+    @Slot(result="QVariantMap")
+    def runDiagnostics(self) -> dict[str, Any]:
+        from autum.diagnostics import DiagnosticsLog, run_system_health_checks
+
+        try:
+            cfg = Config.load(self._config_path)
+        except Exception:
+            cfg = Config()
+        store = DiagnosticsLog(self._diagnostics_path())
+        return run_system_health_checks(cfg, problems_log=store)
+
+    @Slot(result="QVariantMap")
+    def clearProblems(self) -> dict[str, Any]:
+        from autum.diagnostics import DiagnosticsLog
+
+        store = DiagnosticsLog(self._diagnostics_path())
+        cleared = store.clear()
+        return {"ok": True, "cleared": cleared}

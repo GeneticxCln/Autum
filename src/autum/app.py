@@ -37,6 +37,7 @@ from autum.audio import (
 from autum.bus import EventBus
 from autum.capabilities import build_default_registry, default_data_dir
 from autum.config import Config
+from autum.diagnostics import DiagnosticsLog, SelfDiagnostics, register_diagnostic_capabilities
 from autum.events import Provenance, new_id
 from autum.hotkey import PushToTalkKey
 from autum.integrations import IntegrationContext, IntegrationManager
@@ -412,12 +413,37 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 reasoning_effort=chat_effort,
                 swapper=swapper,
             )
+            active_cfg: list[Config] = [cfg]
+
+            def live_state_snapshot() -> dict:
+                rt = runtime_ref[0] if runtime_ref else None
+                return {
+                    "chat_model": chat.model,
+                    "vision_model": vision.model,
+                    "voice_model": speech_synth.model,
+                    "dynamic_swap": swapper is not None,
+                    "mode": rt.mode.value if rt is not None else mode.value,
+                    "state": rt.state.value if rt is not None else "idle",
+                    "microphone": rt.microphone if rt is not None else "off",
+                    "observation": rt.observation if rt is not None else "none",
+                    "allowed_read_dirs": [str(p) for p in live_allowed_dirs],
+                }
+
+            diag_log = DiagnosticsLog(data_dir / "diagnostics.jsonl", state_snapshot=live_state_snapshot)
+            diag_log.attach_bus(bus)
+            self_diag = SelfDiagnostics(
+                diag_log,
+                get_config=lambda: active_cfg[0],
+                get_live_state=live_state_snapshot,
+            )
+            register_diagnostic_capabilities(registry, self_diag)
+
             runtime = Runtime(
                 bus,
                 chat,
                 speech,
                 mode=mode,
-                system_prompt=system_prompt,
+                system_prompt=lambda: f"{system_prompt()} {self_diag.awareness_prompt()}",
                 max_history=cfg.max_history,
                 max_context_chars=cfg.max_context_chars,
                 tools=registry,
@@ -509,6 +535,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 if new_cfg.mode is not runtime.mode:
                     await handle_command({"command": "set_mode", "mode": new_cfg.mode.value})
 
+                active_cfg[0] = new_cfg
                 if swapper is not None:
                     await swapper.ensure_active(new_chat)
                 log(
@@ -541,11 +568,21 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 await make_hands_free().start()
                 if aec is None:
                     log("hands-free mode active (use headphones or pass --aec when using speakers).")
+            def on_hotkey_status(msg: str) -> None:
+                log(msg)
+                if "unavailable" in msg.lower():
+                    diag_log.record_problem(
+                        component="hotkey",
+                        summary=msg,
+                        severity="warning",
+                        source="startup",
+                    )
+
             hotkey = PushToTalkKey(
                 loop,
                 on_press=lambda: loop.create_task(handle_command({"command": "talk_start"})),
                 on_release=lambda: loop.create_task(handle_command({"command": "talk_finish"})),
-                on_status=log,
+                on_status=on_hotkey_status,
             )
             hotkey.start()
             swap_note = ", dynamic VRAM swap" if swapper is not None else ""

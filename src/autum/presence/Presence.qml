@@ -352,6 +352,11 @@ Window {
         }
 
         StyledMenuItem {
+            text: "Self-Diagnose..."
+            onTriggered: settingsWindow.openDiagnostics()
+        }
+
+        StyledMenuItem {
             text: "Settings..."
             onTriggered: settingsWindow.openSettings()
         }

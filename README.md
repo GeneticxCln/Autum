@@ -37,7 +37,7 @@ suspended inside a frosted stardust orb that follows you across windows and
 virtual desktops via Wayland `wlr-layer-shell`:
 
 - **Move anywhere:** click and drag the orb anywhere on screen (position is remembered across restarts)
-- **Right-click menu:** toggle **Hands-Free Mode**, **Stop Speaking**, open **Settings...**, or **Reset Position**
+- **Right-click menu:** toggle **Hands-Free Mode**, **Stop Speaking**, run **Self-Diagnose...**, open **Settings...**, or **Reset Position**
 - **Hold to talk:** press and hold the orb briefly (or hold the global shortcut, suggested `Meta+Z`), speak, and release; holding while Autum speaks interrupts her immediately
 - **Idle:** frosted silver-ice, slow stardust orbit and gentle 3D breathing sway
 - **Listening / speech detected:** cool ice-cyan, gathered inward, attentive gaze, warm open-mic edge aura
@@ -69,6 +69,13 @@ virtual desktops via Wayland `wlr-layer-shell`:
   `close_window`) always require explicit user approval (single-use, timed,
   anti-spoofed). Actions are recorded in a redacted audit log at
   `~/.local/share/autum/audit.jsonl`.
+- **Self-awareness, self-diagnosis & problem log:** Autum knows her live AI
+  models, GPU VRAM residency, listening mode, microphone state, and folder
+  permissions on every turn. She can run `self_diagnose` on demand, inspect
+  recent errors with `list_problems`, and record bugs or failures with
+  `log_problem` into a redacted, owner-only diagnostics log at
+  `~/.local/share/autum/diagnostics.jsonl` (`0600`) — also viewable under
+  **Right-Click → Self-Diagnose...**.
 
 ## Configuration
 

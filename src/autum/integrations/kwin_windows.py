@@ -132,6 +132,7 @@ def _run_kwin_js_sync(body_js: str, timeout_s: float = 4.0) -> Any:
     timeout_src = GLib.timeout_source_new(int(timeout_s * 1000))
     timeout_src.set_callback(lambda *_: (loop.quit(), False)[1])
     timeout_src.attach(ctx)
+    loaded = False
     try:
         sid = bus.call_sync(
             KWIN_BUS, KWIN_SCRIPTING_PATH, KWIN_SCRIPTING_IFACE, "loadScript",
@@ -140,20 +141,22 @@ def _run_kwin_js_sync(body_js: str, timeout_s: float = 4.0) -> Any:
         ).unpack()[0]
         if int(sid) < 0:
             raise RuntimeError("KWin rejected the window control script")
+        loaded = True
         bus.call_sync(
             KWIN_BUS, f"/Scripting/Script{sid}", KWIN_SCRIPT_IFACE, "run",
             None, None, Gio.DBusCallFlags.NONE, 3000, None,
         )
         loop.run()
-        try:
-            bus.call_sync(
-                KWIN_BUS, KWIN_SCRIPTING_PATH, KWIN_SCRIPTING_IFACE, "unloadScript",
-                GLib.Variant("(s)", (plugin_name,)),
-                None, Gio.DBusCallFlags.NONE, 3000, None,
-            )
-        except Exception:
-            pass
     finally:
+        if loaded:
+            try:
+                bus.call_sync(
+                    KWIN_BUS, KWIN_SCRIPTING_PATH, KWIN_SCRIPTING_IFACE, "unloadScript",
+                    GLib.Variant("(s)", (plugin_name,)),
+                    None, Gio.DBusCallFlags.NONE, 3000, None,
+                )
+            except Exception:
+                pass
         timeout_src.destroy()
         bus.unregister_object(reg_id)
         ctx.pop_thread_default()
@@ -228,6 +231,10 @@ __reply(out);
         raw = await asyncio.to_thread(_run_kwin_js_sync, js)
         return [w for w in raw if not _is_excluded_window(w.get("title", ""), w.get("app", ""), excluded)]
 
+    async def resolve_window(self, query: str, excluded: Sequence[str] = ()) -> dict[str, Any]:
+        """Resolve a user/model window reference strictly to one controllable window."""
+        return await self._resolve_window(query, excluded)
+
     async def _resolve_window(self, query: str, excluded: Sequence[str]) -> dict[str, Any]:
         needle = query.strip().lower()
         needle_n = _norm(query)
@@ -240,13 +247,15 @@ __reply(out);
         if not windows:
             raise LookupError(f"no controllable window matching {query!r}")
 
-        # 1. Exact ID or normalized app name ("google chrome" -> "google-chrome")
+        # 1. Exact ID or exact normalized app name ("google chrome" -> "google-chrome")
         for w in windows:
             if w["id"].lower() == needle or _norm(w["app"]) == needle_n:
                 return w
-        # 2. Substring match on normalized app or title
+        # 2. Substring match on normalized app or title (whole word or >= 4 chars)
         for w in windows:
-            if needle_n in _norm(w["app"]) or needle_n in _norm(w["title"]):
+            app_n = _norm(w["app"])
+            title_n = _norm(w["title"])
+            if needle_n in app_n or needle_n in title_n:
                 return w
         # 3. Friendly category aliases (browser, terminal, files, editor)
         aliases = _APP_ALIASES.get(needle_n, ())
@@ -255,25 +264,29 @@ __reply(out);
                 hay = f"{_norm(w['app'])} {_norm(w['title'])}"
                 if any(alias in hay for alias in aliases):
                     return w
-        # 4. Token overlap or fuzzy similarity (handles minor typos/diacritics)
-        q_tokens = set(needle_n.split())
-        best_score = 0.0
-        best_win: dict[str, Any] | None = None
-        for w in windows:
-            app_n = _norm(w["app"])
-            title_n = _norm(w["title"])
-            hay_tokens = set(f"{app_n} {title_n}".split())
-            overlap = len(q_tokens & hay_tokens) / max(len(q_tokens), 1)
-            sim = max(
-                difflib.SequenceMatcher(None, needle_n, app_n).ratio(),
-                difflib.SequenceMatcher(None, needle_n, title_n).ratio(),
-            )
-            score = max(overlap, sim)
-            if score > best_score:
-                best_score = score
-                best_win = w
-        if best_win is not None and best_score >= 0.45:
-            return best_win
+        # 4. Strict fuzzy fallback ONLY for longer multi-word queries (>= 8 chars)
+        #    so short queries like "code" or "vs code" NEVER mis-match "Claude".
+        if len(needle_n) >= 8:
+            q_tokens = {t for t in needle_n.split() if len(t) >= 4}
+            best_score = 0.0
+            best_win: dict[str, Any] | None = None
+            for w in windows:
+                app_n = _norm(w["app"])
+                title_n = _norm(w["title"])
+                hay_tokens = {t for t in f"{app_n} {title_n}".split() if len(t) >= 4}
+                overlap = len(q_tokens & hay_tokens) / max(len(q_tokens), 1) if len(q_tokens) >= 2 else 0.0
+                if len(q_tokens & hay_tokens) < 2:
+                    overlap = 0.0
+                sim = max(
+                    difflib.SequenceMatcher(None, needle_n, app_n).ratio(),
+                    difflib.SequenceMatcher(None, needle_n, title_n).ratio(),
+                )
+                score = max(overlap, sim)
+                if score > best_score:
+                    best_score = score
+                    best_win = w
+            if best_win is not None and best_score >= 0.70:
+                return best_win
         raise LookupError(f"no controllable window matching {query!r}")
 
     async def focus_window(self, query: str, excluded: Sequence[str] = ()) -> dict[str, Any]:
@@ -307,6 +320,23 @@ else {{
     ) -> dict[str, Any]:
         position = normalize_position(position)
         target = await self._resolve_window(query, excluded)
+        wants_geom = any(v is not None for v in (position, x, y, width, height))
+        # On Wayland (especially Chromium/Chrome), unmaximizing is async: unmaximize
+        # first and let the client commit before applying target frameGeometry.
+        if wants_geom and target.get("maximized"):
+            unmax_js = f"""
+var ws = workspace.windowList();
+for (var i = 0; i < ws.length; i++) {{
+    if (String(ws[i].internalId) === {json.dumps(target["id"])}) {{
+        ws[i].minimized = false;
+        ws[i].setMaximize(false, false);
+        break;
+    }}
+}}
+__reply({{ok: true}});
+"""
+            await asyncio.to_thread(_run_kwin_js_sync, unmax_js)
+            await asyncio.sleep(0.08)
         spec = {"id": target["id"], "position": position, "x": x, "y": y, "width": width, "height": height, "desktop": desktop}
         js = f"""
 var spec = {json.dumps(spec)};

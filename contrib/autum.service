@@ -1,6 +1,6 @@
 [Unit]
 Description=Autum local voice assistant
-After=graphical-session.target pipewire.service ollama.service
+After=graphical-session.target pipewire.service
 PartOf=graphical-session.target
 
 [Service]
@@ -9,7 +9,7 @@ WorkingDirectory=%h/Projects/Autum
 Environment=PYTHONPATH=%h/Projects/Autum/src
 ExecStart=/usr/bin/python3 -m autum
 Restart=on-failure
-RestartSec=3
+RestartSec=5
 
 [Install]
 WantedBy=graphical-session.target

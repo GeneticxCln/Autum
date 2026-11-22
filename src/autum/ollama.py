@@ -86,6 +86,7 @@ class ModelSwapper:
                 return
             prev = self.active
             if prev is not None and prev not in self.pinned:
+                self.active = None
                 await unload(self.client, model=prev, base_url=self.base_url)
             self.active = model
             if self.on_swap is not None and prev is not None:
@@ -223,5 +224,5 @@ async def check_ready(client: httpx.AsyncClient, model: str = MODEL, base_url: s
         return "Ollama is not running. Start it (systemctl start ollama, or `ollama serve`) and try again."
     names = {m["name"] for m in r.json().get("models", [])}
     if model not in names:
-        return f"Ollama does not have {model}. It is in the WP1 candidate list; pulling it needs your approval."
+        return f"Ollama does not have {model}. Pull it with `ollama pull {model}` (with your approval) or update config.toml."
     return None

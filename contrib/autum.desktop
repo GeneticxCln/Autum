@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Autum
+Comment=Local voice-first AI assistant
+Exec=/usr/bin/python3 -m autum
+Terminal=false
+NoDisplay=true
+Categories=Utility;

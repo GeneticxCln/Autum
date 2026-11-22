@@ -140,12 +140,15 @@ class Runtime:
         self.direct_audio = direct_audio
         self.state = State.IDLE
         self.muted = False
-        self.capturing = False
+        self._capture_count = 0
         self.observation = "none"
         self._obs_stack: list[str] = []
         self._op: _Operation | None = None
         self._input_turn: str | None = None
+        self._transcribe_task: asyncio.Task[None] | None = None
         self._approval_turn: tuple[str, str, int] | None = None  # (turn_id, source_mode, started_mono_ns)
+        self._turn_observed = False
+        self._pending_announcements: deque[str] = deque(maxlen=16)
         self._response_errored = False
         self._tasks: set[asyncio.Task[None]] = set()
         bus.subscribe(
@@ -162,6 +165,18 @@ class Runtime:
         )
 
     # ----- state ---------------------------------------------------------
+
+    @property
+    def capturing(self) -> bool:
+        return self._capture_count > 0
+
+    @capturing.setter
+    def capturing(self, value: bool) -> None:
+        self._capture_count = 1 if value else 0
+
+    @property
+    def turn_observed(self) -> bool:
+        return self._turn_observed
 
     @property
     def microphone(self) -> str:
@@ -253,8 +268,11 @@ class Runtime:
             case "audio.mute_changed":
                 self.muted = bool(event.payload["muted"])
                 self._indicator_changed(event)
-            case "audio.capture_started" | "audio.capture_stopped":
-                self.capturing = event.type == "audio.capture_started"
+            case "audio.capture_started":
+                self._capture_count += 1
+                self._indicator_changed(event)
+            case "audio.capture_stopped":
+                self._capture_count = max(0, self._capture_count - 1)
                 self._indicator_changed(event)
             case "audio.speech_started":
                 self._on_speech_started(event)
@@ -289,8 +307,8 @@ class Runtime:
             self._set_state(self.state, "microphone", cause)
 
     def _on_speech_started(self, event: Event) -> None:
-        if self.muted:
-            return  # the voice engine should not report speech while muted
+        if self.muted or self.state is State.LOADING:
+            return  # ignore speech while muted or still loading models at startup
         # While waiting for approval after the prompt finished playing, capture
         # the user's yes/no reply without cancelling the pending approval.
         pending = self.approval_gate.pending
@@ -366,7 +384,10 @@ class Runtime:
         if turn_id != self._input_turn:
             return  # superseded by a newer utterance
         if not self.direct_audio and self.transcriber is not None:
+            if self._transcribe_task is not None and not self._transcribe_task.done():
+                self._transcribe_task.cancel()
             task = asyncio.get_running_loop().create_task(self._transcribe_and_respond(turn_id, audio))
+            self._transcribe_task = task
             self._track(task)
             return
         self._input_turn = None
@@ -375,12 +396,19 @@ class Runtime:
     async def _transcribe_and_respond(self, turn_id: str, wav: bytes) -> None:
         try:
             text = await self.transcriber.transcribe(wav)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             self.bus.emit("runtime.component_error", {"component": "transcription", "error": str(exc)})
             if turn_id == self._input_turn:
                 self._input_turn = None
                 self._set_state(self.rest_state, "transcription_failed")
             return
+        finally:
+            if self._transcribe_task is asyncio.current_task():
+                self._transcribe_task = None
+        if turn_id != self._input_turn:
+            return  # superseded by cancel or a newer turn while transcribing
         self.bus.emit("audio.transcribed", {"text": text, "final": True}, provenance=Provenance.USER, turn_id=turn_id)
 
     async def _resolve_approval_audio(self, wav: bytes, source: str, started_ns: int) -> None:
@@ -399,9 +427,22 @@ class Runtime:
         if self.state is State.WAITING_FOR_APPROVAL and self.approval_gate.pending is not None:
             self.resolve_approval(text, provenance=Provenance.USER, source="text")
             return
+        if self.state is State.LOADING:
+            return
+        self._cancel_pending_transcription()
         if self._op is not None:
             self._begin_cancel("user_command", None)
         self._start_response(text, "text", new_id(), None)
+
+    def _cancel_pending_transcription(self) -> bool:
+        had_pending = self._input_turn is not None or (
+            self._transcribe_task is not None and not self._transcribe_task.done()
+        )
+        self._input_turn = None
+        if self._transcribe_task is not None and not self._transcribe_task.done():
+            self._transcribe_task.cancel()
+        self._transcribe_task = None
+        return had_pending
 
     def resolve_approval(
         self,
@@ -421,16 +462,34 @@ class Runtime:
         )
 
     def announce(self, text: str) -> None:
-        """Speak a short system announcement (such as a finished timer) when idle."""
+        """Speak a short system announcement (such as a finished timer).
+
+        If Autum is currently busy, queues the announcement and speaks it as
+        soon as she returns to rest instead of dropping it.
+        """
         spoken = speakable(text)
-        if not spoken or self._op is not None or self.state not in (State.IDLE, State.LISTENING):
+        if not spoken:
             return
+        if self._op is not None or self.state not in (State.IDLE, State.LISTENING):
+            self._pending_announcements.append(spoken)
+            return
+        self._start_announcement(spoken)
+
+    def _start_announcement(self, spoken: str) -> None:
         op_id = new_id()
         self.bus.fence.open(op_id)
         self._set_state(State.THINKING, "announcement")
         task = asyncio.get_running_loop().create_task(self._speak_announcement(op_id, spoken))
         self._op = _Operation(op_id, new_id(), task)
         self._track(task)
+
+    def _drain_pending_announcements(self) -> None:
+        if (
+            self._pending_announcements
+            and self._op is None
+            and self.state in (State.IDLE, State.LISTENING)
+        ):
+            self._start_announcement(self._pending_announcements.popleft())
 
     async def _speak_announcement(self, op_id: str, text: str) -> None:
         try:
@@ -446,12 +505,17 @@ class Runtime:
         self._op = None
         self.bus.fence.close(op_id)
         self._set_state(self.rest_state, "announcement_finished")
+        self._drain_pending_announcements()
 
     async def cancel(self, source: str = "user_command") -> bool:
-        """Cancel the active response. Returns False if nothing was active."""
+        """Cancel the active response or pending transcription. Returns False if nothing was active."""
+        had_tx = self._cancel_pending_transcription()
         finishing = self._begin_cancel(source, None)
         if finishing is None:
-            return False
+            if had_tx and self.state in (State.SPEECH_DETECTED, State.PROCESSING):
+                self._set_state(self.rest_state, source)
+                return True
+            return had_tx
         await finishing
         return True
 
@@ -493,20 +557,25 @@ class Runtime:
         return self.inference.stream(messages, operation_id=op_id)
 
     async def _request_approval(
-        self, cap: Capability, args: dict[str, Any], op_id: str, tc_id: str
+        self,
+        cap: Capability,
+        args: dict[str, Any],
+        op_id: str,
+        tc_id: str,
+        target: str | None = None,
     ) -> str:
-        target = cap.target_summary(args)
+        resolved_target = target if target is not None else cap.target_summary(args)
         pending = self.approval_gate.open(
             action=cap.name,
-            target=target,
+            target=resolved_target,
             level=cap.permission_level,
             operation_id=op_id,
             tool_call_id=tc_id,
         )
         if cap.permission_level is PermissionLevel.IRREVERSIBLE and self.mode is Mode.HANDS_FREE:
-            prompt = f"Should I {target}? Hold your talk key and say yes to confirm, or no to cancel."
+            prompt = f"Should I {resolved_target}? Hold your talk key and say yes to confirm, or no to cancel."
         else:
-            prompt = f"Should I {target}? Say yes to confirm, or no to cancel."
+            prompt = f"Should I {resolved_target}? Say yes to confirm, or no to cancel."
         self._speak([prompt], op_id, None)
         await self.speech.drain(op_id)
         if not self.bus.fence.is_live(op_id):
@@ -541,6 +610,7 @@ class Runtime:
         max_steps = self.max_agent_steps if tool_schemas else 1
         emitted_parts: list[str] = []
         final_text = ""
+        self._turn_observed = False
         try:
             started = self.bus.emit(
                 "conversation.response_started", turn_id=turn_id, operation_id=op_id, cause=cause
@@ -612,6 +682,8 @@ class Runtime:
                             approval_gate=self.approval_gate,
                             request_approval=self._request_approval,
                         )
+                        if outcome.observed and outcome.succeeded:
+                            self._turn_observed = True
                         messages.append(
                             {
                                 "role": "tool",
@@ -655,7 +727,9 @@ class Runtime:
         if self._response_errored:
             self._response_errored = False
             self.bus.emit("runtime.component_recovered", {"component": "response"})
+        self._turn_observed = False
         self._set_state(self.rest_state, "response_finished", finished)
+        self._drain_pending_announcements()
 
     def _speak(self, chunks: list[str], op_id: str, turn_id: str | None) -> None:
         for chunk in chunks:
@@ -677,9 +751,11 @@ class Runtime:
             operation_id=op_id,
         )
         self._op = None
+        self._turn_observed = False
         self.bus.fence.close(op_id)
         self._set_state(State.ERROR, "response_failed", error)
         self._set_state(self.rest_state, "recovered", error)
+        self._drain_pending_announcements()
 
     # ----- cancellation (plan §4.2) --------------------------------------
 
@@ -695,6 +771,7 @@ class Runtime:
         requested_ns = time.monotonic_ns()
         self._op = None
         self._approval_turn = None
+        self._turn_observed = False
         self.approval_gate.cancel()
         self._drop_turn_audio(op.turn_id)
         spoken = self.speech.stop()
@@ -746,6 +823,7 @@ class Runtime:
         self.bus.fence.close(op.id)
         if self.state is State.INTERRUPTED:
             self._set_state(self.rest_state, "cancelled", cancelled)
+            self._drain_pending_announcements()
 
     def _track(self, task: asyncio.Task[None]) -> None:
         self._tasks.add(task)

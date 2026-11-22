@@ -27,10 +27,31 @@ REQUEST_IFACE = "org.freedesktop.portal.Request"
 SESSION_IFACE = "org.freedesktop.portal.Session"
 
 
-def _portal_call_with_response(bus, method: str, args_variant, token: str, timeout_s: float = 45.0) -> tuple[int, dict]:
+def _close_portal_request(bus, req_path: str) -> None:
+    try:
+        from gi.repository import Gio
+
+        bus.call_sync(
+            PORTAL_BUS, req_path, REQUEST_IFACE, "Close", None,
+            None, Gio.DBusCallFlags.NONE, 2000, None,
+        )
+    except Exception:
+        pass
+
+
+def _portal_call_with_response(
+    bus,
+    method: str,
+    args_variant,
+    token: str,
+    timeout_s: float = 45.0,
+    cancel_event: threading.Event | None = None,
+) -> tuple[int, dict]:
     """Invoke a ScreenCast portal method and wait for its Request::Response signal."""
     from gi.repository import Gio, GLib
 
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("screen sharing was cancelled")
     unique = bus.get_unique_name().lstrip(":").replace(".", "_")
     req_path = f"{PORTAL_PATH}/request/{unique}/{token}"
     ctx = GLib.MainContext.new()
@@ -50,6 +71,20 @@ def _portal_call_with_response(bus, method: str, args_variant, token: str, timeo
     timeout_src = GLib.timeout_source_new(int(timeout_s * 1000))
     timeout_src.set_callback(lambda *_: (outcome.__setitem__("timeout", True), loop.quit(), False)[2])
     timeout_src.attach(ctx)
+
+    poll_src = None
+    if cancel_event is not None:
+        def _check_cancel(*_):
+            if cancel_event.is_set():
+                outcome["cancelled"] = True
+                _close_portal_request(bus, req_path)
+                loop.quit()
+                return False
+            return True
+
+        poll_src = GLib.timeout_source_new(100)
+        poll_src.set_callback(_check_cancel)
+        poll_src.attach(ctx)
     try:
         bus.call_sync(
             PORTAL_BUS, PORTAL_PATH, SCREENCAST_IFACE, method, args_variant,
@@ -58,15 +93,23 @@ def _portal_call_with_response(bus, method: str, args_variant, token: str, timeo
         loop.run()
     finally:
         timeout_src.destroy()
+        if poll_src is not None:
+            poll_src.destroy()
         bus.signal_unsubscribe(sub_id)
         ctx.pop_thread_default()
 
+    if outcome.get("cancelled"):
+        raise RuntimeError("screen sharing was cancelled")
     if outcome.get("timeout"):
+        _close_portal_request(bus, req_path)
         raise TimeoutError(f"ScreenCast.{method} timed out waiting for user confirmation")
     return outcome.get("code", 1), outcome.get("results", {})
 
 
-def _open_screencast_session(source_type: str = "both") -> tuple[str, int, int]:
+def _open_screencast_session(
+    source_type: str = "both",
+    cancel_event: threading.Event | None = None,
+) -> tuple[str, int, int]:
     """Open an XDG ScreenCast session and return (session_handle, pipewire_fd, node_id)."""
     from gi.repository import Gio, GLib
 
@@ -81,6 +124,7 @@ def _open_screencast_session(source_type: str = "both") -> tuple[str, int, int]:
             "session_handle_token": GLib.Variant("s", sess_token),
         },)),
         tok1,
+        cancel_event=cancel_event,
     )
     if code != 0 or not res.get("session_handle"):
         raise RuntimeError("could not create ScreenCast portal session")
@@ -89,57 +133,65 @@ def _open_screencast_session(source_type: str = "both") -> tuple[str, int, int]:
     # Portal source types bitmask: 1 = MONITOR, 2 = WINDOW
     types_mask = 1 if source_type == "monitor" else 2 if source_type == "window" else 3
     tok2 = f"autum_req_{secrets.token_hex(6)}"
-    code, _ = _portal_call_with_response(
-        bus,
-        "SelectSources",
-        GLib.Variant("(oa{sv})", (session_handle, {
-            "handle_token": GLib.Variant("s", tok2),
-            "types": GLib.Variant("u", types_mask),
-            "multiple": GLib.Variant("b", False),
-            "cursor_mode": GLib.Variant("u", 2),  # embedded cursor
-        })),
-        tok2,
-    )
-    if code != 0:
-        _close_portal_session(session_handle)
-        raise RuntimeError("screen sharing selection failed")
+    try:
+        code, _ = _portal_call_with_response(
+            bus,
+            "SelectSources",
+            GLib.Variant("(oa{sv})", (session_handle, {
+                "handle_token": GLib.Variant("s", tok2),
+                "types": GLib.Variant("u", types_mask),
+                "multiple": GLib.Variant("b", False),
+                "cursor_mode": GLib.Variant("u", 2),  # embedded cursor
+            })),
+            tok2,
+            cancel_event=cancel_event,
+        )
+        if code != 0:
+            raise RuntimeError("screen sharing selection failed")
 
-    tok3 = f"autum_req_{secrets.token_hex(6)}"
-    code, res = _portal_call_with_response(
-        bus,
-        "Start",
-        GLib.Variant("(osa{sv})", (session_handle, "", {
-            "handle_token": GLib.Variant("s", tok3),
-        })),
-        tok3,
-        timeout_s=60.0,
-    )
-    if code != 0:
-        _close_portal_session(session_handle)
-        raise RuntimeError("screen sharing was cancelled by the user")
-    streams = res.get("streams") or []
-    if not streams:
-        _close_portal_session(session_handle)
-        raise RuntimeError("screen sharing portal returned no video streams")
-    node_id = int(streams[0][0])
+        tok3 = f"autum_req_{secrets.token_hex(6)}"
+        code, res = _portal_call_with_response(
+            bus,
+            "Start",
+            GLib.Variant("(osa{sv})", (session_handle, "", {
+                "handle_token": GLib.Variant("s", tok3),
+            })),
+            tok3,
+            timeout_s=60.0,
+            cancel_event=cancel_event,
+        )
+        if code != 0:
+            raise RuntimeError("screen sharing was cancelled by the user")
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("screen sharing was cancelled")
+        streams = res.get("streams") or []
+        if not streams:
+            raise RuntimeError("screen sharing portal returned no video streams")
+        node_id = int(streams[0][0])
 
-    # OpenPipeWireRemote returns a file descriptor via UnixFDList
-    fd_list = Gio.UnixFDList()
-    reply, out_fds = bus.call_with_unix_fd_list_sync(
-        PORTAL_BUS,
-        PORTAL_PATH,
-        SCREENCAST_IFACE,
-        "OpenPipeWireRemote",
-        GLib.Variant("(oa{sv})", (session_handle, {})),
-        None,
-        Gio.DBusCallFlags.NONE,
-        10_000,
-        fd_list,
-        None,
-    )
-    fd_idx = int(reply.unpack()[0])
-    pw_fd = os.dup(out_fds.get(fd_idx))
-    return session_handle, pw_fd, node_id
+        # OpenPipeWireRemote returns a file descriptor via UnixFDList
+        fd_list = Gio.UnixFDList()
+        reply, out_fds = bus.call_with_unix_fd_list_sync(
+            PORTAL_BUS,
+            PORTAL_PATH,
+            SCREENCAST_IFACE,
+            "OpenPipeWireRemote",
+            GLib.Variant("(oa{sv})", (session_handle, {})),
+            None,
+            Gio.DBusCallFlags.NONE,
+            10_000,
+            fd_list,
+            None,
+        )
+        fd_idx = int(reply.unpack()[0])
+        pw_fd = os.dup(out_fds.get(fd_idx))
+        if cancel_event is not None and cancel_event.is_set():
+            os.close(pw_fd)
+            raise RuntimeError("screen sharing was cancelled")
+        return session_handle, pw_fd, node_id
+    except Exception:
+        _close_portal_session(session_handle)
+        raise
 
 
 def _close_portal_session(session_handle: str) -> None:
@@ -170,6 +222,7 @@ class ScreenWatcher:
         self.max_height = max_height
         self.fps = fps
         self._on_ended = on_ended
+        self._on_started: Callable[[], None] | None = None
         self._lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
         self._frame: bytes | None = None
@@ -179,6 +232,9 @@ class ScreenWatcher:
         self._pw_fd: int | None = None
         self._pipeline = None
         self._active = False
+
+    def set_on_started(self, callback: Callable[[], None] | None) -> None:
+        self._on_started = callback
 
     def set_on_ended(self, callback: Callable[[], None] | None) -> None:
         self._on_ended = callback
@@ -195,16 +251,28 @@ class ScreenWatcher:
     async def start(self, source_type: str = "both") -> dict[str, Any]:
         if self._active:
             return {"active": True, "already_watching": True}
-        return await asyncio.to_thread(self._start_sync, source_type)
+        cancel_event = threading.Event()
+        try:
+            return await asyncio.to_thread(self._start_sync, source_type, cancel_event)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            raise
 
-    def _start_sync(self, source_type: str) -> dict[str, Any]:
+    def _start_sync(self, source_type: str, cancel_event: threading.Event | None = None) -> dict[str, Any]:
         import gi
 
         gi.require_version("Gst", "1.0")
         from gi.repository import Gst
 
         Gst.init(None)
-        session_handle, pw_fd, node_id = _open_screencast_session(source_type)
+        session_handle, pw_fd, node_id = _open_screencast_session(source_type, cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            try:
+                os.close(pw_fd)
+            except OSError:
+                pass
+            _close_portal_session(session_handle)
+            raise RuntimeError("screen sharing was cancelled")
         self._session_handle = session_handle
         self._pw_fd = pw_fd
         self._frame_ready.clear()
@@ -230,9 +298,17 @@ class ScreenWatcher:
         self._active = True
         threading.Thread(target=self._watch_bus, args=(pipeline,), name="autum-screenwatch-bus", daemon=True).start()
         got_first = self._frame_ready.wait(timeout=5.0)
-        if not got_first:
+        if not got_first or (cancel_event is not None and cancel_event.is_set()):
             self._cleanup_sync()
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("screen sharing was cancelled")
             raise RuntimeError("screen sharing started, but no video frames arrived within 5 seconds")
+        cb = self._on_started
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                pass
         with self._lock:
             size = len(self._frame or b"")
         return {"active": True, "node_id": node_id, "frame_bytes": size}

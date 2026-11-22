@@ -13,16 +13,19 @@ Implements plan §5.1, §5.3, and §6 WP8:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from autum.events import Provenance, new_id
 from autum.logging import redact_sensitive
 from autum.tools import Capability, PermissionLevel, ToolRegistry
+
+log = logging.getLogger("autum.memory")
 
 MAX_MEMORIES = 500
 _SECRET_KEY_WORDS = ("password", "passwd", "secret", "token", "api_key", "apikey", "private_key", "credential")
@@ -57,7 +60,19 @@ class MemoryStore:
     def __init__(self, path: Path) -> None:
         self.path = path.resolve()
         self._entries: dict[str, MemoryEntry] = {}
+        self.corrupt_backup: Path | None = None
         self._load()
+
+    def _backup_corrupt(self) -> None:
+        """Preserve a damaged memory.json file before any future save can overwrite it."""
+        backup = self.path.with_name(f"{self.path.name}.corrupt.{time.time_ns() // 1_000_000}")
+        try:
+            os.replace(self.path, backup)
+            os.chmod(backup, 0o600)
+            self.corrupt_backup = backup
+            log.warning("damaged memory file backed up to %s", backup)
+        except OSError as exc:
+            log.warning("could not back up damaged memory file %s: %s", self.path, exc)
 
     def _load(self) -> None:
         if not self.path.is_file():
@@ -65,20 +80,25 @@ class MemoryStore:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            self._backup_corrupt()
             return
         if not isinstance(raw, list):
+            self._backup_corrupt()
             return
         for item in raw:
             if isinstance(item, dict) and {"id", "key", "value", "category", "provenance", "created_ms", "updated_ms"} <= item.keys():
-                entry = MemoryEntry(
-                    id=str(item["id"]),
-                    key=str(item["key"]),
-                    value=str(item["value"]),
-                    category=str(item["category"]),
-                    provenance=Provenance(item["provenance"]).value,
-                    created_ms=int(item["created_ms"]),
-                    updated_ms=int(item["updated_ms"]),
-                )
+                try:
+                    entry = MemoryEntry(
+                        id=str(item["id"]),
+                        key=str(item["key"]),
+                        value=str(item["value"]),
+                        category=str(item["category"]),
+                        provenance=Provenance(item["provenance"]).value,
+                        created_ms=int(item["created_ms"]),
+                        updated_ms=int(item["updated_ms"]),
+                    )
+                except (ValueError, TypeError):
+                    continue
                 self._entries[entry.id] = entry
 
     def _save(self) -> None:
@@ -111,13 +131,19 @@ class MemoryStore:
         # Update existing entry with matching key (case-insensitive)
         existing = self.find_by_key(clean_key)
         if existing is not None:
-            # Never silently upgrade an observed memory to USER provenance unless explicitly USER
+            # Never silently upgrade an OBSERVED memory to USER provenance (§5.1):
+            # once tainted as observed data, it stays observed unless deleted & recreated directly.
+            final_prov = (
+                Provenance.OBSERVED.value
+                if existing.provenance == Provenance.OBSERVED.value
+                else provenance.value
+            )
             updated = MemoryEntry(
                 id=existing.id,
                 key=clean_key,
                 value=clean_val,
                 category=clean_cat,
-                provenance=provenance.value,
+                provenance=final_prov,
                 created_ms=existing.created_ms,
                 updated_ms=now,
             )
@@ -201,12 +227,21 @@ class MemoryStore:
         return entry
 
 
-def register_memory_capabilities(registry: ToolRegistry, store: MemoryStore) -> None:
+def register_memory_capabilities(
+    registry: ToolRegistry,
+    store: MemoryStore,
+    *,
+    is_observed_turn: Callable[[], bool] | None = None,
+) -> None:
     """Register WP8 persistent memory capabilities in the ToolRegistry."""
 
     # 1. Remember / update user fact (REVERSIBLE)
     async def _remember(args: dict[str, Any]) -> dict[str, Any]:
-        prov = Provenance.OBSERVED if args.get("from_observed") else Provenance.USER
+        # §5.1: if untrusted observed content entered this turn (screen, window,
+        # document, note), force Provenance.OBSERVED regardless of model args so
+        # screen text can never escalate into a permanent system-prompt instruction.
+        tainted = bool(is_observed_turn()) if is_observed_turn is not None else False
+        prov = Provenance.OBSERVED if (tainted or args.get("from_observed")) else Provenance.USER
         entry = store.remember(
             str(args["key"]),
             str(args["value"]),

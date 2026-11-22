@@ -363,7 +363,11 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 else None,
             )
             memory = MemoryStore(data_dir / "memory.json")
-            register_memory_capabilities(registry, memory)
+            register_memory_capabilities(
+                registry,
+                memory,
+                is_observed_turn=lambda: runtime_ref[0].turn_observed if runtime_ref else False,
+            )
             vision = OllamaVision(
                 client,
                 model=vision_model,

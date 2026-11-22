@@ -90,6 +90,7 @@ class Capability:
     cancellable: bool = True
     observed_output: bool = False
     precondition: Callable[[dict[str, Any]], str | None] | None = None
+    prepare: Callable[[dict[str, Any]], Awaitable[tuple[dict[str, Any], str]]] | None = None
 
     def openai_tool(self) -> dict[str, Any]:
         # Strip pure runtime-validation constraints (minLength, maxLength,
@@ -208,7 +209,9 @@ class AuditLog:
 # ----- approvals (§5.2) -------------------------------------------------
 
 _AFFIRMATIVE = re.compile(
-    r"^\s*(?:yes|yeah|yep|yup|approve|approved|confirm|confirmed|go ahead|do it|proceed|sure|ok|okay)\b[.!\s]*$",
+    r"^\s*(?:yes|yeah|yep|yup|approve|approved|confirm|confirmed|go ahead|do it|proceed|sure|ok|okay)"
+    r"(?:[\s,]+(?:please|go ahead|do it|proceed|confirm|confirmed|delete it|close it|remove it|forget it))*"
+    r"[.!\s]*$",
     re.IGNORECASE,
 )
 
@@ -331,7 +334,7 @@ class ApprovalGate:
 
 # ----- registry & executor ----------------------------------------------
 
-ApprovalRequester = Callable[[Capability, dict[str, Any], str, str], Awaitable[str]]
+ApprovalRequester = Callable[..., Awaitable[str]]
 
 
 class ToolRegistry:
@@ -404,10 +407,30 @@ class ToolRegistry:
             self.audit.record("tool_failed", tool=cap.name, tool_call_id=tc_id, error=schema_err)
             return ToolOutcome(tc_id, cap.name, True, False, False, False, "invalid", error=schema_err)
 
+        exec_args = dict(call.arguments)
+        prepared_target: str | None = None
+        if cap.prepare is not None:
+            try:
+                exec_args, prepared_target = await asyncio.wait_for(cap.prepare(exec_args), cap.timeout_s)
+            except asyncio.CancelledError:
+                self.audit.record("tool_cancelled", tool=cap.name, tool_call_id=tc_id)
+                raise
+            except Exception as exc:
+                err = f"{type(exc).__name__}: {exc}"
+                bus.emit(
+                    "agent.tool_failed",
+                    {"tool": cap.name, "error": err},
+                    turn_id=turn_id,
+                    operation_id=operation_id,
+                    tool_call_id=tc_id,
+                )
+                self.audit.record("tool_failed", tool=cap.name, tool_call_id=tc_id, error=err)
+                return ToolOutcome(tc_id, cap.name, True, False, False, False, "failed", error=err)
+
         # Permission & approval check (§5.2)
         gate = approval_gate or ApprovalGate()
         if gate.requires_approval(cap.permission_level):
-            target = cap.target_summary(call.arguments)
+            target = prepared_target if prepared_target is not None else cap.target_summary(exec_args)
             bus.emit(
                 "agent.approval_required",
                 {"action": cap.name, "target": target, "level": cap.permission_level.value},
@@ -425,7 +448,10 @@ class ToolRegistry:
             if request_approval is None:
                 outcome = "denied"
             else:
-                outcome = await request_approval(cap, call.arguments, operation_id, tc_id)
+                try:
+                    outcome = await request_approval(cap, exec_args, operation_id, tc_id, target)
+                except TypeError:
+                    outcome = await request_approval(cap, exec_args, operation_id, tc_id)
             bus.emit(
                 "agent.approval_resolved",
                 {"outcome": outcome},
@@ -458,7 +484,7 @@ class ToolRegistry:
         self.audit.record("tool_started", tool=cap.name, tool_call_id=tc_id)
 
         try:
-            coro = cap.execute(call.arguments)
+            coro = cap.execute(exec_args)
             if cap.cancellable:
                 result = await asyncio.wait_for(coro, cap.timeout_s)
             else:
@@ -501,7 +527,7 @@ class ToolRegistry:
 
         # Independent post-condition verification (WP5 / WP6)
         try:
-            verified = bool(await asyncio.wait_for(cap.verify(call.arguments, result), cap.timeout_s))
+            verified = bool(await asyncio.wait_for(cap.verify(exec_args, result), cap.timeout_s))
         except Exception:
             verified = False
 

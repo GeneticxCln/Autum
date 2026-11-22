@@ -106,7 +106,7 @@ def read_linux_system_info() -> dict[str, Any]:
 # ----- XDG Screenshot portal (interactive user-selected window) ---------
 
 
-def _portal_screenshot_sync(timeout_s: float) -> bytes:
+def _portal_screenshot_sync(timeout_s: float, cancel_event: threading.Event | None = None) -> bytes:
     """Ask the XDG Desktop Portal for a user-selected interactive screenshot.
 
     Returns PNG bytes and immediately deletes the temporary portal file so no
@@ -114,6 +114,8 @@ def _portal_screenshot_sync(timeout_s: float) -> bytes:
     """
     from gi.repository import Gio, GLib
 
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("window capture was cancelled")
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     token = f"autum_{secrets.token_hex(8)}"
     unique = bus.get_unique_name().lstrip(":").replace(".", "_")
@@ -123,6 +125,15 @@ def _portal_screenshot_sync(timeout_s: float) -> bytes:
     ctx.push_thread_default()
     loop = GLib.MainLoop.new(ctx, False)
     outcome: dict[str, Any] = {}
+
+    def _close_req() -> None:
+        try:
+            bus.call_sync(
+                PORTAL_BUS, req_path, REQUEST_IFACE, "Close", None,
+                None, Gio.DBusCallFlags.NONE, 2000, None,
+            )
+        except Exception:
+            pass
 
     def on_response(_conn, _sender, _path, _iface, _signal, params):
         code, results = params.unpack()
@@ -136,12 +147,27 @@ def _portal_screenshot_sync(timeout_s: float) -> bytes:
 
     def on_timeout(*_):
         outcome["timeout"] = True
+        _close_req()
         loop.quit()
         return False
 
     timeout_src = GLib.timeout_source_new(int(timeout_s * 1000))
     timeout_src.set_callback(on_timeout)
     timeout_src.attach(ctx)
+
+    poll_src = None
+    if cancel_event is not None:
+        def _check_cancel(*_):
+            if cancel_event.is_set():
+                outcome["cancelled"] = True
+                _close_req()
+                loop.quit()
+                return False
+            return True
+
+        poll_src = GLib.timeout_source_new(100)
+        poll_src.set_callback(_check_cancel)
+        poll_src.attach(ctx)
     try:
         options = {
             "handle_token": GLib.Variant("s", token),
@@ -162,9 +188,13 @@ def _portal_screenshot_sync(timeout_s: float) -> bytes:
         loop.run()
     finally:
         timeout_src.destroy()
+        if poll_src is not None:
+            poll_src.destroy()
         bus.signal_unsubscribe(sub_id)
         ctx.pop_thread_default()
 
+    if outcome.get("cancelled"):
+        raise RuntimeError("window capture was cancelled")
     if outcome.get("timeout"):
         raise TimeoutError("window selection timed out")
     if outcome.get("code", 1) != 0:
@@ -187,7 +217,12 @@ def _portal_screenshot_sync(timeout_s: float) -> bytes:
 
 
 async def portal_screenshot_interactive(timeout_s: float = 30.0) -> bytes:
-    return await asyncio.to_thread(_portal_screenshot_sync, timeout_s)
+    cancel_event = threading.Event()
+    try:
+        return await asyncio.to_thread(_portal_screenshot_sync, timeout_s, cancel_event)
+    except asyncio.CancelledError:
+        cancel_event.set()
+        raise
 
 
 # ----- desktop application discovery & safe launch ----------------------
@@ -236,35 +271,32 @@ def find_desktop_entry(app_query: str, search_dirs: Sequence[Path] | None = None
 
 
 async def launch_desktop_app(app_name: str, desktop_file: Path | None) -> dict[str, Any]:
-    """Launch an installed desktop app cleanly without shell execution."""
-    if desktop_file is not None and shutil.which("gtk-launch"):
-        proc = await asyncio.create_subprocess_exec(
-            "gtk-launch", desktop_file.name,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        # gtk-launch exits 0 quickly after handing off; wait briefly to catch immediate failure
-        try:
-            code = await asyncio.wait_for(proc.wait(), 1.0)
-            if code != 0:
-                raise RuntimeError(f"gtk-launch exited with status {code}")
-        except asyncio.TimeoutError:
-            pass
-        return {"app": app_name, "desktop_file": desktop_file.name, "launched": True}
+    """Launch an installed `.desktop` application cleanly without shell or arbitrary $PATH execution.
 
-    clean = app_name.strip().lower()
-    if clean in BLOCKED_BINARIES or not clean.replace("-", "").replace("_", "").isalnum():
-        raise PermissionError(f"launching {app_name!r} is not permitted")
-    exe = shutil.which(clean)
-    if not exe:
-        raise FileNotFoundError(f"no installed desktop application found matching {app_name!r}")
+    Security (§5.2): never falls back to arbitrary executables on $PATH (such as
+    reboot, poweroff, shutdown, halt, shred, or shells). Only verified `.desktop`
+    entries installed in standard XDG application directories may be launched.
+    """
+    if desktop_file is None:
+        raise PermissionError(
+            f"no installed desktop application (.desktop entry) found matching {app_name!r}; "
+            "arbitrary system commands are not permitted (plan §5.2)"
+        )
+    if not shutil.which("gtk-launch"):
+        raise RuntimeError("launching desktop applications requires 'gtk-launch'")
     proc = await asyncio.create_subprocess_exec(
-        exe, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, start_new_session=True,
+        "gtk-launch", desktop_file.name,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=True,
     )
-    await asyncio.sleep(0.1)
-    if proc.returncode is not None and proc.returncode != 0:
-        raise RuntimeError(f"application {app_name!r} exited immediately with code {proc.returncode}")
-    return {"app": app_name, "executable": exe, "pid": proc.pid, "launched": True}
+    # gtk-launch exits 0 quickly after handing off; wait briefly to catch immediate failure
+    try:
+        code = await asyncio.wait_for(proc.wait(), 1.0)
+        if code != 0:
+            raise RuntimeError(f"gtk-launch exited with status {code}")
+    except asyncio.TimeoutError:
+        pass
+    return {"app": app_name, "desktop_file": desktop_file.name, "launched": True}
 
 
 # ----- integration implementation ---------------------------------------
@@ -476,6 +508,8 @@ class LinuxDesktopIntegration:
             if source not in ("monitor", "window", "both"):
                 raise ValueError("source must be 'monitor', 'window', or 'both'")
             loop = asyncio.get_running_loop()
+            if hasattr(watcher, "set_on_started"):
+                watcher.set_on_started(lambda: loop.call_soon_threadsafe(_notify, "screen") if not loop.is_closed() else None)
             if hasattr(watcher, "set_on_ended"):
                 watcher.set_on_ended(lambda: loop.call_soon_threadsafe(_end_screen_obs) if not loop.is_closed() else None)
             res = await watcher.start(source)
@@ -738,6 +772,17 @@ class LinuxDesktopIntegration:
             )
             registered.append("window_state")
 
+            async def _prepare_close(args: dict[str, Any]) -> tuple[dict[str, Any], str]:
+                # Resolve the exact window BEFORE asking for irreversible approval (§5.2)
+                # so the spoken confirmation names the real window and closes only that ID.
+                if hasattr(wm, "resolve_window"):
+                    target = await wm.resolve_window(str(args["window"]), context.excluded_windows)
+                    title = str(target.get("title") or target.get("app") or args["window"])
+                    app = str(target.get("app") or "")
+                    label = f"close window '{title}' ({app})" if app and app.lower() != title.lower() else f"close window '{title}'"
+                    return {"window": str(target["id"])}, label
+                return args, f"close window '{args['window']}'"
+
             async def _close_window(args: dict[str, Any]) -> dict[str, Any]:
                 return await wm.close_window(str(args["window"]), context.excluded_windows)
 
@@ -762,6 +807,7 @@ class LinuxDesktopIntegration:
                     permission_level=PermissionLevel.IRREVERSIBLE,
                     cancellable=False,
                     observed_output=True,
+                    prepare=_prepare_close,
                     execute=_close_window,
                     verify=_verify_close,
                     target_summary=lambda a: f"close window '{a['window']}'",

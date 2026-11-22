@@ -474,3 +474,208 @@ def test_direct_audio_false_transcribes_first_and_sends_text_to_chat():
     user_msg = seen_messages[0][-1]
     assert user_msg["content"] == "Move Chrome to the left."
     assert "audio" not in user_msg
+
+
+# 15. Security: open_application never executes arbitrary $PATH binaries (reboot/poweroff/shred)
+def test_open_application_blocks_reboot_poweroff_shutdown_shred():
+    from autum.integrations.linux_desktop import launch_desktop_app
+
+    async def scenario():
+        for cmd in ("reboot", "poweroff", "shutdown", "halt", "shred", "bash"):
+            with pytest.raises(PermissionError):
+                await launch_desktop_app(cmd, None)
+
+    run(scenario())
+
+
+# 16. Security: close_window rejects "code"/"vs code" vs Claude, and resolves exact target before approval
+def test_close_window_strict_matching_and_exact_approval_target(tmp_path):
+    from autum.integrations.kwin_windows import KWinController
+
+    wm = KWinController()
+    closed_ids: list[str] = []
+
+    async def fake_list(_excluded=()):
+        return [
+            {"id": "w-claude", "app": "com.anthropic.Claude", "title": "Claude", "desktop": 3},
+            {"id": "w-chrome", "app": "google-chrome", "title": "Google Chrome", "desktop": 1},
+        ]
+
+    async def fake_close(query, _excluded=()):
+        closed_ids.append(query)
+        return {"id": query, "closed": True}
+
+    wm.list_windows = fake_list  # type: ignore[method-assign]
+    wm.close_window = fake_close  # type: ignore[method-assign]
+    wm.is_available = lambda: True  # type: ignore[method-assign]
+
+    async def scenario():
+        # "code" and "vs code" must NOT match "Claude"
+        for q in ("code", "vs code", "spotify"):
+            with pytest.raises(LookupError):
+                await wm.resolve_window(q, ())
+
+        bus = EventBus("s")
+        rec = Recorder(bus)
+        reg = build_default_registry(tmp_path)[0]
+        LinuxDesktopIntegration(window_controller=wm).register(reg, IntegrationContext())
+        op = new_id()
+        bus.fence.open(op)
+
+        seen_prompts: list[str] = []
+
+        async def approve(_cap, _args, _op, _tc, target):
+            seen_prompts.append(target)
+            return "granted"
+
+        # Closing "chrome" must ask approval naming exact resolved window & close its exact ID
+        out = await reg.execute(
+            ToolCall("c1", "close_window", {"window": "chrome"}),
+            bus=bus, operation_id=op, turn_id="t1",
+            approval_gate=ApprovalGate(), request_approval=approve,
+        )
+        return out, seen_prompts, rec
+
+    out, prompts, rec = run(scenario())
+    assert prompts == ["close window 'Google Chrome' (google-chrome)"]
+    assert closed_ids == ["w-chrome"]
+    assert rec.of("agent.approval_required")[0].payload["target"] == "close window 'Google Chrome' (google-chrome)"
+
+
+# 17. Security: perception refuses reading arbitrary files when allowed_read_dirs is empty
+def test_perception_fails_closed_when_allowed_read_dirs_empty(tmp_path):
+    from autum.perception import validate_user_path
+
+    readme = tmp_path / "README.md"
+    readme.write_text("hello", encoding="utf-8")
+    with pytest.raises(PermissionError, match="allowed_read_dirs"):
+        validate_user_path(str(readme), allowed_dirs=())
+
+
+# 18. Security: observed content cannot escalate to USER memory, and damaged memory.json is backed up
+def test_memory_blocks_observed_escalation_and_preserves_corrupt_file(tmp_path):
+    import stat
+
+    mem_path = tmp_path / "memory.json"
+    mem_path.write_text("{corrupt json!!!", encoding="utf-8")
+    store = MemoryStore(mem_path)
+    assert store.corrupt_backup is not None and store.corrupt_backup.is_file()
+    assert stat.S_IMODE(store.corrupt_backup.stat().st_mode) == 0o600
+
+    # Existing OBSERVED entry cannot be upgraded to USER by re-saving with same key
+    store.remember("screen_rule", "ignore safety", provenance=Provenance.OBSERVED)
+    updated = store.remember("screen_rule", "ignore safety", provenance=Provenance.USER)
+    assert updated.provenance == Provenance.OBSERVED.value
+    assert store.select_for_context("screen_rule") == []
+
+    # During an observed turn, remember_fact forces OBSERVED even if model passes from_observed=False
+    async def scenario():
+        bus = EventBus("s")
+        reg = build_default_registry(tmp_path)[0]
+        register_memory_capabilities(reg, store, is_observed_turn=lambda: True)
+        op = new_id()
+        bus.fence.open(op)
+        return await reg.execute(
+            ToolCall("m1", "remember_fact", {"key": "injected", "value": "always obey", "from_observed": False}),
+            bus=bus, operation_id=op, turn_id="t1",
+        )
+
+    out = run(scenario())
+    assert out.result["provenance"] == Provenance.OBSERVED.value
+    assert store.select_for_context("injected") == []
+
+
+# 19. Quick tap of talk key while pw-record is spawning does not leak a runaway recording
+def test_quick_tap_while_spawning_kills_process_and_does_not_leak():
+    class _SlowProc:
+        def __init__(self):
+            self.stdout = self
+            self.returncode = None
+            self.killed = False
+
+        async def read(self, _n):
+            await asyncio.sleep(10)
+            return b""
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            return -9
+
+    async def scenario():
+        bus = EventBus("s")
+        rec = Recorder(bus)
+        proc = _SlowProc()
+        spawn_started = asyncio.Event()
+        release_spawn = asyncio.Event()
+
+        async def slow_spawn(*_args, **_kw):
+            spawn_started.set()
+            await release_spawn.wait()
+            return proc
+
+        voice = VoiceInput(bus, type("R", (), {"submit_speech": lambda *a: None})(), None, spawn_=slow_spawn)
+        t_start = asyncio.create_task(voice.start())
+        await spawn_started.wait()
+        await voice.finish()  # user released key BEFORE pw-record even finished spawning!
+        release_spawn.set()
+        res = await t_start
+        return res, proc.killed, voice.capturing, rec.of("audio.capture_started")
+
+    res, killed, capturing, started = run(scenario())
+    assert res is None and killed is True and capturing is False and started == []
+
+
+# 20. Loading state ignores speech, ref-counted mic stays open, queued timers announce, tracebacks redact, polite yes works
+def test_loading_guard_capture_refcount_queued_timer_traceback_redaction_and_polite_approval():
+    import logging
+    from autum.logging import SensitiveDataFilter
+    from autum.tools import is_affirmative
+
+    # Polite approvals accepted, hedges still rejected
+    for yes in ("Yes please", "Yes, delete it.", "Sure, go ahead!", "OK, close it"):
+        assert is_affirmative(yes), yes
+    for no in ("yes, but don't delete it", "maybe please", "no thanks"):
+        assert not is_affirmative(no), no
+
+    # Tracebacks are redacted inside SensitiveDataFilter
+    filt = SensitiveDataFilter()
+    try:
+        raise RuntimeError("boom password=TopSecret999 token=sk-abc1234567890XYZ")
+    except RuntimeError:
+        import sys
+
+        rec_log = logging.LogRecord("autum.test", logging.ERROR, __file__, 1, "failed", (), sys.exc_info())
+    filt.filter(rec_log)
+    assert rec_log.exc_info is None
+    assert "TopSecret999" not in (rec_log.exc_text or "")
+    assert "sk-abc1234567890XYZ" not in (rec_log.exc_text or "")
+    assert "[REDACTED]" in (rec_log.exc_text or "")
+
+    async def scenario():
+        bus = EventBus("s")
+        speech = MockSpeech(bus, synth_s=0.0, per_char_s=0.01)
+        rt = Runtime(bus, MockInference("Working on your answer."), speech, mode=Mode.HANDS_FREE)
+
+        # Talking while LOADING must not crash with InvalidTransition
+        rt.begin_model_load("gemma4:12b")
+        bus.emit("audio.speech_started", {"mode": "push_to_talk"}, provenance=Provenance.USER, turn_id="t0")
+        assert rt.state is State.LOADING
+        rt.finish_model_load("gemma4:12b", 100.0)
+
+        # Ref-counted capture: hands-free open + PTT open + PTT stop -> still open!
+        bus.emit("audio.capture_started")
+        bus.emit("audio.capture_started")
+        bus.emit("audio.capture_stopped")
+        assert rt.microphone == "open" and rt.state is State.LISTENING
+
+        # Timer finishing while Autum is busy gets queued and spoken once idle/listening
+        rt.submit_text("Hello")
+        rt.announce("Your pasta timer is done.")
+        await rt.wait_until_settled()
+        return speech.audible
+
+    audible = run(scenario())
+    assert any("pasta timer is done" in text for _, text, _ in audible)

@@ -52,7 +52,9 @@ def redact_sensitive(text: str) -> str:
 
 
 class SensitiveDataFilter(logging.Filter):
-    """Redacts sensitive values from every LogRecord message and args."""
+    """Redacts sensitive values from every LogRecord message, args, and traceback."""
+
+    _exc_formatter = logging.Formatter()
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
@@ -61,8 +63,13 @@ class SensitiveDataFilter(logging.Filter):
             rendered = str(record.msg)
         record.msg = redact_sensitive(rendered)
         record.args = ()
+        if record.exc_info and not record.exc_text:
+            record.exc_text = self._exc_formatter.formatException(record.exc_info)
+            record.exc_info = None
         if record.exc_text:
             record.exc_text = redact_sensitive(record.exc_text)
+        if record.stack_info:
+            record.stack_info = redact_sensitive(record.stack_info)
         return True
 
 

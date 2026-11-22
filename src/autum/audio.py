@@ -163,10 +163,16 @@ class VoiceInput:
         self._pcm = bytearray()
         self._first_audio = asyncio.Event()
         target_args = ("--target", self.target) if self.target else ()
-        self._proc = await self.spawn(
+        proc = await self.spawn(
             "pw-record", *target_args, "--raw", "--rate", str(MIC_RATE), "--channels", "1", "--format", "s16",
             "--latency", "20ms", "-", stdout=PIPE,
         )
+        # Guard against quick tap / mute while pw-record was still spawning
+        if self._turn != turn or self.muted:
+            _kill(proc)
+            await proc.wait()
+            return None
+        self._proc = proc
         self._reader = asyncio.create_task(self._read(self._proc))
         self._watchdog = asyncio.create_task(self._watch(turn))
         self.bus.emit("audio.capture_started")
@@ -220,6 +226,7 @@ class VoiceInput:
 
     async def _stop_capture(self) -> bytes:
         proc, reader, watchdog = self._proc, self._reader, self._watchdog
+        was_started = proc is not None
         self._turn = self._proc = self._reader = self._watchdog = None
         if watchdog is not None and watchdog is not asyncio.current_task():
             watchdog.cancel()
@@ -231,7 +238,8 @@ class VoiceInput:
                 reader.cancel()
         if proc is not None:
             await proc.wait()
-        self.bus.emit("audio.capture_stopped")
+        if was_started:
+            self.bus.emit("audio.capture_stopped")
         return bytes(self._pcm)
 
     def _on_event(self, event) -> None:

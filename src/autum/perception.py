@@ -92,14 +92,17 @@ def validate_user_path(raw_path: str, allowed_dirs: Sequence[Path] = ()) -> Path
     """Validate and resolve a user-supplied file path against exclusion and scope rules."""
     if not raw_path or not raw_path.strip():
         raise ValueError("path must be a non-empty file path")
+    if not allowed_dirs:
+        raise PermissionError(
+            "file reading requires allowed_read_dirs to be configured in ~/.config/autum/config.toml (plan §5.2)"
+        )
     path = Path(raw_path).expanduser().resolve()
     reason = is_excluded_path(path)
     if reason is not None:
         raise PermissionError(reason)
-    if allowed_dirs:
-        allowed_resolved = [d.expanduser().resolve() for d in allowed_dirs]
-        if not any(path == d or d in path.parents for d in allowed_resolved):
-            raise PermissionError("path is outside the user-configured allowed read directories (plan §5.2)")
+    allowed_resolved = [d.expanduser().resolve() for d in allowed_dirs]
+    if not any(path == d or d in path.parents for d in allowed_resolved):
+        raise PermissionError("path is outside the user-configured allowed read directories (plan §5.2)")
     if not path.is_file():
         raise FileNotFoundError(f"file not found: {path}")
     return path
@@ -166,7 +169,15 @@ async def extract_document_text(path: Path, max_chars: int = MAX_DOC_CHARS) -> t
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        out, err = await asyncio.wait_for(proc.communicate(), 15.0)
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), 15.0)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            raise TimeoutError("pdftotext timed out after 15s") from None
         if proc.returncode != 0:
             raise RuntimeError(f"pdftotext failed: {err.decode(errors='replace').strip()[:200]}")
         raw = out.decode("utf-8", errors="replace")

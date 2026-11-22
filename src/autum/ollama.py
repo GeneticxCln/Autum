@@ -33,6 +33,10 @@ def to_openai(message: Message) -> dict:
         data = base64.b64encode(message["audio"]).decode()
         return {"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": data, "format": "wav"}}]}
     content = message.get("content") or ""
+    if message["role"] == "assistant":
+        # Strip the runtime's internal interruption marker so small models do not
+        # echo "[interrupted by the user]" aloud on the next turn.
+        content = content.replace(" [interrupted by the user]", "").strip()
     if message["role"] == "user" and not content:
         content = "(unclear speech)"  # an earlier spoken turn whose transcript never arrived
     return {"role": message["role"], "content": content}

@@ -50,6 +50,27 @@ async def spawn(*args: str, stdin=None, stdout=None) -> asyncio.subprocess.Proce
     )
 
 
+def highpass_pcm(pcm: bytes, rate: int = MIC_RATE, cutoff_hz: float = 80.0) -> bytes:
+    """Remove DC offset and sub-sonic rumble (< cutoff_hz) from 16-bit mono PCM.
+
+    Preserves exact frame count. Keeps USB mic rumble (e.g. 0-20 Hz) from
+    degrading speech recognition while leaving the speech band untouched.
+    """
+    samples = array.array("h", pcm[: len(pcm) - len(pcm) % 2])
+    if not samples:
+        return b""
+    alpha = 1.0 / (1.0 + 2.0 * math.pi * cutoff_hz / rate)
+    out = array.array("h", [0]) * len(samples)
+    prev_x = float(samples[0])
+    prev_y = 0.0
+    for i, s in enumerate(samples):
+        x = float(s)
+        y = alpha * (prev_y + x - prev_x)
+        prev_x, prev_y = x, y
+        out[i] = max(-32768, min(32767, int(round(y))))
+    return out.tobytes()
+
+
 def wav_bytes(pcm: bytes, rate: int) -> bytes:
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as w:
@@ -161,7 +182,7 @@ class VoiceInput:
         if len(pcm) < MIN_UTTERANCE_S * MIC_RATE * 2:
             self._nothing_heard(turn)
             return
-        wav = wav_bytes(pcm, MIC_RATE)
+        wav = wav_bytes(highpass_pcm(pcm, MIC_RATE), MIC_RATE)
         self._awaiting_transcript[turn] = wav
         self.runtime.submit_speech(turn, wav, ended)
 
@@ -568,7 +589,7 @@ class HandsFreeInput:
             if len(event.pcm) < MIN_UTTERANCE_S * MIC_RATE * 2:
                 self._nothing_heard(turn)
                 return
-            wav = wav_bytes(event.pcm, MIC_RATE)
+            wav = wav_bytes(highpass_pcm(event.pcm, MIC_RATE), MIC_RATE)
             self._awaiting_transcript[turn] = wav
             self.runtime.submit_speech(turn, wav, ended)
 

@@ -24,6 +24,10 @@ def test_audio_turns_become_input_audio_and_untranscribed_old_turns_are_marked()
     }
     assert to_openai({"role": "user", "content": "", "turn_id": "t"})["content"] == "(unclear speech)"
     assert to_openai({"role": "assistant", "content": "Hi."}) == {"role": "assistant", "content": "Hi."}
+    assert to_openai({"role": "assistant", "content": "Sure. [interrupted by the user]"}) == {
+        "role": "assistant",
+        "content": "Sure.",
+    }
 
 
 def test_chat_streams_deltas_with_pinned_sampling():

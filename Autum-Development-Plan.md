@@ -853,10 +853,9 @@ explicitly deferred by user decision): its own process, pinned across all
 virtual desktops and windows via Wayland `wlr-layer-shell` (with an X11
 fallback), kept off the taskbar, fed by the event socket. The microphone
 indicator is part of the cloud: a warm edge glow while open, grey with a gap
-while muted. Steady CPU use about 15% of one core (measured under XWayland;
-re-measure under native Wayland during M1/R1 resource measurement). On the
-reference display a state change reached the screen in 4.6 ms median and
-8.7 ms at worst (objective: 100 ms or less).
+while muted. Measured on native Wayland `wlr-layer-shell` (300 px cloud):
+steady CPU about 14% of one core, ~302 MiB RSS, and state change to screen
+in 6.0 ms median / 71.2 ms max (`n=20`, objective: 100 ms or less).
 
 M0 and M1 run in parallel. M0's skeleton is the codebase M2 builds on;
 M1's benchmark harness is the first running voice pipeline. Visual work

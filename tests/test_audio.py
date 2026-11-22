@@ -7,7 +7,16 @@ import wave
 
 import pytest
 
-from autum.audio import MIC_HELP, HandsFreeInput, MuteMonitor, SpeechPlayer, VoiceInput, check_microphone
+from autum.audio import (
+    MIC_HELP,
+    HandsFreeInput,
+    MuteMonitor,
+    SpeechPlayer,
+    VoiceInput,
+    check_microphone,
+    highpass_pcm,
+    rms,
+)
 from autum.bus import EventBus
 from autum.events import new_id
 from autum.runtime import Mode, Runtime, State
@@ -487,3 +496,14 @@ def test_hands_free_recovers_after_microphone_disconnect():
     assert spawn_count >= 2
     assert log.of("runtime.component_error")[0].payload["component"] == "microphone"
     assert log.of("runtime.component_recovered")[0].payload == {"component": "microphone"}
+
+
+def test_highpass_removes_dc_and_subsonic_rumble_while_keeping_speech():
+    import array, math
+
+    n = 1600  # 100 ms at 16 kHz
+    rumble = array.array("h", [int(4000 * math.sin(2 * math.pi * 5 * i / 16000)) for i in range(n)]).tobytes()
+    speech = array.array("h", [int(4000 * math.sin(2 * math.pi * 500 * i / 16000)) for i in range(n)]).tobytes()
+    assert len(highpass_pcm(rumble)) == len(rumble)
+    assert rms(highpass_pcm(rumble)) < rms(rumble) * 0.25
+    assert rms(highpass_pcm(speech)) > rms(speech) * 0.85

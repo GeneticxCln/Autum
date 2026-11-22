@@ -27,7 +27,8 @@ log = logging.getLogger("autum.transport")
 CLIENT_QUEUE = 512
 MAX_LINE = 8192
 MAX_TEXT = 2000
-COMMANDS = {"talk_start", "talk_finish", "stop", "text"}
+COMMANDS = {"talk_start", "talk_finish", "stop", "text", "set_mode"}
+MODES = {"push_to_talk", "hands_free"}
 SNAPSHOT_TYPES = ("runtime.state_changed", "audio.mute_changed")
 
 CommandHandler = Callable[[dict], Awaitable[None]]
@@ -53,6 +54,11 @@ def parse_command(line: bytes) -> dict | None:
         if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT:
             return None
         return {"command": "text", "text": text}
+    if data["command"] == "set_mode":
+        mode = data.get("mode")
+        if mode not in MODES or set(data) != {"command", "mode"}:
+            return None
+        return {"command": "set_mode", "mode": mode}
     if set(data) != {"command"}:
         return None
     return {"command": data["command"]}

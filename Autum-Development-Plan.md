@@ -836,6 +836,16 @@ pipeline that replaces it. Autum runs in the background with no terminal
 program. Push-to-talk: hold the desktop key (KDE's GlobalShortcuts portal;
 the user confirms the key once) or hold the bubble.
 
+**M3 status (2026-11-22):** hands-free mode (`--hands-free`) is implemented
+on top of streaming Silero VAD v6 (`src/autum/vad.py`, ~0.08 ms/frame on CPU)
+and `HandsFreeInput` (`src/autum/audio.py`): continuous capture, configurable
+end-of-turn silence (`--silence-ms`, default 700 ms), stricter voice barge-in
+onset while Autum is speaking (`--barge-in-ms`, default 256 ms) to reject brief
+backchannels, hard-mute stop/resume, microphone disconnect recovery, and
+optional PipeWire WebRTC echo cancellation (`--aec`). Final silence/barge-in
+thresholds and the speaker vs. headphone policy remain provisional until M1's
+recorded set and attended echo test complete.
+
 **M4 status (2026-11-22):** the visual presence is a particle cloud in
 the bottom-right screen corner and nothing else (user's choice of design):
 its own process, pinned across all virtual desktops and windows via Wayland

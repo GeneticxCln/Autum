@@ -23,14 +23,18 @@ from typing import AsyncIterator, Awaitable, Callable, Protocol
 
 from autum.bus import EventBus
 from autum.events import Provenance, new_id
+from autum.vad import TurnDetector, VAD_FRAME_BYTES
 
 MIC_RATE = 16_000
 SPEECH_RATE = 24_000
 MIC_STALL_S = 2.0
+MIC_RECONNECT_S = 1.0
 DEVICE_TIMEOUT_S = 3.0
 PLAY_AHEAD_S = 0.15
 LEVEL_EVERY_S = 0.05
 MIN_UTTERANCE_S = 0.3
+AEC_SOURCE = "autum_aec_source"
+AEC_SINK = "autum_aec_sink"
 MIC_HELP = (
     "The microphone sent no audio for 2 seconds. Stop any program stuck on it, "
     "unplug the microphone and plug it back in, then try again."
@@ -103,12 +107,14 @@ class VoiceInput:
         *,
         spawn_: Spawn = spawn,
         stall_s: float = MIC_STALL_S,
+        target: str | None = None,
     ) -> None:
         self.bus = bus
         self.runtime = runtime
         self.transcriber = transcriber
         self.spawn = spawn_
         self.stall_s = stall_s
+        self.target = target
         self.muted = False
         self._turn: str | None = None
         self._proc: asyncio.subprocess.Process | None = None
@@ -134,8 +140,9 @@ class VoiceInput:
         turn = self._turn = new_id()
         self._pcm = bytearray()
         self._first_audio = asyncio.Event()
+        target_args = ("--target", self.target) if self.target else ()
         self._proc = await self.spawn(
-            "pw-record", "--raw", "--rate", str(MIC_RATE), "--channels", "1", "--format", "s16",
+            "pw-record", *target_args, "--raw", "--rate", str(MIC_RATE), "--channels", "1", "--format", "s16",
             "--latency", "20ms", "-", stdout=PIPE,
         )
         self._reader = asyncio.create_task(self._read(self._proc))
@@ -237,10 +244,18 @@ class SpeechPlayer:
     sentences the user actually heard.
     """
 
-    def __init__(self, bus: EventBus, synth: Synthesizer, *, spawn_: Spawn = spawn) -> None:
+    def __init__(
+        self,
+        bus: EventBus,
+        synth: Synthesizer,
+        *,
+        spawn_: Spawn = spawn,
+        target: str | None = None,
+    ) -> None:
         self.bus = bus
         self.synth = synth
         self.spawn = spawn_
+        self.target = target
         self._op: str | None = None
         self._turn: str | None = None
         self._queue: asyncio.Queue[str] = asyncio.Queue()
@@ -341,8 +356,9 @@ class SpeechPlayer:
 
     async def _write(self, op: str, pcm: bytes) -> None:
         if self._proc is None:
+            target_args = ("--target", self.target) if self.target else ()
             self._proc = await self.spawn(
-                "pw-play", "--raw", "--rate", str(SPEECH_RATE), "--channels", "1", "--format", "s16",
+                "pw-play", *target_args, "--raw", "--rate", str(SPEECH_RATE), "--channels", "1", "--format", "s16",
                 "--latency", "20ms", "-", stdin=PIPE,
             )
         now = time.monotonic()
@@ -398,3 +414,260 @@ class MuteMonitor:
                 self.muted = muted
                 self.bus.emit("audio.mute_changed", {"muted": muted})
             await asyncio.sleep(self.interval_s)
+
+
+class HandsFreeInput:
+    """Continuous capture with streaming VAD turn detection and voice barge-in (M3)."""
+
+    def __init__(
+        self,
+        bus: EventBus,
+        runtime: SpeechRuntime,
+        transcriber: Transcriber,
+        detector: TurnDetector,
+        *,
+        spawn_: Spawn = spawn,
+        stall_s: float = MIC_STALL_S,
+        reconnect_s: float = MIC_RECONNECT_S,
+        target: str | None = None,
+    ) -> None:
+        self.bus = bus
+        self.runtime = runtime
+        self.transcriber = transcriber
+        self.detector = detector
+        self.spawn = spawn_
+        self.stall_s = stall_s
+        self.reconnect_s = reconnect_s
+        self.target = target
+        self.muted = False
+        self._active = False
+        self._autum_speaking = False
+        self._errored = False
+        self._turn: str | None = None
+        self._proc: asyncio.subprocess.Process | None = None
+        self._runner: asyncio.Task | None = None
+        self._awaiting_transcript: dict[str, bytes] = {}
+        self._tasks: set[asyncio.Task] = set()
+        bus.subscribe(
+            self._on_event,
+            {
+                "audio.mute_changed",
+                "runtime.state_changed",
+                "conversation.response_finished",
+                "operation.cancelled",
+            },
+        )
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    @property
+    def capturing(self) -> bool:
+        return self._proc is not None and self._proc.returncode is None
+
+    async def start(self) -> None:
+        """Enable hands-free listening. Starts capturing immediately unless muted."""
+        if self._active:
+            return
+        self._active = True
+        if not self.muted:
+            self._start_runner()
+
+    async def stop(self) -> None:
+        """Disable hands-free listening and release the microphone."""
+        self._active = False
+        await self._stop_runner()
+
+    def _start_runner(self) -> None:
+        if self._runner is None or self._runner.done():
+            self._runner = asyncio.create_task(self._run())
+
+    async def _stop_runner(self) -> None:
+        runner, self._runner = self._runner, None
+        if runner is not None and not runner.done():
+            runner.cancel()
+            try:
+                await runner
+            except asyncio.CancelledError:
+                pass
+        await self._close_capture()
+        self._drop_turn()
+        self.detector.reset()
+
+    async def _run(self) -> None:
+        try:
+            while self._active and not self.muted:
+                ok = await self._capture_session()
+                if not self._active or self.muted:
+                    break
+                if not ok:
+                    await asyncio.sleep(self.reconnect_s)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            await self._close_capture()
+
+    async def _capture_session(self) -> bool:
+        target_args = ("--target", self.target) if self.target else ()
+        try:
+            proc = await self.spawn(
+                "pw-record", *target_args, "--raw", "--rate", str(MIC_RATE), "--channels", "1",
+                "--format", "s16", "--latency", "20ms", "-", stdout=PIPE,
+            )
+        except Exception as exc:
+            self._report_error(str(exc))
+            return False
+        self._proc = proc
+        self.detector.reset()
+        self.bus.emit("audio.capture_started")
+        got_audio = False
+        try:
+            while self._active and not self.muted:
+                timeout = self.stall_s if not got_audio else None
+                try:
+                    frame = await asyncio.wait_for(proc.stdout.readexactly(VAD_FRAME_BYTES), timeout)
+                except asyncio.TimeoutError:
+                    self._report_error(MIC_HELP)
+                    return False
+                except asyncio.IncompleteReadError:
+                    if self._active and not self.muted:
+                        self._report_error("microphone stream ended unexpectedly; retrying")
+                    return False
+                if not got_audio:
+                    got_audio = True
+                    if self._errored:
+                        self._errored = False
+                        self.bus.emit("runtime.component_recovered", {"component": "microphone"})
+                self._handle_frame(frame)
+            return True
+        finally:
+            await self._close_capture()
+            self._drop_turn()
+
+    def _handle_frame(self, frame: bytes) -> None:
+        event = self.detector.feed(frame, speaking=self._autum_speaking)
+        if event is None:
+            return
+        if event.kind == "speech_started":
+            self._turn = new_id()
+            self.bus.emit(
+                "audio.speech_started",
+                {"mode": "hands_free"},
+                provenance=Provenance.USER,
+                turn_id=self._turn,
+            )
+        elif event.kind == "speech_ended" and self._turn is not None:
+            turn, self._turn = self._turn, None
+            ended = self.bus.emit(
+                "audio.speech_ended",
+                {"confidence": round(event.confidence, 3)},
+                provenance=Provenance.USER,
+                turn_id=turn,
+            )
+            if len(event.pcm) < MIN_UTTERANCE_S * MIC_RATE * 2:
+                self._nothing_heard(turn)
+                return
+            wav = wav_bytes(event.pcm, MIC_RATE)
+            self._awaiting_transcript[turn] = wav
+            self.runtime.submit_speech(turn, wav, ended)
+
+    async def _close_capture(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        _kill(proc)
+        try:
+            await asyncio.wait_for(proc.wait(), DEVICE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            pass
+        self.bus.emit("audio.capture_stopped")
+
+    def _drop_turn(self) -> None:
+        if self._turn is not None:
+            turn, self._turn = self._turn, None
+            self._nothing_heard(turn)
+
+    def _nothing_heard(self, turn: str) -> None:
+        self.bus.emit("audio.transcribed", {"text": "", "final": True}, provenance=Provenance.USER, turn_id=turn)
+
+    def _report_error(self, message: str) -> None:
+        self._errored = True
+        self.bus.emit("runtime.component_error", {"component": "microphone", "error": message})
+
+    def _on_event(self, event) -> None:
+        if event.type == "audio.mute_changed":
+            self.muted = bool(event.payload["muted"])
+            if not self._active:
+                return
+            if self.muted:
+                self._track(self._stop_runner())
+            else:
+                self._start_runner()
+        elif event.type == "runtime.state_changed":
+            self._autum_speaking = event.payload["to"] in ("speaking", "thinking")
+        elif event.turn_id in self._awaiting_transcript:
+            self._track(self._transcribe(event.turn_id))
+
+    async def _transcribe(self, turn: str) -> None:
+        wav = self._awaiting_transcript.pop(turn, None)
+        if wav is None:
+            return
+        try:
+            text = await self.transcriber.transcribe(wav)
+        except Exception as exc:
+            self.bus.emit("runtime.component_error", {"component": "transcription", "error": str(exc)})
+            return
+        self.bus.emit("audio.transcribed", {"text": text, "final": True}, provenance=Provenance.USER, turn_id=turn)
+
+    def _track(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+
+class EchoCanceller:
+    """PipeWire WebRTC echo-cancel virtual sink/source pair for hands-free speaker use."""
+
+    def __init__(self, source: str = AEC_SOURCE, sink: str = AEC_SINK) -> None:
+        self.source = source
+        self.sink = sink
+        self._module: str | None = None
+
+    async def start(self) -> bool:
+        """Load module-echo-cancel; returns True when both devices are ready."""
+        await self._unload_leftovers()
+        proc = await asyncio.create_subprocess_exec(
+            "pactl", "load-module", "module-echo-cancel", "aec_method=webrtc",
+            f"source_name={self.source}", f"sink_name={self.sink}",
+            stdout=PIPE, stderr=PIPE,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), 5.0)
+        if proc.returncode != 0:
+            return False
+        self._module = out.decode().strip()
+        for _ in range(50):
+            sinks = await self._pactl("list", "short", "sinks")
+            sources = await self._pactl("list", "short", "sources")
+            if self.sink in sinks and self.source in sources:
+                return True
+            await asyncio.sleep(0.1)
+        await self.stop()
+        return False
+
+    async def stop(self) -> None:
+        if self._module is None:
+            return
+        module, self._module = self._module, None
+        await self._pactl("unload-module", module)
+
+    async def _unload_leftovers(self) -> None:
+        for line in (await self._pactl("list", "modules", "short")).splitlines():
+            if "module-echo-cancel" in line and self.sink in line:
+                await self._pactl("unload-module", line.split()[0])
+
+    @staticmethod
+    async def _pactl(*args: str) -> str:
+        proc = await asyncio.create_subprocess_exec("pactl", *args, stdout=PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), 5.0)
+        return out.decode(errors="replace")

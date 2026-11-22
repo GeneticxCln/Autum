@@ -7,10 +7,12 @@ import wave
 
 import pytest
 
-from autum.audio import MIC_HELP, MuteMonitor, SpeechPlayer, VoiceInput, check_microphone
+from autum.audio import MIC_HELP, HandsFreeInput, MuteMonitor, SpeechPlayer, VoiceInput, check_microphone
 from autum.bus import EventBus
 from autum.events import new_id
-from mocks import Recorder
+from autum.runtime import Mode, Runtime, State
+from autum.vad import VAD_FRAME_BYTES, TurnDetector
+from mocks import MockInference, MockSpeech, Recorder
 
 CHUNK_100MS_24K = b"\x10\x00" * 2400  # 0.1 s of 24 kHz s16 mono
 CHUNK_100MS_16K = b"\x20\x00" * 1600  # 0.1 s of 16 kHz s16 mono
@@ -295,3 +297,193 @@ def test_mute_monitor_reports_changes_only():
 
     log = run(scenario())
     assert [e.payload["muted"] for e in log.of("audio.mute_changed")] == [False, True, False]
+
+
+# ----- hands-free mode (M3) ---------------------------------------------
+
+
+def _hf_frame(tag: int) -> bytes:
+    return bytes([tag & 0xFF]) * VAD_FRAME_BYTES
+
+
+def _hf_detector(**kwargs) -> TurnDetector:
+    defaults = dict(min_speech_ms=96, barge_in_ms=160, silence_ms=160, pre_roll_ms=96, tail_ms=32)
+    defaults.update(kwargs)
+    return TurnDetector(lambda pcm: 0.9 if pcm[0] == 1 else 0.05, **defaults)
+
+
+class StreamingRecordProc:
+    """Fake pw-record whose stream can be pushed frame-by-frame by a test."""
+
+    def __init__(self, initial=()):
+        self.stdout = asyncio.StreamReader()
+        self.returncode = None
+        self._done = asyncio.Event()
+        for chunk in initial:
+            self.stdout.feed_data(chunk)
+
+    def push(self, *frames: bytes) -> None:
+        for f in frames:
+            self.stdout.feed_data(f)
+
+    def eof(self) -> None:
+        if self.returncode is None:
+            self.returncode = 1
+            self.stdout.feed_eof()
+            self._done.set()
+
+    def kill(self) -> None:
+        if self.returncode is None:
+            self.returncode = -9
+            self.stdout.feed_eof()
+            self._done.set()
+
+    async def wait(self) -> int:
+        await self._done.wait()
+        return self.returncode
+
+
+def test_hands_free_completes_a_turn_and_returns_to_listening():
+    async def scenario():
+        bus = EventBus("s")
+        log = Recorder(bus)
+        speech = MockSpeech(bus)
+        runtime = Runtime(bus, MockInference("Hello back."), speech, mode=Mode.HANDS_FREE)
+        proc = StreamingRecordProc()
+
+        async def spawn_(*args, **kw):
+            return proc
+
+        hf = HandsFreeInput(bus, runtime, FakeTranscriber(), _hf_detector(), spawn_=spawn_)
+        await hf.start()
+        await asyncio.sleep(0.02)
+        assert runtime.state is State.LISTENING
+
+        # 2 silence + 12 speech (~384 ms > MIN_UTTERANCE_S) + 5 silence -> full turn
+        proc.push(*([_hf_frame(0)] * 2 + [_hf_frame(1)] * 12 + [_hf_frame(0)] * 5))
+        deadline = time.monotonic() + 2.0
+        while not log.of("audio.transcribed") and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        await runtime.wait_until_settled()
+        end_state = runtime.state
+        end_mic = runtime.microphone
+        await hf.stop()
+        return log, runtime, end_state, end_mic
+
+    log, runtime, end_state, end_mic = run(scenario())
+    assert end_state is State.LISTENING and end_mic == "open"
+    assert [e.payload["mode"] for e in log.of("audio.speech_started")] == ["hands_free"]
+    assert log.of("audio.transcribed")[0].payload == {"text": "what time is it", "final": True}
+    assert runtime.history[0]["content"] == "what time is it"
+    assert runtime.history[1]["content"].strip() == "Hello back."
+
+
+def test_hands_free_barge_in_cancels_active_speech_and_answers_new_turn():
+    async def scenario():
+        bus = EventBus("s")
+        log = Recorder(bus)
+        speech = MockSpeech(bus, synth_s=0.005, per_char_s=0.02)
+        inf = MockInference("First sentence. Second sentence. Third sentence.", token_delay_s=0.002)
+        runtime = Runtime(bus, inf, speech, mode=Mode.HANDS_FREE)
+        proc = StreamingRecordProc()
+
+        async def spawn_(*args, **kw):
+            return proc
+
+        hf = HandsFreeInput(bus, runtime, FakeTranscriber(), _hf_detector(), spawn_=spawn_)
+        await hf.start()
+        await asyncio.sleep(0.02)
+
+        # Trigger an initial reply so Autum is actively SPEAKING
+        runtime.submit_text("tell me a long story")
+        deadline = time.monotonic() + 2.0
+        while runtime.state is not State.SPEAKING and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert runtime.state is State.SPEAKING
+
+        # Short backchannel (3 frames < 5 barge_in frames): must NOT interrupt
+        proc.push(*([_hf_frame(1)] * 3 + [_hf_frame(0)] * 3))
+        await asyncio.sleep(0.03)
+        assert runtime.state is State.SPEAKING
+        assert log.of("operation.cancel_requested") == []
+
+        # Sustained user speech (12 frames >= 5 barge_in frames): interrupts via barge_in!
+        proc.push(*([_hf_frame(1)] * 12 + [_hf_frame(0)] * 5))
+        deadline = time.monotonic() + 2.0
+        while len(log.of("audio.transcribed")) < 1 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        await runtime.wait_until_settled()
+        await hf.stop()
+        return log
+
+    log = run(scenario())
+    cancels = log.of("operation.cancel_requested")
+    assert len(cancels) == 1 and cancels[0].payload["source"] == "barge_in"
+    assert len(log.of("operation.cancelled")) == 1
+    assert len(log.of("audio.speech_started")) == 1
+
+
+def test_hands_free_respects_hard_mute_and_resumes_on_unmute():
+    async def scenario():
+        bus = EventBus("s")
+        log = Recorder(bus)
+        runtime = Runtime(bus, MockInference("ok"), MockSpeech(bus), mode=Mode.HANDS_FREE)
+        procs: list[StreamingRecordProc] = []
+
+        async def spawn_(*args, **kw):
+            p = StreamingRecordProc([_hf_frame(0)])
+            procs.append(p)
+            return p
+
+        hf = HandsFreeInput(bus, runtime, FakeTranscriber(), _hf_detector(), spawn_=spawn_)
+        await hf.start()
+        await asyncio.sleep(0.02)
+        assert runtime.state is State.LISTENING and len(procs) == 1
+
+        # Start speaking, then hardware-mute mid-utterance
+        procs[0].push(*([_hf_frame(1)] * 4))
+        await asyncio.sleep(0.02)
+        assert runtime.state is State.SPEECH_DETECTED
+        bus.emit("audio.mute_changed", {"muted": True})
+        await asyncio.sleep(0.04)
+        muted_state = (runtime.state, runtime.microphone, hf.capturing)
+
+        # Unmute: capture automatically resumes into LISTENING
+        bus.emit("audio.mute_changed", {"muted": False})
+        await asyncio.sleep(0.04)
+        resumed_state = (runtime.state, runtime.microphone, hf.capturing, len(procs))
+        await hf.stop()
+        return log, muted_state, resumed_state
+
+    log, muted_state, resumed_state = run(scenario())
+    assert muted_state == (State.IDLE, "muted", False)
+    assert resumed_state == (State.LISTENING, "open", True, 2)
+    assert log.of("audio.transcribed")[0].payload["text"] == ""
+
+
+def test_hands_free_recovers_after_microphone_disconnect():
+    async def scenario():
+        bus = EventBus("s")
+        log = Recorder(bus)
+        runtime = Runtime(bus, MockInference("ok"), MockSpeech(bus), mode=Mode.HANDS_FREE)
+        procs: list[StreamingRecordProc] = []
+
+        async def spawn_(*args, **kw):
+            p = StreamingRecordProc([_hf_frame(0)])
+            procs.append(p)
+            return p
+
+        hf = HandsFreeInput(bus, runtime, FakeTranscriber(), _hf_detector(), spawn_=spawn_, reconnect_s=0.02)
+        await hf.start()
+        await asyncio.sleep(0.02)
+        procs[0].eof()  # simulate USB microphone disconnect
+        deadline = time.monotonic() + 2.0
+        while not log.of("runtime.component_recovered") and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        await hf.stop()
+        return log, len(procs)
+
+    log, spawn_count = run(scenario())
+    assert spawn_count >= 2
+    assert log.of("runtime.component_error")[0].payload["component"] == "microphone"
+    assert log.of("runtime.component_recovered")[0].payload == {"component": "microphone"}

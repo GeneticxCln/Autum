@@ -154,6 +154,14 @@ class Runtime:
             return State.LISTENING
         return State.IDLE
 
+    def set_mode(self, mode: Mode) -> None:
+        """Switch between push-to-talk and hands-free mode."""
+        if mode is self.mode:
+            return
+        self.mode = mode
+        if self.state in (State.IDLE, State.LISTENING):
+            self._set_state(self.rest_state, "mode_changed")
+
     def _set_state(self, new: State, reason: str, cause: Event | None = None) -> None:
         old = self.state
         if new is not old and new not in TRANSITIONS[old]:

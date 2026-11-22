@@ -195,10 +195,11 @@ ADR 0001.
   other input is ignored. Lines over 8 KiB drop the client.
 
 ```text
-{"command": "talk_start"}              start a push-to-talk turn
-{"command": "talk_finish"}             end it
-{"command": "stop"}                    drop the current utterance and cancel the response
-{"command": "text", "text": "..."}     typed message, 1-2000 characters
+{"command": "talk_start"}                        start a push-to-talk turn (or interrupt in hands-free mode)
+{"command": "talk_finish"}                       end a push-to-talk turn
+{"command": "stop"}                              drop the current utterance and cancel the response
+{"command": "text", "text": "..."}               typed message, 1-2000 characters
+{"command": "set_mode", "mode": "hands_free"}    switch between "push_to_talk" and "hands_free"
 ```
 
 Commands are user actions in a window the user controls, so they carry

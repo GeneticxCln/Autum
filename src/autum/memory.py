@@ -231,16 +231,22 @@ def register_memory_capabilities(
     registry: ToolRegistry,
     store: MemoryStore,
     *,
-    is_observed_turn: Callable[[], bool] | None = None,
+    is_observed_turn: Callable[..., bool] | None = None,
 ) -> None:
     """Register WP8 persistent memory capabilities in the ToolRegistry."""
 
     # 1. Remember / update user fact (REVERSIBLE)
     async def _remember(args: dict[str, Any]) -> dict[str, Any]:
         # §5.1: if untrusted observed content entered this turn (screen, window,
-        # document, note), force Provenance.OBSERVED regardless of model args so
-        # screen text can never escalate into a permanent system-prompt instruction.
-        tainted = bool(is_observed_turn()) if is_observed_turn is not None else False
+        # document, note) or this fact repeats an observed assistant reply from
+        # history, force Provenance.OBSERVED regardless of model args so screen
+        # text can never escalate into a permanent system-prompt instruction.
+        tainted = False
+        if is_observed_turn is not None:
+            try:
+                tainted = bool(is_observed_turn(f"{args.get('key', '')} {args.get('value', '')}"))
+            except TypeError:
+                tainted = bool(is_observed_turn())
         prov = Provenance.OBSERVED if (tainted or args.get("from_observed")) else Provenance.USER
         entry = store.remember(
             str(args["key"]),

@@ -129,6 +129,16 @@ class Config:
         cfg_path = path or default_config_path()
         cfg_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(cfg_path.parent, 0o700)
+        if cfg_path.is_file():
+            try:
+                self.load(cfg_path)
+            except Exception:
+                backup = cfg_path.with_suffix(".toml.corrupt")
+                try:
+                    cfg_path.replace(backup)
+                    os.chmod(backup, 0o600)
+                except OSError:
+                    pass
         tmp = cfg_path.with_suffix(".toml.tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:

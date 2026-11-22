@@ -251,11 +251,24 @@ __reply(out);
         for w in windows:
             if w["id"].lower() == needle or _norm(w["app"]) == needle_n:
                 return w
-        # 2. Substring match on normalized app or title (whole word or >= 4 chars)
+        # 2a. Substring match on normalized app class FIRST across all windows
         for w in windows:
             app_n = _norm(w["app"])
+            if needle_n in app_n:
+                return w
+        # 2b. Title match: require whole-word token match for short queries and
+        #     never let "code" / "vs code" match a "Claude Code" title.
+        is_vscode_query = needle_n in ("code", "vs code", "vscode", "visual studio code")
+        needle_tokens = set(needle_n.split())
+        for w in windows:
             title_n = _norm(w["title"])
-            if needle_n in app_n or needle_n in title_n:
+            if is_vscode_query and "claude" in title_n and "visual studio" not in title_n:
+                continue
+            title_tokens = set(title_n.split())
+            if len(needle_n) <= 5:
+                if needle_tokens and needle_tokens <= title_tokens:
+                    return w
+            elif needle_n in title_n:
                 return w
         # 3. Friendly category aliases (browser, terminal, files, editor)
         aliases = _APP_ALIASES.get(needle_n, ())

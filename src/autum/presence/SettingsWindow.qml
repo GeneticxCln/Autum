@@ -62,11 +62,26 @@ Window {
     function runSelfDiagnosis() {
         if (typeof settingsBridge === "undefined" || !settingsBridge)
             return
+        if (typeof settingsBridge.runDiagnosticsAsync === "function") {
+            settingsBridge.runDiagnosticsAsync()
+            return
+        }
         const rep = settingsBridge.runDiagnostics()
         if (rep) {
             diagnosticOverall = rep.overall_status || "ok"
             diagnosticChecks = rep.checks || []
             diagnosticProblems = rep.recent_problems || []
+        }
+    }
+
+    Connections {
+        target: typeof settingsBridge !== "undefined" ? settingsBridge : null
+        function onDiagnosticsReady(rep) {
+            if (rep) {
+                root.diagnosticOverall = rep.overall_status || "ok"
+                root.diagnosticChecks = rep.checks || []
+                root.diagnosticProblems = rep.recent_problems || []
+            }
         }
     }
 
@@ -115,6 +130,10 @@ Window {
             return
         const cfg = settingsBridge.loadSettings()
         applyDict(cfg)
+        if (cfg && cfg._load_error) {
+            statusError = true
+            statusText = cfg._load_error
+        }
         refreshModels()
         runSelfDiagnosis()
     }

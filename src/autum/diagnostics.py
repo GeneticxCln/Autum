@@ -64,7 +64,9 @@ class DiagnosticsLog:
     ) -> None:
         self.path = path
         self._state_snapshot = state_snapshot
-        self._recent: deque[dict[str, Any]] = deque(maxlen=100)
+        self._recent: deque[dict[str, Any]] = deque(maxlen=MAX_LOG_ENTRIES)
+        self._last_mtime_ns: int = -1
+        self._disk_lines: int = 0
         self.total_errors = 0
         self.total_tool_failures = 0
         self.last_problem: dict[str, Any] | None = None
@@ -85,12 +87,18 @@ class DiagnosticsLog:
 
     def _load_existing(self) -> None:
         if not self.path.is_file():
+            self._last_mtime_ns = -1
+            self._disk_lines = 0
             return
         try:
+            st = self.path.stat()
+            self._last_mtime_ns = st.st_mtime_ns
             lines = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
+            self._disk_lines = len(lines)
         except OSError:
             return
-        for line in lines[-100:]:
+        self._recent.clear()
+        for line in lines[-MAX_LOG_ENTRIES:]:
             try:
                 item = json.loads(line)
                 if isinstance(item, dict):
@@ -98,6 +106,26 @@ class DiagnosticsLog:
                     self.last_problem = item
             except ValueError:
                 continue
+        if len(lines) > MAX_LOG_ENTRIES:
+            self._compact_disk()
+
+    def _compact_disk(self) -> None:
+        self._ensure_file()
+        tmp = self.path.with_suffix(".jsonl.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                for entry in self._recent:
+                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            tmp.replace(self.path)
+            self._disk_lines = len(self._recent)
+            self._last_mtime_ns = self.path.stat().st_mtime_ns
+        except OSError:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def attach_bus(self, bus: EventBus) -> None:
         """Automatically record runtime component errors and failed tool calls."""
@@ -192,6 +220,11 @@ class DiagnosticsLog:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "a", encoding="utf-8") as fh:
                 fh.write(line)
+            self._disk_lines += 1
+            if self._disk_lines > MAX_LOG_ENTRIES:
+                self._compact_disk()
+            else:
+                self._last_mtime_ns = self.path.stat().st_mtime_ns
         except Exception:
             try:
                 os.close(fd)
@@ -209,33 +242,32 @@ class DiagnosticsLog:
         if not self.path.is_file():
             self._recent.clear()
             self.last_problem = None
+            self._last_mtime_ns = -1
+            self._disk_lines = 0
             return
         try:
-            lines = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
+            mtime = self.path.stat().st_mtime_ns
         except OSError:
             return
-        parsed: list[dict[str, Any]] = []
-        for line in lines[-100:]:
-            try:
-                item = json.loads(line)
-                if isinstance(item, dict):
-                    parsed.append(item)
-            except ValueError:
-                continue
-        self._recent.clear()
-        self._recent.extend(parsed)
-        self.last_problem = parsed[-1] if parsed else None
+        if mtime == self._last_mtime_ns:
+            return
+        self._load_existing()
 
     def clear(self) -> int:
         count = len(self._recent)
         self._recent.clear()
         self.last_problem = None
+        self._disk_lines = 0
         self._ensure_file()
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
             os.fchmod(fd, 0o600)
         finally:
             os.close(fd)
+        try:
+            self._last_mtime_ns = self.path.stat().st_mtime_ns
+        except OSError:
+            self._last_mtime_ns = -1
         return count
 
 
@@ -444,7 +476,12 @@ class SelfDiagnostics:
         self._get_live_state = get_live_state
 
     def awareness_prompt(self) -> str:
-        """Compact per-turn self-awareness summary injected into Autum's system prompt."""
+        """Compact per-turn self-awareness summary injected into Autum's system prompt.
+
+        Security note: never injects free-form text from diagnostics.jsonl into the
+        system prompt (only integer problem counts), so logged problem strings can
+        never become standing instructions.
+        """
         cfg = self._get_config()
         st = self._get_live_state()
         chat_m = st.get("chat_model") or cfg.resolved_chat_model()
@@ -455,14 +492,12 @@ class SelfDiagnostics:
         swap = "on" if st.get("dynamic_swap", cfg.dynamic_swap) else "off"
         dirs = st.get("allowed_read_dirs") or [str(p) for p in cfg.resolved_allowed_read_dirs()]
         dirs_summary = ", ".join(dirs) if dirs else "none (fail-closed until user adds a folder in Settings)"
-        last_err = ""
-        if self.log_store.last_problem is not None:
-            lp = self.log_store.last_problem
-            last_err = f" Last logged problem: [{lp.get('component')}] {lp.get('summary')}."
+        prob_count = len(self.log_store.recent_problems(limit=50))
+        prob_note = f" logged_problems={prob_count}." if prob_count else ""
         return (
             f"Self-awareness: Your live configuration is Brain/Chat={chat_m}, Vision={vis_m}, "
             f"Voice={voice_m}, dynamic_vram_swap={swap}, mode={mode}, mic={mic}, "
-            f"allowed_read_dirs={dirs_summary}.{last_err} "
+            f"allowed_read_dirs={dirs_summary}.{prob_note} "
             "You have self_diagnose, log_problem, and list_problems tools: call self_diagnose when asked "
             "about your models, health, audio, or why something failed, and call log_problem whenever you "
             "encounter or confirm a bug so it is saved to diagnostics.jsonl for fixing."

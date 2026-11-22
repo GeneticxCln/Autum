@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, Slot
+from PySide6.QtCore import QObject, Signal, Slot
 
 from autum.config import Config, default_config_path
 
@@ -80,6 +81,8 @@ def query_ollama_models(ollama_url: str = "http://127.0.0.1:11434", timeout_s: f
 class SettingsBridge(QObject):
     """QML-accessible bridge for Autum Settings & persisted orb position."""
 
+    diagnosticsReady = Signal("QVariantMap")
+
     def __init__(
         self,
         model: Any | None = None,
@@ -95,8 +98,10 @@ class SettingsBridge(QObject):
     def loadSettings(self) -> dict[str, Any]:
         try:
             return Config.load(self._config_path).to_dict()
-        except Exception:
-            return Config().to_dict()
+        except Exception as exc:
+            fallback = Config().to_dict()
+            fallback["_load_error"] = f"Invalid config.toml ({exc}); saving will back up to config.toml.corrupt"
+            return fallback
 
     @Slot(result="QVariantMap")
     def defaultSettings(self) -> dict[str, Any]:
@@ -238,6 +243,14 @@ class SettingsBridge(QObject):
             cfg = Config()
         store = DiagnosticsLog(self._diagnostics_path())
         return run_system_health_checks(cfg, problems_log=store)
+
+    @Slot()
+    def runDiagnosticsAsync(self) -> None:
+        def _worker() -> None:
+            rep = self.runDiagnostics()
+            self.diagnosticsReady.emit(rep)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     @Slot(result="QVariantMap")
     def clearProblems(self) -> dict[str, Any]:

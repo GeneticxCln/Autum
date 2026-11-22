@@ -107,6 +107,8 @@ def command_handler(
             case "talk_finish":
                 if getattr(runtime, "mode", Mode.PUSH_TO_TALK) is Mode.PUSH_TO_TALK or waiting:
                     await voice.finish()
+            case "talk_abort":
+                await voice.abort()
             case "stop":
                 await voice.abort()
                 await runtime.cancel()
@@ -370,7 +372,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
             register_memory_capabilities(
                 registry,
                 memory,
-                is_observed_turn=lambda: runtime_ref[0].turn_observed if runtime_ref else False,
+                is_observed_turn=lambda val="": runtime_ref[0].is_observed_content(val) if runtime_ref else False,
             )
             live_allowed_dirs: list[Path] = list(cfg.resolved_allowed_read_dirs())
             live_excluded_windows: list[str] = list(cfg.excluded_windows)
@@ -521,6 +523,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 transcriber.base_url = base
 
                 runtime.direct_audio = new_chat == new_voice and "omni" in new_chat.lower()
+                runtime.max_history = new_cfg.max_history
                 runtime.max_context_chars = new_cfg.max_context_chars
                 approval_gate.require_reversible = new_cfg.require_reversible_approval
                 approval_gate.timeout_s = new_cfg.approval_timeout_s

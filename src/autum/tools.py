@@ -210,7 +210,7 @@ class AuditLog:
 
 _AFFIRMATIVE = re.compile(
     r"^\s*(?:yes|yeah|yep|yup|approve|approved|confirm|confirmed|go ahead|do it|proceed|sure|ok|okay)"
-    r"(?:[\s,]+(?:please|go ahead|do it|proceed|confirm|confirmed|delete it|close it|remove it|forget it))*"
+    r"(?:[\s,]+(?:please|go ahead|do it|proceed|confirm|confirmed|delete it|close it|remove it))*"
     r"[.!\s]*$",
     re.IGNORECASE,
 )

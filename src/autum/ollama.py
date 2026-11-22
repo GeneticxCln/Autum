@@ -132,6 +132,8 @@ class OmniChat:
         if tools:
             body["tools"] = list(tools)
         pending_calls: dict[int, dict[str, str]] = {}
+        in_think = False
+        think_buf = ""
         async with self.client.stream("POST", f"{self.base_url}/v1/chat/completions", json=body) as r:
             if r.status_code != 200:
                 raise RuntimeError(f"Ollama chat failed ({r.status_code}): {(await r.aread())[:200]!r}")
@@ -141,7 +143,32 @@ class OmniChat:
                 choice = json.loads(line[6:])["choices"][0]
                 delta = choice.get("delta", {})
                 if delta.get("content"):
-                    yield delta["content"]
+                    think_buf += str(delta["content"])
+                    while think_buf:
+                        if in_think:
+                            end_idx = think_buf.find("</think>")
+                            if end_idx < 0:
+                                think_buf = think_buf[-7:] if len(think_buf) > 7 else think_buf
+                                break
+                            think_buf = think_buf[end_idx + 8 :]
+                            in_think = False
+                        else:
+                            start_idx = think_buf.find("<think>")
+                            if start_idx < 0:
+                                # Hold back a partial '<think' prefix at chunk boundary
+                                partial = 0
+                                for k in range(1, min(7, len(think_buf) + 1)):
+                                    if "<think>".startswith(think_buf[-k:]):
+                                        partial = k
+                                emit = think_buf[:-partial] if partial else think_buf
+                                think_buf = think_buf[-partial:] if partial else ""
+                                if emit:
+                                    yield emit
+                                break
+                            if start_idx > 0:
+                                yield think_buf[:start_idx]
+                            think_buf = think_buf[start_idx + 7 :]
+                            in_think = True
                 for tc in delta.get("tool_calls") or ():
                     idx = int(tc.get("index", 0))
                     slot = pending_calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
@@ -152,6 +179,8 @@ class OmniChat:
                         slot["name"] += str(fn["name"])
                     if fn.get("arguments"):
                         slot["arguments"] += str(fn["arguments"])
+            if think_buf and not in_think:
+                yield think_buf
         for idx in sorted(pending_calls):
             slot = pending_calls[idx]
             if not slot["name"]:

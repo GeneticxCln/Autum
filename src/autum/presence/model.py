@@ -153,6 +153,10 @@ class PresenceModel(QObject):
     def talkFinish(self) -> None:
         self._send({"command": "talk_finish"})
 
+    @Slot()
+    def talkAbort(self) -> None:
+        self._send({"command": "talk_abort"})
+
     @Slot(str)
     def setMode(self, mode: str) -> None:
         if mode in ("push_to_talk", "hands_free"):

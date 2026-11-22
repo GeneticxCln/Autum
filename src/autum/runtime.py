@@ -178,6 +178,24 @@ class Runtime:
     def turn_observed(self) -> bool:
         return self._turn_observed
 
+    def is_observed_content(self, text: str = "") -> bool:
+        """True if this turn observed external content or `text` repeats an observed assistant reply."""
+        if self._turn_observed:
+            return True
+        clean = (text or "").strip().lower()
+        txt_words = {w for w in clean.split() if len(w) >= 3}
+        for entry in reversed(self.history):
+            if entry.get("role") == "assistant" and entry.get("observed"):
+                obs_text = str(entry.get("content") or "").lower()
+                if not clean:
+                    return True
+                if clean in obs_text:
+                    return True
+                obs_words = {w for w in obs_text.split() if len(w) >= 3}
+                if txt_words and len(txt_words & obs_words) / len(txt_words) >= 0.5:
+                    return True
+        return False
+
     @property
     def microphone(self) -> str:
         if self.muted:
@@ -209,6 +227,7 @@ class Runtime:
         ev = self.bus.emit("runtime.model_ready", {"model": model, "load_ms": round(load_ms, 1)})
         if self.state is State.LOADING:
             self._set_state(self.rest_state, "model_ready", ev)
+            self._drain_pending_announcements()
 
     def set_observation(self, source: str) -> None:
         """Update the active observation indicator and emit perception events (§3.2, §5.4).
@@ -361,6 +380,7 @@ class Runtime:
         text = str(event.payload["text"]).strip()
         if not text:
             self._set_state(self.rest_state, "empty_transcript", event)
+            self._drain_pending_announcements()
             return
         self._start_response(text, "speech", event.turn_id or new_id(), event)
 
@@ -404,6 +424,7 @@ class Runtime:
             if turn_id == self._input_turn:
                 self._input_turn = None
                 self._set_state(self.rest_state, "transcription_failed")
+                self._drain_pending_announcements()
             return
         finally:
             if self._transcribe_task is asyncio.current_task():
@@ -515,6 +536,7 @@ class Runtime:
         if finishing is None:
             if had_tx and self.state in (State.SPEECH_DETECTED, State.PROCESSING):
                 self._set_state(self.rest_state, source)
+                self._drain_pending_announcements()
                 return True
             return had_tx
         await finishing
@@ -721,7 +743,7 @@ class Runtime:
             self._drop_turn_audio(turn_id)
             return  # superseded while draining
         self._drop_turn_audio(turn_id)
-        self.history.append({"role": "assistant", "content": final_text})
+        self.history.append({"role": "assistant", "content": final_text, "observed": self._turn_observed})
         self._trim_history()
         self._op = None
         self.bus.fence.close(op_id)

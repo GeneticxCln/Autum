@@ -168,20 +168,9 @@ Window {
         hovering: talkArea.hoveringOrb && !talkArea.dragging
     }
 
-    Timer {
-        id: holdTalkTimer
-        interval: 180
-        repeat: false
-        onTriggered: {
-            if (talkArea.leftHeld && !talkArea.dragging) {
-                talkArea.talking = true
-                presence.talkStart()
-            }
-        }
-    }
-
-    // Left-drag moves the orb anywhere on screen; hold still briefly to talk;
-    // right-click opens Hands-Free toggle and Settings.
+    // Left-drag moves the orb anywhere on screen; holding talks immediately
+    // with 0 ms clipping (aborted silently if the press turns into a drag);
+    // right-click opens Hands-Free toggle, Self-Diagnose, and Settings.
     MouseArea {
         id: talkArea
         anchors.fill: parent
@@ -210,11 +199,14 @@ Window {
             if (leftHeld) {
                 curX = mouse.x
                 curY = mouse.y
-                if (!dragging && !talking) {
+                if (!dragging) {
                     const moveDist = Math.hypot(mouse.x - pressX, mouse.y - pressY)
                     if (moveDist >= 7) {
-                        holdTalkTimer.stop()
                         dragging = true
+                        if (talking) {
+                            talking = false
+                            presence.talkAbort()
+                        }
                     }
                 }
             }
@@ -236,13 +228,12 @@ Window {
             curY = mouse.y
             leftHeld = true
             dragging = false
-            talking = false
-            holdTalkTimer.restart()
+            talking = true
+            presence.talkStart()
         }
         onReleased: (mouse) => {
             if (mouse.button !== Qt.LeftButton)
                 return
-            holdTalkTimer.stop()
             if (dragging) {
                 const dx = Math.round(curX - pressX)
                 const dy = Math.round(curY - pressY)
@@ -260,9 +251,8 @@ Window {
             talking = false
         }
         onCanceled: {
-            holdTalkTimer.stop()
             if (talking)
-                presence.talkFinish()
+                presence.talkAbort()
             leftHeld = false
             dragging = false
             talking = false

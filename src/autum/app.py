@@ -90,11 +90,11 @@ def log(message: str) -> None:
 
 
 def system_prompt() -> str:
-    """Built per turn, so Autum knows the real time instead of guessing it."""
+    """Built per turn with stable prefix so Ollama's tool-schema KV cache stays hot."""
     now = dt.datetime.now().astimezone()
     return (
-        f"{PERSONA} The current local date and time is {now:%A %d %B %Y, %H:%M} ({now.tzname()}). "
-        "Mention it only when asked, and never guess a different time or date."
+        f"{PERSONA} Today is {now:%A %d %B %Y} ({now.tzname()}). "
+        "For the exact current time, always call the get_time tool rather than guessing."
     )
 
 

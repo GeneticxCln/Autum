@@ -643,9 +643,11 @@ class SelfDiagnostics:
         dirs_summary = ", ".join(dirs) if dirs else "none (fail-closed until user adds a folder in Settings)"
         prob_count = len(self.log_store.recent_problems(limit=50))
         prob_note = f" logged_problems={prob_count}." if prob_count else ""
+        # Keep system prompt stable across turns (avoid volatile fields like mic=open/off
+        # that would bust Ollama's 2k-token tool KV cache on every push-to-talk turn).
         return (
             f"Self-awareness: Your live configuration is Brain/Chat={chat_m}, Vision={vis_m}, "
-            f"Voice={voice_m}, dynamic_vram_swap={swap}, mode={mode}, mic={mic}, "
+            f"Voice={voice_m}, dynamic_vram_swap={swap}, mode={mode}, "
             f"allowed_read_dirs={dirs_summary}.{prob_note} "
             "You have self_diagnose, log_problem, and list_problems tools: call self_diagnose when asked "
             "about your models, health, audio, or why something failed, and call log_problem whenever you "

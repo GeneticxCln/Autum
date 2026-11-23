@@ -36,16 +36,6 @@ PORTAL_PATH = "/org/freedesktop/portal/desktop"
 SCREENSHOT_IFACE = "org.freedesktop.portal.Screenshot"
 REQUEST_IFACE = "org.freedesktop.portal.Request"
 
-BLOCKED_BINARIES: frozenset[str] = frozenset(
-    {
-        "sh", "bash", "zsh", "fish", "dash", "csh", "tcsh", "ksh",
-        "rm", "rmdir", "dd", "mkfs", "fdisk", "parted", "wipefs",
-        "sudo", "su", "doas", "pkexec", "chmod", "chown", "kill", "pkill", "killall",
-        "python", "python3", "perl", "ruby", "node", "php", "lua",
-        "curl", "wget", "nc", "ncat", "ssh", "scp", "rsync", "eval", "exec",
-    }
-)
-
 WindowCapturer = Callable[[float], Awaitable[bytes]]
 AppLauncher = Callable[[str, Path | None], Awaitable[dict[str, Any]]]
 
@@ -237,8 +227,29 @@ def desktop_app_dirs() -> list[Path]:
     return [d for d in dirs if d.is_dir()]
 
 
+def _desktop_entry_meta(path: Path) -> tuple[bool, str]:
+    """Return `(visible, lower_name)` for `[Desktop Entry]`; invisible if Hidden or NoDisplay."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False, ""
+    in_entry = False
+    name = ""
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("["):
+            in_entry = s == "[Desktop Entry]"
+        elif in_entry:
+            low = s.lower()
+            if low in ("hidden=true", "nodisplay=true"):
+                return False, ""
+            if s.startswith("Name=") and not name:
+                name = s.split("=", 1)[1].strip().lower()
+    return True, name
+
+
 def find_desktop_entry(app_query: str, search_dirs: Sequence[Path] | None = None) -> Path | None:
-    """Resolve an app name or desktop ID to an installed `.desktop` file."""
+    """Resolve an app name or desktop ID to a visible installed `.desktop` file."""
     q = app_query.strip().lower()
     if not q or "/" in q or "\\" in q or ".." in q:
         return None
@@ -249,24 +260,16 @@ def find_desktop_entry(app_query: str, search_dirs: Sequence[Path] | None = None
     for d in dirs:
         for p in sorted(d.glob("*.desktop")):
             if p.stem.lower() == stem_target or p.stem.lower().endswith(f".{stem_target}"):
-                return p
+                visible, _ = _desktop_entry_meta(p)
+                if visible:
+                    return p
 
     # Pass 2: exact Name= match inside [Desktop Entry]
     for d in dirs:
         for p in sorted(d.glob("*.desktop")):
-            try:
-                text = p.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            in_entry = False
-            for line in text.splitlines():
-                s = line.strip()
-                if s.startswith("["):
-                    in_entry = s == "[Desktop Entry]"
-                elif in_entry and s.startswith("Name="):
-                    if s.split("=", 1)[1].strip().lower() == stem_target:
-                        return p
-                    break
+            visible, name = _desktop_entry_meta(p)
+            if visible and name == stem_target:
+                return p
     return None
 
 
@@ -508,12 +511,19 @@ class LinuxDesktopIntegration:
             if source not in ("monitor", "window", "both"):
                 raise ValueError("source must be 'monitor', 'window', or 'both'")
             loop = asyncio.get_running_loop()
+            started_flag = [False]
+
+            def _mark_started() -> None:
+                if not started_flag[0]:
+                    started_flag[0] = True
+                    _notify("screen")
+
             if hasattr(watcher, "set_on_started"):
-                watcher.set_on_started(lambda: loop.call_soon_threadsafe(_notify, "screen") if not loop.is_closed() else None)
+                watcher.set_on_started(lambda: loop.call_soon_threadsafe(_mark_started) if not loop.is_closed() else None)
             if hasattr(watcher, "set_on_ended"):
                 watcher.set_on_ended(lambda: loop.call_soon_threadsafe(_end_screen_obs) if not loop.is_closed() else None)
             res = await watcher.start(source)
-            _notify("screen")
+            _mark_started()
             return res
 
         async def _verify_start_watch(_args: dict[str, Any], _res: dict[str, Any]) -> bool:

@@ -83,6 +83,15 @@ Window {
                 root.diagnosticProblems = rep.recent_problems || []
             }
         }
+        function onModelsReady(models) {
+            const prevChat = chatModelBox.editText
+            const prevVision = visionModelBox.editText
+            const prevVoice = voiceModelBox.editText
+            root.installedModels = models || []
+            chatModelBox.editText = prevChat
+            visionModelBox.editText = prevVision
+            voiceModelBox.editText = prevVoice
+        }
     }
 
     function clearProblemLog() {
@@ -141,6 +150,10 @@ Window {
     function refreshModels() {
         if (typeof settingsBridge === "undefined" || !settingsBridge)
             return
+        if (typeof settingsBridge.listOllamaModelsAsync === "function") {
+            settingsBridge.listOllamaModelsAsync(ollamaUrlField.text)
+            return
+        }
         const prevChat = chatModelBox.editText
         const prevVision = visionModelBox.editText
         const prevVoice = voiceModelBox.editText
@@ -916,7 +929,7 @@ Window {
                             Layout.fillWidth: true
                             spacing: 4
                             Text { text: "Max History Turns"; color: root.textPrimary; font.pixelSize: 12 }
-                            StyledSpinBox { id: maxHistorySpin; from: 1; to: 100; Layout.fillWidth: true }
+                            StyledSpinBox { id: maxHistorySpin; from: 2; to: 200; Layout.fillWidth: true }
                         }
 
                         ColumnLayout {

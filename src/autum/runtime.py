@@ -147,6 +147,7 @@ class Runtime:
         self._op: _Operation | None = None
         self._input_turn: str | None = None
         self._transcribe_task: asyncio.Task[None] | None = None
+        self._transcribe_turn: str | None = None
         self._paused_segments: list[str] = []
         self._approval_turn: tuple[str, str, int] | None = None  # (turn_id, source_mode, started_mono_ns)
         self._turn_observed = False
@@ -501,9 +502,30 @@ class Runtime:
         self._input_turn = None
         raw_text = str(event.payload["text"]).strip()
         if not raw_text:
-            self._set_state(self.rest_state, "empty_transcript", event)
-            self._drain_pending_announcements()
-            return
+            # A too-short sound (e.g. "um") ended after a mid-sentence pause:
+            # 1) If the first half is still transcribing, hand control back to it
+            #    so the first half is neither lost nor dropped.
+            if (
+                self._transcribe_task is not None
+                and not self._transcribe_task.done()
+                and self._transcribe_turn is not None
+            ):
+                self._input_turn = self._transcribe_turn
+                if self.state is not State.PROCESSING and State.PROCESSING in TRANSITIONS[self.state]:
+                    self._set_state(State.PROCESSING, "resume_transcription", event)
+                return
+            # 2) If the first half already finished into _paused_segments, answer it
+            #    now instead of leaving stale words stuck onto a future question.
+            if self._paused_segments:
+                raw_text = " ".join(p for p in self._paused_segments if p).strip()
+                self._paused_segments.clear()
+            if not raw_text:
+                self._set_state(self.rest_state, "empty_transcript", event)
+                self._drain_pending_announcements()
+                return
+        elif self._paused_segments:
+            raw_text = " ".join(p for p in (*self._paused_segments, raw_text) if p).strip()
+            self._paused_segments.clear()
         if self.mode is Mode.HANDS_FREE:
             cleaned, is_stop = self.clean_wake_transcript(raw_text)
             if is_stop:
@@ -548,6 +570,7 @@ class Runtime:
                 self._transcribe_and_respond(turn_id, audio, prev_task=prev_task)
             )
             self._transcribe_task = task
+            self._transcribe_turn = turn_id
             self._track(task)
             return
         self._input_turn = None
@@ -582,6 +605,7 @@ class Runtime:
         finally:
             if self._transcribe_task is asyncio.current_task():
                 self._transcribe_task = None
+                self._transcribe_turn = None
         if turn_id != self._input_turn:
             # If the user resumed speaking mid-sentence (a newer _input_turn is active),
             # preserve this first half so the next segment merges into one full sentence.
@@ -622,6 +646,7 @@ class Runtime:
             self._transcribe_task is not None and not self._transcribe_task.done()
         )
         self._input_turn = None
+        self._transcribe_turn = None
         self._paused_segments.clear()
         if self._transcribe_task is not None and not self._transcribe_task.done():
             self._transcribe_task.cancel()

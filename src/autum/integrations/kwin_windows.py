@@ -362,8 +362,11 @@ if (!w) {{ __reply({{error: "window disappeared"}}); }}
 else {{
     w.minimized = false;
     if (spec.desktop !== null && workspace.desktops && workspace.desktops.length > 0) {{
-        var idx = Math.max(0, Math.min(workspace.desktops.length - 1, spec.desktop - 1));
-        w.desktops = [workspace.desktops[idx]];
+        if (spec.desktop < 1 || spec.desktop > workspace.desktops.length) {{
+            __reply({{error: "desktop " + spec.desktop + " does not exist (only " + workspace.desktops.length + " virtual desktop(s) configured)"}});
+            return;
+        }}
+        w.desktops = [workspace.desktops[spec.desktop - 1]];
     }}
     var area = workspace.clientArea(KWin.MaximizeArea, w);
     var nx = w.frameGeometry.x, ny = w.frameGeometry.y, nw = w.frameGeometry.width, nh = w.frameGeometry.height;
@@ -410,9 +413,11 @@ else {{
         js = f"""
 var ds = workspace.desktops || [];
 if (ds.length === 0) {{ __reply({{error: "no virtual desktops available"}}); }}
+else if ({int(desktop)} < 1 || {int(desktop)} > ds.length) {{
+    __reply({{error: "desktop " + {int(desktop)} + " does not exist (only " + ds.length + " virtual desktop(s) configured)"}});
+}}
 else {{
-    var idx = Math.max(0, Math.min(ds.length - 1, {int(desktop)} - 1));
-    workspace.currentDesktop = ds[idx];
+    workspace.currentDesktop = ds[{int(desktop)} - 1];
     var cur = workspace.currentDesktop ? workspace.currentDesktop.x11DesktopNumber : 0;
     __reply({{desktop: cur, total: ds.length}});
 }}

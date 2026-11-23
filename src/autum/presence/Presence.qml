@@ -120,7 +120,7 @@ Window {
     property real phase: 0
     property real lastTick: Date.now()
     Timer {
-        interval: 33
+        interval: (win.st === "idle" && !talkArea.hoveringOrb && !talkArea.dragging && !win.observing && !win.micOpen) ? 50 : 33
         running: true
         repeat: true
         onTriggered: {

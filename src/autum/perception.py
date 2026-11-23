@@ -178,6 +178,16 @@ async def extract_document_text(path: Path, max_chars: int = MAX_DOC_CHARS) -> t
                 pass
             await proc.wait()
             raise TimeoutError("pdftotext timed out after 15s") from None
+        except BaseException:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            raise
         if proc.returncode != 0:
             raise RuntimeError(f"pdftotext failed: {err.decode(errors='replace').strip()[:200]}")
         raw = out.decode("utf-8", errors="replace")
@@ -212,11 +222,12 @@ def register_perception_capabilities(
         mime = IMAGE_MIMES.get(path.suffix.lower())
         if mime is None:
             raise ValueError(f"unsupported image format {path.suffix or '(none)'!r}")
-        data = path.read_bytes()
-        if not data:
+        size = path.stat().st_size
+        if size == 0:
             raise ValueError("image file is empty")
-        if len(data) > MAX_IMAGE_BYTES:
+        if size > MAX_IMAGE_BYTES:
             raise ValueError(f"image exceeds maximum size of {MAX_IMAGE_BYTES // (1024 * 1024)} MiB")
+        data = path.read_bytes()
         question = str(args.get("question") or "Describe what is visible in this image concisely.")
         _notify("image")
         try:

@@ -663,6 +663,76 @@ def test_hands_free_paused_mid_sentence_merges_first_and_second_halves():
     assert user_msgs == ["turn on the kitchen lights please"]
 
 
+def test_hands_free_short_sound_after_pause_neither_drops_nor_leaks_prefix():
+    """Reproduces 'turn on the ... um' in both timings:
+    (a) short sound ends BEFORE first transcription finishes -> first half is still answered,
+    (b) short sound ends AFTER first transcription finishes -> first half is answered immediately
+        and NEVER leaks onto a later question like 'what time is it'.
+    """
+    class ControlledTranscriber:
+        def __init__(self, delay_s: float):
+            self.delay_s = delay_s
+            self.replies = iter(["turn on the", "what time is it"])
+
+        async def transcribe(self, _wav: bytes) -> str:
+            await asyncio.sleep(self.delay_s)
+            return next(self.replies)
+
+    async def scenario(tx_delay_s: float, short_sound_delay_s: float):
+        bus = EventBus("short-um")
+        log = Recorder(bus)
+        tx = ControlledTranscriber(tx_delay_s)
+        runtime = Runtime(
+            bus,
+            MockInference("Done."),
+            MockSpeech(bus),
+            mode=Mode.HANDS_FREE,
+            transcriber=tx,
+            direct_audio=False,
+        )
+        proc = StreamingRecordProc()
+
+        async def spawn_(*args, **kw):
+            return proc
+
+        hf = HandsFreeInput(
+            bus,
+            runtime,
+            tx,
+            _hf_detector(),
+            spawn_=spawn_,
+            voice_barge_in=False,
+            smart_barge_in=True,
+        )
+        await hf.start()
+        await asyncio.sleep(0.02)
+
+        # 1. Speak "turn on the" (12 speech frames > MIN_UTTERANCE_S) + silence
+        proc.push(*([_hf_frame(1)] * 12 + [_hf_frame(0)] * 6))
+        await asyncio.sleep(short_sound_delay_s)
+
+        # 2. Short sound "um" (3 speech frames = 96 ms -> speech_started, then < MIN_UTTERANCE_S -> _nothing_heard)
+        proc.push(*([_hf_frame(1)] * 3 + [_hf_frame(0)] * 6))
+        deadline = time.monotonic() + 2.0
+        while len(log.of("conversation.response_finished")) < 1 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        await runtime.wait_until_settled()
+
+        # 3. Later unrelated question: "what time is it" must arrive clean without "turn on the"
+        proc.push(*([_hf_frame(1)] * 12 + [_hf_frame(0)] * 6))
+        deadline = time.monotonic() + 2.0
+        while len(log.of("conversation.response_finished")) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        await runtime.wait_until_settled()
+        await hf.stop()
+        return [m["content"] for m in runtime.history if m["role"] == "user"]
+
+    # Case A: "um" ends BEFORE "turn on the" finishes transcribing
+    assert run(scenario(tx_delay_s=0.10, short_sound_delay_s=0.02)) == ["turn on the", "what time is it"]
+    # Case B: "turn on the" finishes transcribing BEFORE "um" ends
+    assert run(scenario(tx_delay_s=0.01, short_sound_delay_s=0.05)) == ["turn on the", "what time is it"]
+
+
 def test_hands_free_respects_hard_mute_and_resumes_on_unmute():
     async def scenario():
         bus = EventBus("s")

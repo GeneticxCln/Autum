@@ -407,13 +407,13 @@ def test_self_awareness_self_diagnose_and_problem_logging(tmp_path):
     assert cleared["ok"] is True and cleared["cleared"] == 4
     assert len(bridge.runDiagnostics()["recent_problems"]) == 0
 
-    # 5. Corrupt config.toml is reported by loadSettings and backed up to .corrupt on save
+    # 5. Corrupt config.toml is reported by loadSettings and backed up to .corrupt.<ms> on save
     cfg_path.write_text("not valid toml === ???", encoding="utf-8")
     broken_map = bridge.loadSettings()
     assert "_load_error" in broken_map
     cfg.save(cfg_path)
-    corrupt_backup = cfg_path.with_suffix(".toml.corrupt")
-    assert corrupt_backup.is_file() and (corrupt_backup.stat().st_mode & 0o777) == 0o600
+    backups = list(cfg_path.parent.glob("config.toml.corrupt.*"))
+    assert len(backups) == 1 and (backups[0].stat().st_mode & 0o777) == 0o600
 
     # 6. Approvals reject "Okay, forget it"
     from autum.tools import is_affirmative

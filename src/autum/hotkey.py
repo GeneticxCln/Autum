@@ -19,7 +19,7 @@ PORTAL_PATH = "/org/freedesktop/portal/desktop"
 SHORTCUTS = "org.freedesktop.portal.GlobalShortcuts"
 APP_ID = "autum"
 SHORTCUT_ID = "push-to-talk"
-PREFERRED_KEY = "Meta+Z"
+PREFERRED_KEY = "LOGO+z"
 BIND_TIMEOUT_S = 300  # the user may take a while in the desktop's dialog
 
 
@@ -178,6 +178,8 @@ class PushToTalkKey:
             )
             deadline = time.monotonic() + timeout_s
             while "code" not in reply:
+                if self._stopped.is_set():
+                    raise RuntimeError("stopped")
                 if time.monotonic() > deadline:
                     raise TimeoutError(f"{method} got no answer")
                 if not context.iteration(False):

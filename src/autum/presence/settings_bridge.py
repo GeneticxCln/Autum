@@ -82,6 +82,7 @@ class SettingsBridge(QObject):
     """QML-accessible bridge for Autum Settings & persisted orb position."""
 
     diagnosticsReady = Signal("QVariantMap")
+    modelsReady = Signal("QVariantList")
 
     def __init__(
         self,
@@ -193,6 +194,14 @@ class SettingsBridge(QObject):
     def listOllamaModels(self, ollama_url: str = "") -> list[dict[str, Any]]:
         url = (ollama_url or "").strip() or Config.load(self._config_path).ollama_url
         return query_ollama_models(url)
+
+    @Slot(str)
+    def listOllamaModelsAsync(self, ollama_url: str = "") -> None:
+        def _worker() -> None:
+            models = self.listOllamaModels(ollama_url)
+            self.modelsReady.emit(models)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     @Slot(result="QVariantMap")
     def loadPosition(self) -> dict[str, Any]:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import tomllib
 import urllib.parse
 from dataclasses import dataclass
@@ -133,7 +134,7 @@ class Config:
             try:
                 self.load(cfg_path)
             except Exception:
-                backup = cfg_path.with_suffix(".toml.corrupt")
+                backup = cfg_path.with_name(f"{cfg_path.name}.corrupt.{time.time_ns() // 1_000_000}")
                 try:
                     cfg_path.replace(backup)
                     os.chmod(backup, 0o600)

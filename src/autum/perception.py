@@ -89,21 +89,53 @@ def is_excluded_path(path: Path) -> str | None:
     return None
 
 
-def validate_user_path(raw_path: str, allowed_dirs: Sequence[Path] = ()) -> Path:
-    """Validate and resolve a user-supplied file path against exclusion and scope rules."""
-    if not raw_path or not raw_path.strip():
+def resolve_allowed_path(raw_path: str, allowed_dirs: Sequence[Path]) -> Path:
+    """Resolve a user/model path against `allowed_dirs` (strictly fail-closed).
+
+    Supports relative shorthands like 'Documents' or 'Documents/report.txt' when
+    '/home/user/Documents' is in `allowed_dirs`, while still enforcing exclusion
+    and containment strictly inside `allowed_dirs`.
+    """
+    clean = (raw_path or "").strip()
+    if not clean:
         raise ValueError("path must be a non-empty file path")
     if not allowed_dirs:
         raise PermissionError(
             "file reading requires allowed_read_dirs to be configured in ~/.config/autum/config.toml (plan §5.2)"
         )
-    path = Path(raw_path).expanduser().resolve()
-    reason = is_excluded_path(path)
+    allowed_resolved = [d.expanduser().resolve() for d in allowed_dirs]
+    candidate: Path | None = None
+    p = Path(clean)
+    if p.is_absolute() or clean.startswith("~"):
+        candidate = p.expanduser().resolve()
+    else:
+        rel_parts = [part for part in p.parts if part not in ("", ".")]
+        if not rel_parts or ".." in rel_parts:
+            candidate = p.expanduser().resolve()
+        else:
+            for d in allowed_resolved:
+                if rel_parts[0].lower() == d.name.lower():
+                    candidate = (d / Path(*rel_parts[1:])).resolve() if len(rel_parts) > 1 else d
+                    break
+            if candidate is None:
+                for d in allowed_resolved:
+                    probe = (d / Path(*rel_parts)).resolve()
+                    if (probe == d or d in probe.parents) and probe.exists():
+                        candidate = probe
+                        break
+            if candidate is None:
+                candidate = p.expanduser().resolve()
+    reason = is_excluded_path(candidate)
     if reason is not None:
         raise PermissionError(reason)
-    allowed_resolved = [d.expanduser().resolve() for d in allowed_dirs]
-    if not any(path == d or d in path.parents for d in allowed_resolved):
+    if not any(candidate == d or d in candidate.parents for d in allowed_resolved):
         raise PermissionError("path is outside the user-configured allowed read directories (plan §5.2)")
+    return candidate
+
+
+def validate_user_path(raw_path: str, allowed_dirs: Sequence[Path] = ()) -> Path:
+    """Validate and resolve a user-supplied file path against exclusion and scope rules."""
+    path = resolve_allowed_path(raw_path, allowed_dirs)
     if not path.is_file():
         raise FileNotFoundError(f"file not found: {path}")
     return path

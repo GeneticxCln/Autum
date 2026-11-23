@@ -359,6 +359,33 @@ class DiagnosticsLog:
             return count
 
 
+def gpu_vram_gb() -> float | None:
+    """Return total GPU VRAM in GiB via nvidia-smi if available, else None."""
+    if not shutil.which("nvidia-smi"):
+        return None
+    rc, out = _run_cmd(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+    if rc == 0 and out:
+        try:
+            mib = float(out.splitlines()[0].strip())
+            return round(mib / 1024.0, 2)
+        except ValueError:
+            pass
+    return None
+
+
+def _compact_problem(entry: dict[str, Any]) -> dict[str, Any]:
+    """Strip bulky snapshot objects before sending problem entries into LLM tool context."""
+    out = {
+        "id": entry.get("id", ""),
+        "severity": entry.get("severity", "warning"),
+        "component": entry.get("component", "general"),
+        "summary": str(entry.get("summary", ""))[:200],
+    }
+    if entry.get("suggestion"):
+        out["suggestion"] = str(entry["suggestion"])[:200]
+    return out
+
+
 def _run_cmd(args: list[str], timeout_s: float = 2.0) -> tuple[int, str]:
     try:
         proc = subprocess.run(
@@ -422,16 +449,49 @@ def run_system_health_checks(
         )
     else:
         vram_info = f"In VRAM: {', '.join(loaded_models)}" if loaded_models else "No models currently warm in VRAM"
-        checks.append(
-            {
-                "section": "models",
-                "title": "Ollama & AI Models",
-                "status": "ok",
-                "summary": f"Brain={chat_m} • Vision={vis_m} • Voice={voice_m} (swap={'ON' if cfg.dynamic_swap else 'OFF'})",
-                "details": f"{len(models)} local models installed • {vram_info}",
-                "suggestion": "",
-            }
-        )
+        cpu_spilled = [
+            f"{m['name']} ({m['status']})"
+            for m in models
+            if m.get("loaded") and "% GPU" in str(m.get("status", "")) and str(m.get("status", "")) != "100% GPU"
+        ]
+        total_vram = gpu_vram_gb()
+        size_by_name = {m["name"]: float(m.get("size_gb") or 0.0) for m in models}
+        chat_gb = size_by_name.get(chat_m, 0.0)
+        voice_gb = 0.0 if voice_m == chat_m else size_by_name.get(voice_m, 0.0)
+        vram_tight = total_vram is not None and (chat_gb + voice_gb + 2.5) > total_vram
+        if cpu_spilled:
+            checks.append(
+                {
+                    "section": "models",
+                    "title": "Ollama & AI Models",
+                    "status": "warning",
+                    "summary": f"Model spilling onto CPU: {', '.join(cpu_spilled)} (causes lag)",
+                    "details": f"Brain={chat_m} ({chat_gb:.1f} GB) • Voice={voice_m} ({voice_gb:.1f} GB) • {vram_info}",
+                    "suggestion": "Pick a smaller quantization for Brain/Chat (e.g. Q4 ~8 GB) so both chat and voice stay 100% on GPU with desktop headroom.",
+                }
+            )
+        elif vram_tight:
+            checks.append(
+                {
+                    "section": "models",
+                    "title": "Ollama & AI Models",
+                    "status": "warning",
+                    "summary": f"Tight VRAM ({chat_gb:.1f} + {voice_gb:.1f} GB + desktop > {total_vram:.1f} GB GPU)",
+                    "details": f"Brain={chat_m} • Vision={vis_m} • Voice={voice_m} • {vram_info}",
+                    "suggestion": "Choose a smaller chat model (e.g. gemma4:12b Q4 at 8 GB) to prevent desktop stalls and voice CPU spill.",
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "section": "models",
+                    "title": "Ollama & AI Models",
+                    "status": "ok",
+                    "summary": f"Brain={chat_m} • Vision={vis_m} • Voice={voice_m} (swap={'ON' if cfg.dynamic_swap else 'OFF'})",
+                    "details": f"{len(models)} local models installed • {vram_info}",
+                    "suggestion": "",
+                }
+            )
 
     # 2. Audio & Microphone (PipeWire)
     missing_pw = [t for t in ("pw-record", "pw-play", "wpctl") if not shutil.which(t)]
@@ -617,7 +677,21 @@ def register_diagnostic_capabilities(
 
     async def _exec_self_diagnose(args: dict[str, Any]) -> dict[str, Any]:
         focus = str(args.get("focus") or "all").strip().lower()
-        return await diagnostics.diagnose(focus=focus)
+        rep = await diagnostics.diagnose(focus=focus)
+        # Keep tool output compact so it never overflows 4,096-token local chat models
+        return {
+            "overall_status": rep.get("overall_status", "ok"),
+            "checks": [
+                {
+                    "section": c.get("section", ""),
+                    "status": c.get("status", "ok"),
+                    "summary": str(c.get("summary", ""))[:200],
+                    **({"suggestion": str(c["suggestion"])[:200]} if c.get("suggestion") else {}),
+                }
+                for c in (rep.get("checks") or [])
+            ],
+            "recent_problems": [_compact_problem(p) for p in (rep.get("recent_problems") or [])[:5]],
+        }
 
     async def _exec_log_problem(args: dict[str, Any]) -> dict[str, Any]:
         entry = diagnostics.log_store.record_problem(
@@ -640,7 +714,7 @@ def register_diagnostic_capabilities(
         return {
             "count": len(items),
             "path": str(diagnostics.log_store.path),
-            "problems": items,
+            "problems": [_compact_problem(p) for p in items],
         }
 
     registry.register(

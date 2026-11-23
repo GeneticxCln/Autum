@@ -28,7 +28,7 @@ from autum.integrations import IntegrationContext
 from autum.integrations.kwin_windows import SNAP_POSITIONS, KWinController, normalize_position
 from autum.integrations.screen_watch import ScreenWatcher
 from autum.logging import redact_sensitive
-from autum.perception import is_excluded_path
+from autum.perception import is_excluded_path, resolve_allowed_path
 from autum.tools import Capability, PermissionLevel, ToolRegistry
 
 PORTAL_BUS = "org.freedesktop.portal.Desktop"
@@ -426,13 +426,12 @@ class LinuxDesktopIntegration:
                 raise PermissionError(
                     "list_directory requires allowed_read_dirs to be configured in ~/.config/autum/config.toml (plan §5.2)"
                 )
-            target = Path(str(args["path"])).expanduser().resolve()
-            reason = is_excluded_path(target)
-            if reason is not None:
-                raise PermissionError(reason)
             allowed = [d.expanduser().resolve() for d in context.allowed_read_dirs]
-            if not any(target == d or d in target.parents for d in allowed):
-                raise PermissionError("directory is outside user-configured allowed_read_dirs (plan §5.2)")
+            try:
+                target = resolve_allowed_path(str(args["path"]), context.allowed_read_dirs)
+            except PermissionError as exc:
+                msg = str(exc).replace("path is outside the user-configured allowed read directories", "directory is outside user-configured allowed_read_dirs")
+                raise PermissionError(msg) from None
             if not target.is_dir():
                 raise NotADirectoryError(f"not a directory: {target}")
             entries: list[dict[str, str]] = []

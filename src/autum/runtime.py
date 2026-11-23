@@ -997,8 +997,20 @@ class Runtime:
                 prompt = f"{prompt}{mem_note}" if prompt else mem_note.strip()
         if prompt:
             messages.append({"role": "system", "content": prompt})
-        messages.extend(dict(entry) for entry in self.history)
         tool_schemas = self.tools.openai_tools() if self.tools is not None else None
+        # When tool schemas are attached (~2k tokens), bound history chars sent per turn
+        # so Ollama's default 4,096 context never truncates the system prompt or tool definitions.
+        hist_budget = min(self.max_context_chars, 3600) if tool_schemas else self.max_context_chars
+        selected_hist: list[dict[str, Any]] = []
+        used_chars = 0
+        for entry in reversed(self.history):
+            c_len = len(str(entry.get("content") or ""))
+            if selected_hist and used_chars + c_len > hist_budget:
+                break
+            selected_hist.append(dict(entry))
+            used_chars += c_len
+        selected_hist.reverse()
+        messages.extend(selected_hist)
         max_steps = self.max_agent_steps if tool_schemas else 1
         emitted_parts: list[str] = []
         final_text = ""

@@ -8,13 +8,19 @@ _ABBREVIATIONS = frozenset({"e.g.", "i.e.", "mr.", "mrs.", "ms.", "dr.", "vs.", 
 _SENTENCE_END = re.compile(r"[.!?…]+[\"')\]]*\s|\n+")
 _CLAUSE_END = re.compile(r"[,;:—]\s")
 _THINK = re.compile(r"<think>.*?(?:</think>|$)|</think>", re.DOTALL)
+_TOOL_CALL_TAG = re.compile(r"<\|tool_call>.*?(?:<tool_call\|>|$)|<tool_call\|>|<\|[^|>]{1,40}\|>", re.DOTALL)
 _URL = re.compile(r"https?://\S+")
 _MARKUP = re.compile(r"[*_#`>|~]+")
 _SPACES = re.compile(r"\s+")
 
+_HIDDEN_TAGS: tuple[tuple[str, str], ...] = (
+    ("<think>", "</think>"),
+    ("<|tool_call>", "<tool_call|>"),
+)
+
 
 class SentenceChunker:
-    """Split a token stream at sentence ends while stripping streamed <think>...</think> blocks.
+    """Split a token stream at sentence ends while stripping streamed <think> and raw tool-call blocks.
 
     The first chunk may also end at a clause break once it is at least
     ``first_clause_chars`` long, so the first audio starts sooner. Text
@@ -27,37 +33,49 @@ class SentenceChunker:
         self._first = True
         self._first_clause_chars = first_clause_chars
         self._max_chars = max_chars
-        self._in_think = False
+        self._hidden_close: str | None = None
         self._think_buf = ""
 
     def _filter_think(self, delta: str) -> str:
-        """Strip <think>...</think> across arbitrary token/line boundaries."""
+        """Strip <think>...</think> and raw <|tool_call>...<tool_call|> across arbitrary token boundaries."""
         self._think_buf += delta
         out: list[str] = []
+        max_open = max(len(o) for o, _ in _HIDDEN_TAGS)
         while self._think_buf:
-            if self._in_think:
-                end_idx = self._think_buf.find("</think>")
+            if self._hidden_close is not None:
+                close_tag = self._hidden_close
+                end_idx = self._think_buf.find(close_tag)
                 if end_idx < 0:
-                    self._think_buf = self._think_buf[-7:] if len(self._think_buf) > 7 else self._think_buf
+                    keep = len(close_tag) - 1
+                    self._think_buf = self._think_buf[-keep:] if len(self._think_buf) > keep else self._think_buf
                     break
-                self._think_buf = self._think_buf[end_idx + 8 :]
-                self._in_think = False
+                self._think_buf = self._think_buf[end_idx + len(close_tag) :]
+                self._hidden_close = None
             else:
-                start_idx = self._think_buf.find("<think>")
-                if start_idx < 0:
+                earliest_idx = -1
+                earliest_open = ""
+                earliest_close = ""
+                for open_tag, close_tag in _HIDDEN_TAGS:
+                    idx = self._think_buf.find(open_tag)
+                    if idx >= 0 and (earliest_idx < 0 or idx < earliest_idx):
+                        earliest_idx = idx
+                        earliest_open = open_tag
+                        earliest_close = close_tag
+                if earliest_idx < 0:
                     partial = 0
-                    for k in range(1, min(7, len(self._think_buf) + 1)):
-                        if "<think>".startswith(self._think_buf[-k:]):
+                    for k in range(1, min(max_open, len(self._think_buf) + 1)):
+                        tail = self._think_buf[-k:]
+                        if any(open_tag.startswith(tail) for open_tag, _ in _HIDDEN_TAGS):
                             partial = k
                     emit = self._think_buf[:-partial] if partial else self._think_buf
                     self._think_buf = self._think_buf[-partial:] if partial else ""
                     if emit:
                         out.append(emit)
                     break
-                if start_idx > 0:
-                    out.append(self._think_buf[:start_idx])
-                self._think_buf = self._think_buf[start_idx + 7 :]
-                self._in_think = True
+                if earliest_idx > 0:
+                    out.append(self._think_buf[:earliest_idx])
+                self._think_buf = self._think_buf[earliest_idx + len(earliest_open) :]
+                self._hidden_close = earliest_close
         return "".join(out)
 
     def feed(self, delta: str) -> list[str]:
@@ -71,10 +89,10 @@ class SentenceChunker:
         return chunks
 
     def flush(self) -> list[str]:
-        if self._think_buf and not self._in_think:
+        if self._think_buf and self._hidden_close is None:
             self._buffer += self._think_buf
         self._think_buf = ""
-        self._in_think = False
+        self._hidden_close = None
         rest, self._buffer = self._buffer.strip(), ""
         return [rest] if rest else []
 
@@ -105,8 +123,9 @@ class SentenceChunker:
 
 
 def speakable(text: str) -> str:
-    """Remove what should not be read aloud: reasoning, URLs, markup."""
+    """Remove what should not be read aloud: reasoning, raw tool-call tags, URLs, markup."""
     text = _THINK.sub("", text)
+    text = _TOOL_CALL_TAG.sub("", text)
     text = _URL.sub("", text)
     text = _MARKUP.sub("", text)
     return _SPACES.sub(" ", text).strip()

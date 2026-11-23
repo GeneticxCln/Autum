@@ -85,6 +85,7 @@ class ModelSwapper:
         if prev is not None and prev not in self.pinned:
             self.active = None
             await unload(self.client, model=prev, base_url=self.base_url)
+            await asyncio.sleep(0.25)  # allow CUDA VRAM release before loading next heavy model
         self.active = model
         if self.on_swap is not None and prev is not None:
             self.on_swap(model, prev)
@@ -145,11 +146,13 @@ class OmniChat:
             body["tools"] = list(tools)
         pending_calls: dict[int, dict[str, str]] = {}
         next_auto_idx = 0
-        in_think = False
+        hidden_close: str | None = None
         think_buf = ""
+        hidden_tags = (("<think>", "</think>"), ("<|tool_call>", "<tool_call|>"))
+        max_open = max(len(o) for o, _ in hidden_tags)
 
         async def _run_stream() -> AsyncIterator[str | ToolCall]:
-            nonlocal in_think, think_buf, next_auto_idx
+            nonlocal hidden_close, think_buf, next_auto_idx
             async with self.client.stream("POST", f"{self.base_url}/v1/chat/completions", json=body) as r:
                 if r.status_code != 200:
                     raise RuntimeError(f"Ollama chat failed ({r.status_code}): {(await r.aread())[:200]!r}")
@@ -174,30 +177,40 @@ class OmniChat:
                     if delta.get("content"):
                         think_buf += str(delta["content"])
                         while think_buf:
-                            if in_think:
-                                end_idx = think_buf.find("</think>")
+                            if hidden_close is not None:
+                                end_idx = think_buf.find(hidden_close)
                                 if end_idx < 0:
-                                    think_buf = think_buf[-7:] if len(think_buf) > 7 else think_buf
+                                    keep = len(hidden_close) - 1
+                                    think_buf = think_buf[-keep:] if len(think_buf) > keep else think_buf
                                     break
-                                think_buf = think_buf[end_idx + 8 :]
-                                in_think = False
+                                think_buf = think_buf[end_idx + len(hidden_close) :]
+                                hidden_close = None
                             else:
-                                start_idx = think_buf.find("<think>")
-                                if start_idx < 0:
-                                    # Hold back a partial '<think' prefix at chunk boundary
+                                earliest_idx = -1
+                                earliest_open = ""
+                                earliest_close = ""
+                                for open_tag, close_tag in hidden_tags:
+                                    idx = think_buf.find(open_tag)
+                                    if idx >= 0 and (earliest_idx < 0 or idx < earliest_idx):
+                                        earliest_idx = idx
+                                        earliest_open = open_tag
+                                        earliest_close = close_tag
+                                if earliest_idx < 0:
+                                    # Hold back a partial '<think' or '<|tool_call' prefix at chunk boundary
                                     partial = 0
-                                    for k in range(1, min(7, len(think_buf) + 1)):
-                                        if "<think>".startswith(think_buf[-k:]):
+                                    for k in range(1, min(max_open, len(think_buf) + 1)):
+                                        tail = think_buf[-k:]
+                                        if any(open_tag.startswith(tail) for open_tag, _ in hidden_tags):
                                             partial = k
                                     emit = think_buf[:-partial] if partial else think_buf
                                     think_buf = think_buf[-partial:] if partial else ""
                                     if emit:
                                         yield emit
                                     break
-                                if start_idx > 0:
-                                    yield think_buf[:start_idx]
-                                think_buf = think_buf[start_idx + 7 :]
-                                in_think = True
+                                if earliest_idx > 0:
+                                    yield think_buf[:earliest_idx]
+                                think_buf = think_buf[earliest_idx + len(earliest_open) :]
+                                hidden_close = earliest_close
                     for tc in delta.get("tool_calls") or ():
                         if not isinstance(tc, dict):
                             continue
@@ -227,7 +240,7 @@ class OmniChat:
                                 slot["name"] += str(fn["name"])
                             if fn.get("arguments"):
                                 slot["arguments"] += str(fn["arguments"])
-                if think_buf and not in_think:
+                if think_buf and hidden_close is None:
                     yield think_buf
 
         if self.swapper is not None:

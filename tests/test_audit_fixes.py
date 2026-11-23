@@ -1015,3 +1015,55 @@ def test_approval_gate_rejects_hands_free_for_irreversible_even_if_mode_switched
 
     res, fut = run(scenario())
     assert res is None and fut == "denied"
+
+
+def test_live_audit_fixes_control_tags_relative_paths_and_compact_diagnostics(tmp_path):
+    from autum.diagnostics import DiagnosticsLog, SelfDiagnostics, register_diagnostic_capabilities
+    from autum.perception import resolve_allowed_path
+    from autum.text import SentenceChunker, speakable
+    from autum.tools import ToolCall, ToolRegistry
+
+    # 1. Raw Gemma-4 tool-call tokens never leak into speech
+    chunker = SentenceChunker()
+    chunks = []
+    for tok in ['<|tool_call>call:list_directory{path:<|"|>/home/q/Documents<|"|>}<tool_call|>', " Done."]:
+        chunks.extend(chunker.feed(tok))
+    chunks.extend(chunker.flush())
+    spoken = " ".join(speakable(c) for c in chunks if speakable(c))
+    assert spoken == "Done."
+    assert speakable('<|tool_call>call:foo{}<tool_call|>') == ""
+
+    # 2. Relative folder shorthands ("Documents", "Documents/note.txt") resolve strictly inside allowed_read_dirs
+    docs = tmp_path / "Documents"
+    docs.mkdir()
+    note = docs / "note.txt"
+    note.write_text("hi")
+    assert resolve_allowed_path("Documents", (docs,)) == docs.resolve()
+    assert resolve_allowed_path("Documents/note.txt", (docs,)) == note.resolve()
+    assert resolve_allowed_path("note.txt", (docs,)) == note.resolve()
+    with pytest.raises(PermissionError):
+        resolve_allowed_path("../etc/passwd", (docs,))
+
+    # 3. self_diagnose and list_problems strip bulky snapshot blobs from LLM tool payloads
+    store = DiagnosticsLog(
+        tmp_path / "diag.jsonl",
+        state_snapshot=lambda: {"huge": "x" * 2000},
+    )
+    for i in range(10):
+        store.record_problem("general", f"issue {i}")
+    sd = SelfDiagnostics(store, get_config=Config, get_live_state=lambda: {"huge": "x" * 2000})
+    reg = ToolRegistry()
+    register_diagnostic_capabilities(reg, sd)
+
+    async def scenario():
+        bus = EventBus("compact-diag")
+        op = new_id()
+        bus.fence.open(op)
+        r1 = await reg.execute(ToolCall("d1", "self_diagnose", {"focus": "problems"}), bus=bus, operation_id=op, turn_id="t1")
+        r2 = await reg.execute(ToolCall("d2", "list_problems", {"limit": 5}), bus=bus, operation_id=op, turn_id="t2")
+        return r1.result, r2.result
+
+    r1, r2 = run(scenario())
+    assert len(r1["recent_problems"]) <= 5
+    assert all("snapshot" not in p for p in r1["recent_problems"])
+    assert all("snapshot" not in p for p in r2["problems"])

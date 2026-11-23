@@ -28,7 +28,10 @@ tar -C "${APPDIR}/usr" -xzf "${STAGE}/python.tar.gz" --strip-components=1
 "${APPDIR}/usr/bin/python3" -m pip install --no-cache-dir --upgrade pip
 "${APPDIR}/usr/bin/python3" -m pip install --no-cache-dir "${ROOT}[desktop]"
 
-# Prune unused PySide6/Qt modules that Autum never imports (~200 MiB savings)
+# Uninstall unused PySide6 split wheels (WebEngine ~117 MB, Addons ~59 MB, Pdf ~3 MB)
+"${APPDIR}/usr/bin/python3" -m pip uninstall -y PySide6-WebEngine PySide6-Pdf PySide6-Addons 2>/dev/null || true
+
+# Prune any remaining unused PySide6/Qt modules that Autum never imports
 SITE_PKG="${APPDIR}/usr/lib/python3.12/site-packages"
 PYSIDE_DIR="${SITE_PKG}/PySide6"
 if [[ -d "${PYSIDE_DIR}" ]]; then

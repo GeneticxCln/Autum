@@ -216,7 +216,7 @@ Window {
 
     Timer {
         id: tapTalkTimer
-        interval: 3000
+        interval: 22000
         repeat: false
         onTriggered: {
             if (talkArea.tapTalking) {
@@ -365,6 +365,7 @@ Window {
                 if (heldMs < 240) {
                     tapTalking = true
                     tapTalkTimer.restart()
+                    presence.talkAutoFinish()
                 } else {
                     presence.talkFinish()
                 }

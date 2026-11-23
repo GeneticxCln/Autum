@@ -146,9 +146,18 @@ class VoiceInput:
         self._first_audio = asyncio.Event()
         self._awaiting_transcript: dict[str, bytes] = {}
         self._tasks: set[asyncio.Task] = set()
+        self._auto_finish_turn: str | None = None
+        self._auto_heard_speech: bool = False
+        self._auto_quiet_chunks: int = 0
+        self._auto_total_chunks: int = 0
         bus.subscribe(
             self._on_event,
-            {"audio.mute_changed", "conversation.response_finished", "operation.cancelled"},
+            {
+                "audio.mute_changed",
+                "conversation.response_finished",
+                "operation.cancelled",
+                "runtime.component_error",
+            },
         )
 
     @property
@@ -220,6 +229,14 @@ class VoiceInput:
         # An empty final transcript returns the runtime to rest.
         self.bus.emit("audio.transcribed", {"text": "", "final": True}, provenance=Provenance.USER, turn_id=turn)
 
+    def enable_auto_finish(self) -> None:
+        """Finish the active push-to-talk capture automatically once speech ends with silence."""
+        if self._turn is not None:
+            self._auto_finish_turn = self._turn
+            self._auto_heard_speech = rms(bytes(self._pcm)) >= 0.015 if self._pcm else False
+            self._auto_quiet_chunks = 0
+            self._auto_total_chunks = 0
+
     async def _read(
         self,
         proc: asyncio.subprocess.Process,
@@ -229,6 +246,27 @@ class VoiceInput:
         while chunk := await proc.stdout.read(3200):
             pcm_buf += chunk
             first_audio.set()
+            if self._auto_finish_turn is not None and self._auto_finish_turn == self._turn:
+                self._auto_total_chunks += 1
+                level = rms(chunk)
+                if level >= 0.015:
+                    self._auto_heard_speech = True
+                    self._auto_quiet_chunks = 0
+                elif self._auto_heard_speech:
+                    if level < 0.012:
+                        self._auto_quiet_chunks += 1
+                    else:
+                        self._auto_quiet_chunks = 0
+                # Finish after 800 ms of post-speech silence, 4.5 s of initial silence, or 20 s max.
+                should_finish = (
+                    (self._auto_heard_speech and self._auto_quiet_chunks >= 8)
+                    or (not self._auto_heard_speech and self._auto_total_chunks >= 45)
+                    or self._auto_total_chunks >= 200
+                )
+                if should_finish:
+                    self._auto_finish_turn = None
+                    self._track(self.finish())
+                    return
 
     async def _watch(self, turn: str, first_audio: asyncio.Event) -> None:
         try:
@@ -241,10 +279,11 @@ class VoiceInput:
         proc, reader, watchdog, pcm_buf = self._proc, self._reader, self._watchdog, self._pcm
         was_started = proc is not None
         self._turn = self._proc = self._reader = self._watchdog = None
+        self._auto_finish_turn = None
         if watchdog is not None and watchdog is not asyncio.current_task():
             watchdog.cancel()
         _kill(proc)
-        if reader is not None:
+        if reader is not None and reader is not asyncio.current_task():
             try:
                 await asyncio.wait_for(reader, DEVICE_TIMEOUT_S)
             except asyncio.TimeoutError:
@@ -260,6 +299,9 @@ class VoiceInput:
             self.muted = bool(event.payload["muted"])
             if self.muted and self.capturing:
                 self._track(self.abort())  # captured audio is dropped while muted
+        elif event.type == "runtime.component_error":
+            if event.turn_id in self._awaiting_transcript:
+                self._awaiting_transcript.pop(event.turn_id, None)
         elif event.turn_id in self._awaiting_transcript:
             self._track(self._transcribe(event.turn_id))
 
@@ -314,6 +356,7 @@ class SpeechPlayer:
         self._t0: float | None = None
         self._next_level_s = 0.0
         self._timers: list[asyncio.TimerHandle] = []
+        self._reapers: set[asyncio.Task] = set()
         self._error: Exception | None = None
 
     # SpeechOutput protocol
@@ -373,7 +416,9 @@ class SpeechPlayer:
         proc, self._proc = self._proc, None
         _kill(proc)
         if proc is not None:
-            asyncio.create_task(proc.wait())  # reap it
+            reaper = asyncio.create_task(proc.wait())
+            self._reapers.add(reaper)
+            reaper.add_done_callback(self._reapers.discard)
         for timer in self._timers:
             timer.cancel()
         self._timers.clear()
@@ -430,13 +475,25 @@ class SpeechPlayer:
         if self._written_s() >= self._next_level_s:
             delay = max(0.0, self._written_s() - self._elapsed())
             level = rms(pcm)
-            self._timers.append(asyncio.get_running_loop().call_later(delay, self._level, op, level))
+            loop = asyncio.get_running_loop()
+            if len(self._timers) >= 64:
+                now_loop = loop.time()
+                self._timers = [t for t in self._timers if not t.cancelled() and t.when() > now_loop]
+            self._timers.append(loop.call_later(delay, self._level, op, level))
             self._next_level_s = self._written_s() + LEVEL_EVERY_S
-        self._proc.stdin.write(pcm)
         try:
+            self._proc.stdin.write(pcm)
             await asyncio.wait_for(self._proc.stdin.drain(), DEVICE_TIMEOUT_S)
         except asyncio.TimeoutError:
             raise RuntimeError("the speakers stopped accepting audio; check the audio output") from None
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            dead, self._proc = self._proc, None
+            _kill(dead)
+            if dead is not None:
+                reaper = asyncio.create_task(dead.wait())
+                self._reapers.add(reaper)
+                reaper.add_done_callback(self._reapers.discard)
+            raise RuntimeError("the audio output stream disconnected; check PipeWire/speakers") from None
         self._written += len(pcm)
 
     def _level(self, op: str, level: float) -> None:
@@ -545,11 +602,14 @@ class HandsFreeInput:
         self._runner_gen = 0
         self._awaiting_transcript: dict[str, bytes] = {}
         self._tasks: set[asyncio.Task] = set()
+        self._tx_errored = False
+        self._last_tx_err_at = 0.0
         bus.subscribe(
             self._on_event,
             {
                 "audio.mute_changed",
                 "runtime.state_changed",
+                "runtime.component_error",
                 "speech.playback_started",
                 "speech.output_level",
                 "speech.playback_finished",
@@ -864,6 +924,9 @@ class HandsFreeInput:
                 self.detector.reset()
             elif self.smart_barge_in and event.type == "speech.playback_finished":
                 self._cooldown_until = time.monotonic() + self.post_speech_cooldown_s
+        elif event.type == "runtime.component_error":
+            if event.turn_id in self._awaiting_transcript:
+                self._awaiting_transcript.pop(event.turn_id, None)
         elif event.turn_id in self._awaiting_transcript:
             self._track(self._transcribe(event.turn_id))
 
@@ -883,8 +946,16 @@ class HandsFreeInput:
         """
         try:
             text = (await self.transcriber.transcribe(wav)).strip()
-        except Exception:
+        except Exception as exc:
+            now = time.monotonic()
+            if not self._tx_errored or now - self._last_tx_err_at >= 10.0:
+                self._tx_errored = True
+                self._last_tx_err_at = now
+                self.bus.emit("runtime.component_error", {"component": "transcription", "error": str(exc)})
             return
+        if self._tx_errored:
+            self._tx_errored = False
+            self.bus.emit("runtime.component_recovered", {"component": "transcription"})
         if not text:
             return
         barge_fn = getattr(self.runtime, "barge_in_with_text", None)

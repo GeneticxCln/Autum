@@ -156,6 +156,10 @@ class PresenceModel(QObject):
         self._send({"command": "talk_finish"})
 
     @Slot()
+    def talkAutoFinish(self) -> None:
+        self._send({"command": "talk_auto_finish"})
+
+    @Slot()
     def talkAbort(self) -> None:
         self._send({"command": "talk_abort"})
 

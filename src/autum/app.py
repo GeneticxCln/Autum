@@ -128,6 +128,10 @@ def command_handler(
             case "talk_finish":
                 if getattr(voice, "capturing", False) or getattr(runtime, "mode", Mode.PUSH_TO_TALK) is Mode.PUSH_TO_TALK or waiting:
                     await voice.finish()
+            case "talk_auto_finish":
+                enable_fn = getattr(voice, "enable_auto_finish", None)
+                if callable(enable_fn) and getattr(voice, "capturing", False):
+                    enable_fn()
             case "talk_abort":
                 await voice.abort()
             case "stop":
@@ -244,8 +248,13 @@ class BubbleSupervisor:
         self.proc: asyncio.subprocess.Process | None = None
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._op_lock = asyncio.Lock()
 
     async def start(self) -> None:
+        async with self._op_lock:
+            await self._start_unlocked()
+
+    async def _start_unlocked(self) -> None:
         self.proc = await self.starter()
         if self.proc is not None:
             self._task = asyncio.create_task(self._watch())
@@ -282,11 +291,16 @@ class BubbleSupervisor:
 
     async def reload(self) -> None:
         """Restart the visual presence process cleanly without logging a crash."""
-        await self.stop()
-        self._stop.clear()
-        await self.start()
+        async with self._op_lock:
+            await self._stop_unlocked()
+            self._stop.clear()
+            await self._start_unlocked()
 
     async def stop(self) -> None:
+        async with self._op_lock:
+            await self._stop_unlocked()
+
+    async def _stop_unlocked(self) -> None:
         self._stop.set()
         if self._task is not None:
             self._task.cancel()
@@ -410,9 +424,9 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 if problem:
                     log(problem)
                     return 1
-            if not await check_microphone():
-                log(MIC_HELP)
-                return 1
+            mic_ok = await check_microphone()
+            if not mic_ok:
+                log(f"WARNING: {MIC_HELP}")
 
             voice_model = await resolve_speech_model(client, cfg.model, base_url=cfg.ollama_url)
             if voice_model != cfg.model:
@@ -533,6 +547,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
 
             diag_log = DiagnosticsLog(data_dir / "diagnostics.jsonl", state_snapshot=live_state_snapshot)
             diag_log.attach_bus(bus)
+            if not mic_ok:
+                bus.emit("runtime.component_error", {"component": "microphone", "error": MIC_HELP})
             self_diag = SelfDiagnostics(
                 diag_log,
                 get_config=lambda: active_cfg[0],
@@ -580,7 +596,13 @@ async def main(argv: Sequence[str] | None = None) -> int:
                     hands_free.muted = runtime.muted
                 return hands_free
 
+            reload_lock = asyncio.Lock()
+
             async def reload_live_config() -> None:
+                async with reload_lock:
+                    await _reload_live_config_locked()
+
+            async def _reload_live_config_locked() -> None:
                 nonlocal swapper, silence_ms, barge_in_ms
                 try:
                     new_cfg = Config.load(args.config)
@@ -721,8 +743,24 @@ async def main(argv: Sequence[str] | None = None) -> int:
                                 f"exceed {total_vram:.1f} GB GPU VRAM; this can stall the desktop or push voice onto CPU. "
                                 "Pick a smaller quantization (e.g. gemma4:12b at 8.0 GB) in Settings for smooth 100% GPU speed."
                             )
-                    # Always unload any stale heavy model first so voice_model claims 100% GPU VRAM
-                    if chat_model != voice_model:
+                    voice_hot_gpu = False
+                    try:
+                        ps_resp = await client.get(f"{cfg.ollama_url.rstrip('/')}/api/ps", timeout=2.0)
+                        if ps_resp.status_code == 200:
+                            for entry in (ps_resp.json() or {}).get("models") or ():
+                                if not isinstance(entry, dict):
+                                    continue
+                                name = str(entry.get("name") or "")
+                                sz = int(entry.get("size") or 0)
+                                vram = int(entry.get("size_vram") or 0)
+                                if name == voice_model and vram > 0 and (sz == 0 or vram >= sz * 0.9):
+                                    voice_hot_gpu = True
+                                    break
+                    except (httpx.HTTPError, ValueError):
+                        pass
+                    # Only unload chat_model before preloading voice_model if voice_model
+                    # is not already resident in GPU VRAM, avoiding unnecessary cold reloads.
+                    if not voice_hot_gpu and chat_model != voice_model:
                         await unload(client, model=chat_model, base_url=cfg.ollama_url)
                     if vision_model not in (voice_model, chat_model):
                         await unload(client, model=vision_model, base_url=cfg.ollama_url)

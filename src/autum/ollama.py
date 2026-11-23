@@ -87,6 +87,11 @@ class ModelSwapper:
             await unload(self.client, model=prev, base_url=self.base_url)
             await asyncio.sleep(0.25)  # allow CUDA VRAM release before loading next heavy model
         self.active = model
+        if prev is not None:
+            try:
+                await preload(self.client, model=model, base_url=self.base_url)
+            except (httpx.HTTPError, RuntimeError):
+                pass
         if self.on_swap is not None and prev is not None:
             self.on_swap(model, prev)
 
@@ -139,6 +144,7 @@ class OmniChat:
             "stream": True,
             "temperature": 0,
             "seed": SEED,
+            "keep_alive": -1,
         }
         if self.reasoning_effort is not None:
             body["reasoning_effort"] = self.reasoning_effort

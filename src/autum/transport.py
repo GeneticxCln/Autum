@@ -30,6 +30,7 @@ MAX_TEXT = 2000
 COMMANDS = {
     "talk_start",
     "talk_finish",
+    "talk_auto_finish",
     "talk_abort",
     "stop",
     "text",

@@ -392,33 +392,19 @@ def run_system_health_checks(
             }
         )
 
-    # 3. Desktop Eyes & Hands (Wayland / KWin / Desktop file)
+    # 3. Desktop Eyes & Hands (Wayland / X11)
     wayland = os.environ.get("WAYLAND_DISPLAY", "")
     desktop_env = os.environ.get("XDG_CURRENT_DESKTOP", "Linux")
-    desktop_file = Path.home() / ".local" / "share" / "applications" / "autum.desktop"
-    has_desktop_file = desktop_file.is_file() or Path("/usr/share/applications/autum.desktop").is_file()
-    if not has_desktop_file:
-        checks.append(
-            {
-                "section": "desktop",
-                "title": "Desktop & Global Shortcut",
-                "status": "warning",
-                "summary": f"{desktop_env} ({'Wayland' if wayland else 'X11'}) active; autum.desktop not installed for KDE shortcut portal",
-                "details": "Hold-to-talk on the orb and Hands-Free mode work normally; KDE GlobalShortcuts needs autum.desktop.",
-                "suggestion": "Run: cp contrib/autum.desktop ~/.local/share/applications/autum.desktop",
-            }
-        )
-    else:
-        checks.append(
-            {
-                "section": "desktop",
-                "title": "Desktop & Global Shortcut",
-                "status": "ok",
-                "summary": f"{desktop_env} ({'Wayland' if wayland else 'X11'}) • Eyes & Hands enabled • autum.desktop present",
-                "details": f"Integrations: {', '.join(cfg.enabled_integrations) or 'none'}",
-                "suggestion": "",
-            }
-        )
+    checks.append(
+        {
+            "section": "desktop",
+            "title": "Desktop Integration",
+            "status": "ok",
+            "summary": f"{desktop_env} ({'Wayland' if wayland else 'X11'}) • Eyes & Hands ready",
+            "details": f"Integrations: {', '.join(cfg.enabled_integrations) or 'none'}",
+            "suggestion": "",
+        }
+    )
 
     # 4. Privacy & Folder Permissions
     allowed = cfg.resolved_allowed_read_dirs()

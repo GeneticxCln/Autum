@@ -287,6 +287,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Hands-free speech duration in milliseconds required to interrupt Autum",
     )
+    parser.add_argument(
+        "--hotkey",
+        action="store_true",
+        default=False,
+        help="Optional: register a desktop global push-to-talk shortcut via XDG GlobalShortcuts",
+    )
     return parser.parse_args(argv)
 
 
@@ -608,29 +614,32 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 await make_hands_free().start()
                 if aec is None:
                     log("hands-free mode active (use headphones or pass --aec when using speakers).")
-            def on_hotkey_status(msg: str) -> None:
-                log(msg)
-                if "unavailable" in msg.lower():
-                    diag_log.record_problem(
-                        component="hotkey",
-                        summary=msg,
-                        severity="warning",
-                        source="startup",
-                    )
+            hotkey: PushToTalkKey | None = None
+            if args.hotkey:
+                def on_hotkey_status(msg: str) -> None:
+                    log(msg)
+                    if "unavailable" in msg.lower():
+                        diag_log.record_problem(
+                            component="hotkey",
+                            summary=msg,
+                            severity="warning",
+                            source="startup",
+                        )
 
-            hotkey = PushToTalkKey(
-                loop,
-                on_press=lambda: loop.create_task(handle_command({"command": "talk_start"})),
-                on_release=lambda: loop.create_task(handle_command({"command": "talk_finish"})),
-                on_status=on_hotkey_status,
-            )
-            hotkey.start()
+                hotkey = PushToTalkKey(
+                    loop,
+                    on_press=lambda: loop.create_task(handle_command({"command": "talk_start"})),
+                    on_release=lambda: loop.create_task(handle_command({"command": "talk_finish"})),
+                    on_status=on_hotkey_status,
+                )
+                hotkey.start()
             swap_note = ", dynamic VRAM swap" if swapper is not None else ""
             log(f"running ({mode.value}, chat={chat_model}, vision={vision_model}, voice={voice_model}{swap_note}). Stop with Ctrl+C.")
             try:
                 await stop.wait()
             finally:
-                hotkey.stop()
+                if hotkey is not None:
+                    hotkey.stop()
                 await bubble.stop()
                 await integrations.shutdown()
                 await server.close()

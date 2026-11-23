@@ -147,6 +147,7 @@ class Runtime:
         self._op: _Operation | None = None
         self._input_turn: str | None = None
         self._transcribe_task: asyncio.Task[None] | None = None
+        self._paused_segments: list[str] = []
         self._approval_turn: tuple[str, str, int] | None = None  # (turn_id, source_mode, started_mono_ns)
         self._turn_observed = False
         self.current_spoken_text: str = ""
@@ -538,24 +539,43 @@ class Runtime:
         if turn_id != self._input_turn:
             return  # superseded by a newer utterance
         if not self.direct_audio and self.transcriber is not None:
-            if self._transcribe_task is not None and not self._transcribe_task.done():
-                self._transcribe_task.cancel()
-            task = asyncio.get_running_loop().create_task(self._transcribe_and_respond(turn_id, audio))
+            prev_task = (
+                self._transcribe_task
+                if self._transcribe_task is not None and not self._transcribe_task.done()
+                else None
+            )
+            task = asyncio.get_running_loop().create_task(
+                self._transcribe_and_respond(turn_id, audio, prev_task=prev_task)
+            )
             self._transcribe_task = task
             self._track(task)
             return
         self._input_turn = None
         self._start_response("", "speech", turn_id, cause, audio=audio)
 
-    async def _transcribe_and_respond(self, turn_id: str, wav: bytes) -> None:
+    async def _transcribe_and_respond(
+        self,
+        turn_id: str,
+        wav: bytes,
+        *,
+        prev_task: asyncio.Task[None] | None = None,
+    ) -> None:
+        if prev_task is not None:
+            try:
+                await prev_task
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
         try:
-            text = await self.transcriber.transcribe(wav)
+            text = (await self.transcriber.transcribe(wav)).strip()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self.bus.emit("runtime.component_error", {"component": "transcription", "error": str(exc)})
             if turn_id == self._input_turn:
                 self._input_turn = None
+                self._paused_segments.clear()
                 self._set_state(self.rest_state, "transcription_failed")
                 self._drain_pending_announcements()
             return
@@ -563,8 +583,16 @@ class Runtime:
             if self._transcribe_task is asyncio.current_task():
                 self._transcribe_task = None
         if turn_id != self._input_turn:
-            return  # superseded by cancel or a newer turn while transcribing
-        self.bus.emit("audio.transcribed", {"text": text, "final": True}, provenance=Provenance.USER, turn_id=turn_id)
+            # If the user resumed speaking mid-sentence (a newer _input_turn is active),
+            # preserve this first half so the next segment merges into one full sentence.
+            if self._input_turn is not None and text:
+                if len(self._paused_segments) < 8:
+                    self._paused_segments.append(text)
+            return
+        parts = [*self._paused_segments, text] if text else list(self._paused_segments)
+        self._paused_segments.clear()
+        full_text = " ".join(p for p in parts if p).strip()
+        self.bus.emit("audio.transcribed", {"text": full_text, "final": True}, provenance=Provenance.USER, turn_id=turn_id)
 
     async def _resolve_approval_audio(self, wav: bytes, source: str, started_ns: int) -> None:
         try:
@@ -594,6 +622,7 @@ class Runtime:
             self._transcribe_task is not None and not self._transcribe_task.done()
         )
         self._input_turn = None
+        self._paused_segments.clear()
         if self._transcribe_task is not None and not self._transcribe_task.done():
             self._transcribe_task.cancel()
         self._transcribe_task = None

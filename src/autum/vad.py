@@ -75,7 +75,7 @@ class TurnDetector:
         silence_ms: int = 700,
         pre_roll_ms: int = 320,
         tail_ms: int = 160,
-        max_utterance_s: float = 30.0,
+        max_utterance_s: float = 120.0,
     ) -> None:
         self.scorer = scorer
         self.threshold = threshold

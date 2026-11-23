@@ -606,6 +606,63 @@ def test_hands_free_smart_barge_in_ignores_speaker_echo_and_interrupts_on_wake_q
     assert started and not ended_early and det.in_speech
 
 
+def test_hands_free_paused_mid_sentence_merges_first_and_second_halves():
+    class SlowSequentialTranscriber:
+        def __init__(self):
+            self.replies = iter(["turn on the", "kitchen lights please"])
+
+        async def transcribe(self, _wav: bytes) -> str:
+            await asyncio.sleep(0.08)
+            return next(self.replies)
+
+    async def scenario():
+        bus = EventBus("pause-merge")
+        log = Recorder(bus)
+        tx = SlowSequentialTranscriber()
+        runtime = Runtime(
+            bus,
+            MockInference("Turning on the kitchen lights."),
+            MockSpeech(bus),
+            mode=Mode.HANDS_FREE,
+            transcriber=tx,
+            direct_audio=False,
+        )
+        proc = StreamingRecordProc()
+
+        async def spawn_(*args, **kw):
+            return proc
+
+        hf = HandsFreeInput(
+            bus,
+            runtime,
+            tx,
+            _hf_detector(),
+            spawn_=spawn_,
+            voice_barge_in=False,
+            smart_barge_in=True,
+        )
+        await hf.start()
+        await asyncio.sleep(0.02)
+
+        # First half: "turn on the" -> enters State.PROCESSING while transcribing (80 ms)
+        proc.push(*([_hf_frame(1)] * 12 + [_hf_frame(0)] * 6))
+        await asyncio.sleep(0.02)
+        assert runtime.state is State.PROCESSING
+
+        # User resumes speaking mid-transcription: "kitchen lights please"
+        proc.push(*([_hf_frame(1)] * 12 + [_hf_frame(0)] * 6))
+        deadline = time.monotonic() + 2.0
+        while len(log.of("audio.transcribed")) < 1 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        await runtime.wait_until_settled()
+        await hf.stop()
+        return runtime
+
+    rt = run(scenario())
+    user_msgs = [m["content"] for m in rt.history if m["role"] == "user"]
+    assert user_msgs == ["turn on the kitchen lights please"]
+
+
 def test_hands_free_respects_hard_mute_and_resumes_on_unmute():
     async def scenario():
         bus = EventBus("s")

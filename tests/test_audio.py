@@ -733,6 +733,91 @@ def test_hands_free_short_sound_after_pause_neither_drops_nor_leaks_prefix():
     assert run(scenario(tx_delay_s=0.01, short_sound_delay_s=0.05)) == ["turn on the", "what time is it"]
 
 
+def test_wake_word_mode_ignores_chatter_wakes_on_name_and_interrupts_on_name():
+    class ScriptedTranscriber:
+        def __init__(self, items):
+            self.items = iter(items)
+
+        async def transcribe(self, _wav: bytes) -> str:
+            return next(self.items)
+
+    async def scenario():
+        bus = EventBus("wake")
+        log = Recorder(bus)
+        tx = ScriptedTranscriber(
+            [
+                "so anyway I told my friend about the movie",   # ignored (no "Autum")
+                "Autum, what time is it?",                      # wake + question in one breath
+                "just chatting in the room again",              # ignored again after answering
+                "Hey Autum",                                    # bare wake call -> "Yes?" + 12s window
+                "open Chrome please",                           # answered inside wake window
+            ]
+        )
+        runtime = Runtime(
+            bus,
+            MockInference("Sure thing."),
+            MockSpeech(bus),
+            mode=Mode.WAKE_WORD,
+            transcriber=tx,
+            direct_audio=False,
+        )
+        proc = StreamingRecordProc()
+
+        async def spawn_(*args, **kw):
+            return proc
+
+        hf = HandsFreeInput(
+            bus,
+            runtime,
+            tx,
+            _hf_detector(),
+            spawn_=spawn_,
+            voice_barge_in=False,
+            smart_barge_in=True,
+        )
+        await hf.start()
+        await asyncio.sleep(0.02)
+
+        async def say_turn():
+            proc.push(*([_hf_frame(1)] * 12 + [_hf_frame(0)] * 6))
+            await asyncio.sleep(0.06)
+            await runtime.wait_until_settled()
+
+        # 1. Background chatter -> ignored, no history added
+        await say_turn()
+        assert [m["content"] for m in runtime.history if m["role"] == "user"] == []
+
+        # 2. "Autum, what time is it?" -> answered with stripped prefix
+        await say_turn()
+        assert [m["content"] for m in runtime.history if m["role"] == "user"] == ["what time is it?"]
+
+        # 3. Chatter again -> ignored
+        await say_turn()
+        assert [m["content"] for m in runtime.history if m["role"] == "user"] == ["what time is it?"]
+
+        # 4. Bare "Hey Autum" -> opens wake window & announces "Yes?"
+        await say_turn()
+        assert [m["content"] for m in runtime.history if m["role"] == "user"] == ["what time is it?"]
+
+        # 5. Follow-up inside wake window -> answered without repeating "Autum"
+        await say_turn()
+        assert [m["content"] for m in runtime.history if m["role"] == "user"] == [
+            "what time is it?",
+            "open Chrome please",
+        ]
+
+        # 6. While speaking in WAKE_WORD mode: chatter without "Autum" does NOT interrupt,
+        #    while "Autum, tell me a joke" DOES interrupt & answer!
+        assert runtime.barge_in_with_text("background chatter in the room") is False
+        assert runtime.barge_in_with_text("Autum, tell me a joke") is True
+        await runtime.wait_until_settled()
+        await hf.stop()
+        return [m["content"] for m in runtime.history if m["role"] == "user"]
+
+    user_msgs = run(scenario())
+    assert user_msgs == ["what time is it?", "open Chrome please", "tell me a joke"]
+
+
 def test_hands_free_respects_hard_mute_and_resumes_on_unmute():
     async def scenario():
         bus = EventBus("s")

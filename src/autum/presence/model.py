@@ -85,7 +85,7 @@ class PresenceModel(QObject):
                 if p["to"] != self._state:
                     self._pending.append(event.mono_ns)
                 self._state, self._microphone, self._observation = p["to"], p["microphone"], p["observation"]
-                if "mode" in p and p["mode"] in ("push_to_talk", "hands_free"):
+                if "mode" in p and p["mode"] in ("push_to_talk", "wake_word", "hands_free"):
                     self._mode = str(p["mode"])
                 if self._state != "speaking":
                     self._set_level(0.0)
@@ -159,7 +159,7 @@ class PresenceModel(QObject):
 
     @Slot(str)
     def setMode(self, mode: str) -> None:
-        if mode in ("push_to_talk", "hands_free"):
+        if mode in ("push_to_talk", "wake_word", "hands_free"):
             self._send({"command": "set_mode", "mode": mode})
 
     @Slot()

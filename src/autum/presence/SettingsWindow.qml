@@ -111,7 +111,7 @@ Window {
         chatThinkSwitch.checked = Boolean(cfg.chat_think)
         ollamaUrlField.text = cfg.ollama_url || "http://127.0.0.1:11434"
 
-        selectedMode = (cfg.mode === "hands_free") ? "hands_free" : "push_to_talk"
+        selectedMode = (cfg.mode === "hands_free" || cfg.mode === "wake_word") ? cfg.mode : "push_to_talk"
         aecSwitch.checked = Boolean(cfg.aec)
         voicePresetField.text = cfg.voice || "female-american-english"
         silenceSpin.value = Math.max(200, Math.min(3000, Number(cfg.silence_ms || 700)))
@@ -124,7 +124,7 @@ Window {
         approvalTimeoutSpin.value = Math.max(5, Math.min(120, Math.round(Number(cfg.approval_timeout_s || 20))))
         excludedWindowsField.text = (cfg.excluded_windows || []).join(", ")
 
-        maxHistorySpin.value = Math.max(1, Math.min(100, Number(cfg.max_history || 20)))
+        maxHistorySpin.value = Math.max(2, Math.min(200, Number(cfg.max_history || 20)))
         maxContextSpin.value = Math.max(1000, Math.min(64000, Number(cfg.max_context_chars || 10000)))
         const lvl = String(cfg.log_level || "INFO").toUpperCase()
         const idx = logLevelBox.model.indexOf(lvl)
@@ -527,7 +527,9 @@ Window {
                         id: liveLabel
                         anchors.centerIn: parent
                         text: presence.connected
-                              ? ("● Live • " + (presence.mode === "hands_free" ? "Hands-Free" : "Push-to-Talk"))
+                              ? ("● Live • " + (presence.mode === "hands_free"
+                                                ? "Hands-Free"
+                                                : (presence.mode === "wake_word" ? "Wake Word (\"Autum\")" : "Push-to-Talk")))
                               : "○ Runtime Offline"
                         color: presence.connected ? root.accentGlow : root.dangerSoft
                         font.pixelSize: 11
@@ -675,7 +677,7 @@ Window {
                 // 2. Listening & Voice
                 SectionCard {
                     heading: "Listening & Voice"
-                    subtitle: "Switch between Hold-to-Talk and Hands-Free listening, and tune speech detection."
+                    subtitle: "Choose Push-to-Talk (hold orb with mouse), Wake Word (only responds when you say 'Autum'), or full Hands-Free."
 
                     RowLayout {
                         Layout.fillWidth: true
@@ -691,6 +693,7 @@ Window {
                             Repeater {
                                 model: [
                                     { "id": "push_to_talk", "label": "Push-to-Talk" },
+                                    { "id": "wake_word", "label": "Wake (\"Autum\")" },
                                     { "id": "hands_free", "label": "Hands-Free" }
                                 ]
                                 delegate: Button {
@@ -708,7 +711,7 @@ Window {
                                     }
                                     background: Rectangle {
                                         implicitHeight: 32
-                                        implicitWidth: 112
+                                        implicitWidth: 110
                                         radius: 8
                                         color: parent.active ? root.accentIce : (parent.hovered ? root.bgHover : root.bgInput)
                                         border.width: 1

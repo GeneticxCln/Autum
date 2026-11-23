@@ -245,7 +245,7 @@ Window {
             // - At rest, start recording at 0 ms so the first syllable is never clipped.
             // - While speaking/busy, use a 140 ms drag grace window so dragging the orb
             //   out of the way never interrupts Autum's reply or opens the microphone.
-            if (presence.mode !== "hands_free" || win.st === "waiting_for_approval") {
+            if (presence.mode === "push_to_talk" || win.st === "waiting_for_approval") {
                 if (win.speaking || win.busy) {
                     talking = false
                     dragGraceTalkTimer.restart()
@@ -293,8 +293,15 @@ Window {
     Menu {
         id: contextMenu
         popupType: Popup.Window
-        width: 224
+        width: 248
         padding: 6
+
+        function switchMode(targetMode) {
+            if (typeof settingsBridge !== "undefined" && settingsBridge)
+                settingsBridge.setModeAndPersist(targetMode)
+            else
+                presence.setMode(targetMode)
+        }
 
         background: Rectangle {
             color: "#101724"
@@ -345,15 +352,31 @@ Window {
         }
 
         StyledMenuItem {
-            text: "Hands-Free Mode"
-            badge: presence.mode === "hands_free" ? "ON" : "OFF"
+            text: "Push-to-Talk (Mouse)"
+            badge: presence.mode === "push_to_talk" ? "ON" : ""
+            badgeActive: presence.mode === "push_to_talk"
+            onTriggered: contextMenu.switchMode("push_to_talk")
+        }
+
+        StyledMenuItem {
+            text: "Wake Word (\"Autum\")"
+            badge: presence.mode === "wake_word" ? "ON" : ""
+            badgeActive: presence.mode === "wake_word"
+            onTriggered: contextMenu.switchMode("wake_word")
+        }
+
+        StyledMenuItem {
+            text: "Hands-Free"
+            badge: presence.mode === "hands_free" ? "ON" : ""
             badgeActive: presence.mode === "hands_free"
-            onTriggered: {
-                const next = presence.mode === "hands_free" ? "push_to_talk" : "hands_free"
-                if (typeof settingsBridge !== "undefined" && settingsBridge)
-                    settingsBridge.setModeAndPersist(next)
-                else
-                    presence.setMode(next)
+            onTriggered: contextMenu.switchMode("hands_free")
+        }
+
+        MenuSeparator {
+            padding: 4
+            contentItem: Rectangle {
+                implicitHeight: 1
+                color: "#223047"
             }
         }
 

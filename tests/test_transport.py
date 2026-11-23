@@ -28,6 +28,7 @@ def test_commands_are_validated():
     assert parse_command(b'{"command": "talk_start"}') == {"command": "talk_start"}
     assert parse_command(b'{"command": "text", "text": "hello"}') == {"command": "text", "text": "hello"}
     assert parse_command(b'{"command": "set_mode", "mode": "hands_free"}') == {"command": "set_mode", "mode": "hands_free"}
+    assert parse_command(b'{"command": "set_mode", "mode": "wake_word"}') == {"command": "set_mode", "mode": "wake_word"}
     assert parse_command(b'{"command": "set_mode", "mode": "push_to_talk"}') == {"command": "set_mode", "mode": "push_to_talk"}
     assert parse_command(b'{"command": "approve"}') == {"command": "approve"}
     assert parse_command(b'{"command": "deny"}') == {"command": "deny"}
@@ -36,7 +37,7 @@ def test_commands_are_validated():
     }
     for bad in [b"not json", b"[1]", b'{"command": "rm -rf"}', b'{"command": "stop", "extra": 1}',
                 b'{"command": "text", "text": ""}', b'{"command": "text", "text": 5}',
-                b'{"command": "set_mode", "mode": "wake_word"}', b'{"command": "set_mode"}',
+                b'{"command": "set_mode", "mode": "telepathy"}', b'{"command": "set_mode"}',
                 b'{"command": "observe", "path": ""}', b'{"command": "observe", "path": "/a", "extra": 1}',
                 b'{"command": "text", "text": "' + b"x" * 2001 + b'"}']:
         assert parse_command(bad) is None, bad

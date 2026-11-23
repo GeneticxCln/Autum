@@ -109,7 +109,7 @@ def command_handler(
         waiting = getattr(runtime, "state", None) is State.WAITING_FOR_APPROVAL
         match command["command"]:
             case "talk_start":
-                if getattr(runtime, "mode", Mode.PUSH_TO_TALK) is Mode.HANDS_FREE and not waiting:
+                if getattr(runtime, "mode", Mode.PUSH_TO_TALK) in (Mode.HANDS_FREE, Mode.WAKE_WORD) and not waiting:
                     await runtime.cancel("push_to_talk")
                 else:
                     await voice.start()
@@ -141,9 +141,9 @@ def command_handler(
             case "set_mode":
                 target_mode = Mode(command["mode"])
                 hf = get_hands_free()
-                if target_mode is Mode.HANDS_FREE and hf is not None:
+                if target_mode in (Mode.HANDS_FREE, Mode.WAKE_WORD) and hf is not None:
                     await voice.abort()
-                    runtime.set_mode(Mode.HANDS_FREE)
+                    runtime.set_mode(target_mode)
                     await hf.start()
                 elif target_mode is Mode.PUSH_TO_TALK:
                     if hf is not None:
@@ -270,6 +270,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Start in hands-free mode with Silero VAD turn detection and voice barge-in",
     )
     parser.add_argument(
+        "--wake-word",
+        action="store_true",
+        default=None,
+        help="Start in wake-word mode (only responds when you say 'Autum' / 'Hey Autum')",
+    )
+    parser.add_argument(
         "--aec",
         action="store_true",
         default=None,
@@ -306,7 +312,13 @@ async def main(argv: Sequence[str] | None = None) -> int:
         return 1
     configure_logging(cfg.log_level)
 
-    use_hands_free = cfg.mode is Mode.HANDS_FREE if args.hands_free is None else bool(args.hands_free)
+    if args.hands_free:
+        start_mode = Mode.HANDS_FREE
+    elif args.wake_word:
+        start_mode = Mode.WAKE_WORD
+    else:
+        start_mode = cfg.mode
+    use_continuous = start_mode in (Mode.HANDS_FREE, Mode.WAKE_WORD)
     use_aec = cfg.aec if args.aec is None else bool(args.aec)
     silence_ms = cfg.silence_ms if args.silence_ms is None else args.silence_ms
     barge_in_ms = cfg.barge_in_ms if args.barge_in_ms is None else args.barge_in_ms
@@ -376,7 +388,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 lambda e: log(f"{e.payload['component']}: recovered"),
                 {"runtime.component_recovered"},
             )
-            mode = Mode.HANDS_FREE if use_hands_free else Mode.PUSH_TO_TALK
+            mode = start_mode
             speech_synth = OmniSpeech(client, model=voice_model, voice=cfg.voice, base_url=cfg.ollama_url)
             speech = SpeechPlayer(bus, speech_synth, target=out_target)
             transcriber = OmniTranscriber(client, model=voice_model, base_url=cfg.ollama_url)
@@ -610,10 +622,10 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 await preload(client, model=chat_model, base_url=cfg.ollama_url)
             runtime.finish_model_load(chat_model, (time.monotonic() - t_load) * 1000.0)
 
-            if use_hands_free:
+            if use_continuous:
                 await make_hands_free().start()
                 if aec is None:
-                    log("hands-free mode active (use headphones or pass --aec when using speakers).")
+                    log(f"{mode.value} mode active (use headphones or enable AEC when using speakers).")
             hotkey: PushToTalkKey | None = None
             if args.hotkey:
                 def on_hotkey_status(msg: str) -> None:

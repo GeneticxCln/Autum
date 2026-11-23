@@ -64,6 +64,7 @@ class SpeechOutput(Protocol):
 
 class Mode(enum.StrEnum):
     PUSH_TO_TALK = "push_to_talk"
+    WAKE_WORD = "wake_word"
     HANDS_FREE = "hands_free"
 
 
@@ -152,6 +153,7 @@ class Runtime:
         self._approval_turn: tuple[str, str, int] | None = None  # (turn_id, source_mode, started_mono_ns)
         self._turn_observed = False
         self.current_spoken_text: str = ""
+        self._wake_window_until: float = 0.0
         self._pending_announcements: deque[str] = deque(maxlen=16)
         self._response_errored = False
         self._tasks: set[asyncio.Task[None]] = set()
@@ -299,21 +301,77 @@ class Runtime:
                 return "", True
         return (cleaned or raw), False
 
+    _WAKE_CALL_RE = re.compile(
+        r"(?:^|[\s,.;:!?])(?:(?:hey|hi|ok|okay|yo)\s+)?(?:autum|autumn)\b[\s,.:;!\-]*",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def extract_wake_call(cls, transcript: str) -> tuple[bool, str, bool]:
+        """Parse a wake-word call ('Autum', 'Hey Autum, ...', 'Autumn, ...').
+
+        Returns `(called_wake_word, remaining_question, is_stop_only)`.
+        """
+        raw = (transcript or "").strip()
+        if not raw:
+            return False, "", False
+        # Require explicit wake name ("Autum" / "Hey Autum" / "Autumn" as greeting or followed by pause/end)
+        m = re.search(
+            r"(?:^|[\s,.;:!?])(?:(?:hey|hi|ok|okay|yo)\s+(?:autum|autumn)\b[\s,.:;!\-]*|autum\b[\s,.:;!\-]*|autumn(?:[,.:;!\-]+\s*|\s*$))",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if m is None:
+            # Also allow pure stop words ("stop", "wait") while speaking
+            norm = re.sub(r"[^a-z0-9\s]+", "", raw.lower()).strip()
+            norm = re.sub(r"\s+", " ", norm)
+            if norm in cls._STOP_PHRASES:
+                return False, "", True
+            return False, raw, False
+        remainder = raw[m.end() :].strip()
+        norm_rem = re.sub(r"[^a-z0-9\s]+", "", remainder.lower()).strip()
+        norm_rem = re.sub(r"\s+", " ", norm_rem)
+        if remainder and norm_rem in cls._STOP_PHRASES:
+            return True, "", True
+        return True, remainder, False
+
     def barge_in_with_text(self, transcript: str, turn_id: str | None = None) -> bool:
-        """Interrupt active speech with a verified wake-on-call or new question in hands-free mode."""
+        """Interrupt active speech with a verified wake-on-call or new question."""
         if self.is_self_echo(transcript):
             return False
-        cleaned, is_stop = self.clean_wake_transcript(transcript)
-        if is_stop:
-            self._cancel_pending_transcription()
-            if self._op is not None:
-                self._begin_cancel("barge_in", None)
-            elif self.state not in (State.IDLE, State.LISTENING):
-                self._set_state(self.rest_state, "barge_in")
-            return True
-        if not cleaned:
-            return False
+        if self.mode is Mode.WAKE_WORD:
+            woke, remainder, is_stop = self.extract_wake_call(transcript)
+            if is_stop and (woke or self._op is not None):
+                self._cancel_pending_transcription()
+                if self._op is not None:
+                    self._begin_cancel("barge_in", None)
+                elif self.state not in (State.IDLE, State.LISTENING):
+                    self._set_state(self.rest_state, "barge_in")
+                return True
+            if not woke:
+                return False
+            if not remainder:
+                # Bare "Autum" while speaking -> stop speaking and open follow-up wake window
+                self._cancel_pending_transcription()
+                self._wake_window_until = time.monotonic() + 12.0
+                if self._op is not None:
+                    self._begin_cancel("barge_in", None)
+                return True
+            cleaned = remainder
+        else:
+            cleaned, is_stop = self.clean_wake_transcript(transcript)
+            if is_stop:
+                self._cancel_pending_transcription()
+                if self._op is not None:
+                    self._begin_cancel("barge_in", None)
+                elif self.state not in (State.IDLE, State.LISTENING):
+                    self._set_state(self.rest_state, "barge_in")
+                return True
+            if not cleaned:
+                return False
         tid = turn_id or new_id()
+        # Use direct start if in WAKE_WORD so _on_final_transcript doesn't re-strip wake word
+        self._wake_window_until = time.monotonic() + 12.0 if self.mode is Mode.WAKE_WORD else 0.0
         self.bus.emit("audio.speech_started", {"mode": "hands_free"}, provenance=Provenance.USER, turn_id=tid)
         self.bus.emit("audio.speech_ended", {"confidence": 1.0}, provenance=Provenance.USER, turn_id=tid)
         self.bus.emit("audio.transcribed", {"text": cleaned, "final": True}, provenance=Provenance.USER, turn_id=tid)
@@ -327,7 +385,7 @@ class Runtime:
 
     @property
     def rest_state(self) -> State:
-        if self.mode is Mode.HANDS_FREE and self.capturing and not self.muted:
+        if self.mode in (Mode.HANDS_FREE, Mode.WAKE_WORD) and self.capturing and not self.muted:
             return State.LISTENING
         return State.IDLE
 
@@ -462,10 +520,10 @@ class Runtime:
             and event.mono_ns >= pending.ready_at_ns
         ):
             src_mode = str(event.payload["mode"])
-            # §5.2: never let open-mic hands-free speech clobber a push-to-talk
-            # approval or steal an irreversible approval in hands-free mode.
+            # §5.2: never let open-mic speech clobber a push-to-talk
+            # approval or steal an irreversible approval in hands-free / wake-word mode.
             if src_mode == Mode.HANDS_FREE and (
-                (pending.level is PermissionLevel.IRREVERSIBLE and self.mode is Mode.HANDS_FREE)
+                (pending.level is PermissionLevel.IRREVERSIBLE and self.mode in (Mode.HANDS_FREE, Mode.WAKE_WORD))
                 or (self._approval_turn is not None and self._approval_turn[1] == Mode.PUSH_TO_TALK)
             ):
                 return
@@ -526,7 +584,35 @@ class Runtime:
         elif self._paused_segments:
             raw_text = " ".join(p for p in (*self._paused_segments, raw_text) if p).strip()
             self._paused_segments.clear()
-        if self.mode is Mode.HANDS_FREE:
+        if self.mode is Mode.WAKE_WORD:
+            woke, remainder, is_stop = self.extract_wake_call(raw_text)
+            in_wake_window = time.monotonic() < self._wake_window_until
+            if is_stop and (woke or in_wake_window or self._op is not None):
+                self._wake_window_until = 0.0
+                if self._op is not None:
+                    self._begin_cancel("barge_in", event)
+                else:
+                    self._set_state(self.rest_state, "stop_command", event)
+                    self._drain_pending_announcements()
+                return
+            if woke:
+                if not remainder:
+                    # Bare "Autum" / "Hey Autum": open 12s follow-up window and acknowledge!
+                    self._wake_window_until = time.monotonic() + 12.0
+                    self._set_state(self.rest_state, "wake_word_detected", event)
+                    self.announce("Yes?")
+                    return
+                self._wake_window_until = 0.0
+                text = remainder
+            elif in_wake_window:
+                self._wake_window_until = 0.0
+                text = raw_text
+            else:
+                # Background speech without calling "Autum" -> stay dormant and ignore
+                self._set_state(self.rest_state, "wake_word_ignored", event)
+                self._drain_pending_announcements()
+                return
+        elif self.mode is Mode.HANDS_FREE:
             cleaned, is_stop = self.clean_wake_transcript(raw_text)
             if is_stop:
                 if self._op is not None:
@@ -560,7 +646,7 @@ class Runtime:
             return
         if turn_id != self._input_turn:
             return  # superseded by a newer utterance
-        if not self.direct_audio and self.transcriber is not None:
+        if (not self.direct_audio or self.mode is Mode.WAKE_WORD) and self.transcriber is not None:
             prev_task = (
                 self._transcribe_task
                 if self._transcribe_task is not None and not self._transcribe_task.done()
@@ -666,7 +752,7 @@ class Runtime:
             response,
             provenance=provenance,
             source=source,
-            hands_free_mode=(self.mode is Mode.HANDS_FREE),
+            hands_free_mode=(self.mode in (Mode.HANDS_FREE, Mode.WAKE_WORD)),
             captured_at_ns=captured_at_ns,
         )
 

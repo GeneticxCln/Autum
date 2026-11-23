@@ -158,7 +158,7 @@ class SettingsBridge(QObject):
 
     @Slot(str)
     def setModeAndPersist(self, mode: str) -> None:
-        if mode not in ("push_to_talk", "hands_free"):
+        if mode not in ("push_to_talk", "wake_word", "hands_free"):
             return
         if self._model is not None:
             self._model.setMode(mode)

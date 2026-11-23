@@ -21,7 +21,7 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Awaitable, Callable, Sequence
 
 import httpx
 
@@ -60,6 +60,7 @@ from autum.ollama import (
     OmniTranscriber,
     check_ready,
     preload,
+    release_models,
     resolve_reasoning_effort,
     resolve_speech_model,
     unload,
@@ -191,6 +192,37 @@ def command_handler(
                         await res_c
 
     return handle
+
+
+async def wait_for_startup_preload(
+    preload_models: Awaitable[None], stop: asyncio.Event
+) -> tuple[bool, Exception | None]:
+    """Run the startup model load until it ends or Autum is asked to stop.
+
+    Returns (stopped, error). A failed load is returned rather than raised, so
+    Autum keeps running and reports it, as a failed settings reload does.
+    """
+    preload_task = asyncio.ensure_future(preload_models)
+    stop_waiter = asyncio.create_task(stop.wait())
+    try:
+        await asyncio.wait({preload_task, stop_waiter}, return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        preload_task.cancel()
+        raise
+    finally:
+        stop_waiter.cancel()
+    if stop.is_set():
+        preload_task.cancel()
+        try:
+            await preload_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        return True, None
+    try:
+        await preload_task
+    except Exception as exc:
+        return False, exc
+    return False, None
 
 
 async def start_bubble(config_path: Path | None = None) -> asyncio.subprocess.Process | None:
@@ -810,23 +842,21 @@ async def main(argv: Sequence[str] | None = None) -> int:
 
                 runtime.begin_model_load(chat_model)
                 t_load = time.monotonic()
-                preload_task = asyncio.create_task(_preload_startup())
-                stop_waiter = asyncio.create_task(stop.wait())
                 try:
-                    done, pending = await asyncio.wait(
-                        {preload_task, stop_waiter}, return_when=asyncio.FIRST_COMPLETED
-                    )
-                    for p in pending:
-                        p.cancel()
-                    if stop.is_set():
-                        try:
-                            await preload_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                        return 0
-                    await preload_task
+                    stopped, load_error = await wait_for_startup_preload(_preload_startup(), stop)
                 finally:
                     runtime.finish_model_load(chat_model, (time.monotonic() - t_load) * 1000.0)
+                if stopped:
+                    return 0
+                if load_error is not None:
+                    # Keep running: Ollama loads models on first use, and a settings
+                    # reload retries the preload (startup_preload_pending).
+                    startup_preload_pending = True
+                    log(f"WARNING: model preload failed: {load_error}")
+                    bus.emit(
+                        "runtime.component_error",
+                        {"component": "models", "error": f"model preload failed: {load_error}"},
+                    )
 
                 if use_continuous:
                     await make_hands_free().start()
@@ -871,6 +901,13 @@ async def main(argv: Sequence[str] | None = None) -> int:
                     await asyncio.wait_for(runtime.wait_until_settled(), 3)
                 except asyncio.TimeoutError:
                     pass
+                # Models are pinned with keep_alive -1 while Autum runs; release them
+                # so they do not hold GPU memory after Autum exits.
+                await release_models(
+                    client,
+                    (chat.model, vision.model, speech_synth.model, transcriber.model),
+                    base_url=chat.base_url,
+                )
     finally:
         if aec is not None:
             await aec.stop()

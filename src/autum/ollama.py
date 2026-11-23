@@ -359,6 +359,23 @@ async def unload(client: httpx.AsyncClient, model: str, base_url: str = OLLAMA) 
         pass
 
 
+async def release_models(client: httpx.AsyncClient, models: Iterable[str], base_url: str = OLLAMA) -> None:
+    """On exit, unload Autum's pinned (`keep_alive: -1`) models that are still in VRAM.
+
+    Only models Ollama reports as loaded are unloaded: asking Ollama to unload a
+    model that is not loaded would load it first.
+    """
+    base = base_url.rstrip("/")
+    try:
+        r = await client.get(f"{base}/api/ps", timeout=3)
+        loaded = {str(m.get("name") or "") for m in (r.json() or {}).get("models") or () if isinstance(m, dict)}
+    except (httpx.HTTPError, ValueError):
+        return
+    for model in dict.fromkeys(models):
+        if model and model in loaded:
+            await unload(client, model=model, base_url=base)
+
+
 _THINKING_MODEL_TAGS: tuple[str, ...] = (
     "gemma4",
     "gemma-4",

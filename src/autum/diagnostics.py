@@ -495,13 +495,21 @@ def run_system_health_checks(
 
     # 2. Audio & Microphone (PipeWire)
     missing_pw = [t for t in ("pw-record", "pw-play", "wpctl") if not shutil.which(t)]
-    default_src = "unknown"
-    if shutil.which("pactl"):
+    configured_in = cfg.audio_input.strip()
+    default_src = configured_in or "unknown"
+    if not configured_in and shutil.which("pactl"):
         rc, out = _run_cmd(["pactl", "get-default-source"])
         if rc == 0 and out:
             default_src = out.splitlines()[0].strip()
     vol_out = ""
-    if shutil.which("wpctl"):
+    configured_missing = False
+    if configured_in and shutil.which("pactl"):
+        rc, out = _run_cmd(["pactl", "get-source-mute", configured_in])
+        if rc == 0 and out:
+            vol_out = "[MUTED]" if "yes" in out.lower() else "Unmuted"
+        else:
+            configured_missing = True
+    elif shutil.which("wpctl"):
         rc, out = _run_cmd(["wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@"])
         if rc == 0 and out:
             vol_out = out.splitlines()[0].strip()
@@ -515,6 +523,17 @@ def run_system_health_checks(
                 "summary": f"Missing PipeWire tools: {', '.join(missing_pw)}",
                 "details": "",
                 "suggestion": "Install pipewire-utils / wireplumber.",
+            }
+        )
+    elif configured_missing:
+        checks.append(
+            {
+                "section": "audio",
+                "title": "Audio & Microphone",
+                "status": "warning",
+                "summary": f"Configured microphone is disconnected: {configured_in}",
+                "details": f"Mode: {cfg.mode.value} • AEC: {'ON' if cfg.aec else 'OFF'} • Silence: {cfg.silence_ms} ms",
+                "suggestion": "Reconnect the USB microphone or select System Default / another mic in Settings -> Voice & Audio.",
             }
         )
     elif "MUTED" in vol_out.upper():
@@ -555,8 +574,12 @@ def run_system_health_checks(
         desk_summary = f"{desktop_env} (headless) • No Wayland/X11 display detected"
         desk_suggestion = "Run Autum inside a graphical desktop session for window control and screen watch."
     else:
+        from autum.integrations.window_backends import detect_window_controller
+
+        wm_ctrl = detect_window_controller()
+        wm_name = getattr(wm_ctrl, "backend_name", "KWin") if wm_ctrl.is_available() else "unavailable"
         desk_status = "ok"
-        desk_summary = f"{desktop_env} ({'Wayland' if wayland else 'X11'}) • Eyes & Hands ready"
+        desk_summary = f"{desktop_env} ({'Wayland' if wayland else 'X11'}) • Window backend: {wm_name}"
         desk_suggestion = ""
     checks.append(
         {
@@ -832,3 +855,106 @@ def register_diagnostic_capabilities(
             timeout_s=3.0,
         )
     )
+
+
+class TranscriptLog:
+    """Bounded, secret-redacted recent conversation transcript (`transcript.jsonl`, 0600)."""
+
+    def __init__(self, path: Path, *, max_entries: int = 40) -> None:
+        self.path = path
+        self.max_entries = max(1, int(max_entries))
+        self._lock = threading.RLock()
+        self._entries: deque[dict[str, Any]] = deque(maxlen=self.max_entries)
+        self._load()
+
+    def _load(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            if not self.path.is_file():
+                return
+            try:
+                for line in self.path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(obj, dict) and obj.get("role") and obj.get("text"):
+                        self._entries.append(obj)
+            except OSError:
+                pass
+
+    def _write_locked(self) -> None:
+        parent_existed = self.path.parent.exists()
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not parent_existed or self.path.parent.name == "autum":
+            try:
+                os.chmod(self.path.parent, 0o700)
+            except OSError:
+                pass
+        fd, tmp_name = tempfile.mkstemp(prefix=".transcript.", suffix=".tmp", dir=str(self.path.parent))
+        tmp = Path(tmp_name)
+        try:
+            os.fchmod(fd, 0o600)
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+        except Exception:
+            os.close(fd)
+            tmp.unlink(missing_ok=True)
+            raise
+        try:
+            with fh:
+                for item in self._entries:
+                    fh.write(json.dumps(item, ensure_ascii=False) + "\n")
+            tmp.replace(self.path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+
+    def record(self, role: str, text: str) -> dict[str, Any] | None:
+        clean = redact_sensitive((text or "").strip())
+        if not clean:
+            return None
+        entry = {
+            "timestamp": _now_iso(),
+            "role": str(role),
+            "text": clean[:1200],
+        }
+        with self._lock:
+            self._entries.append(entry)
+            try:
+                self._write_locked()
+            except OSError:
+                pass
+        return entry
+
+    def recent(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self._lock:
+            self._load()
+            cap = max(1, min(self.max_entries, int(limit)))
+            return list(self._entries)[-cap:]
+
+    def clear(self) -> int:
+        with self._lock:
+            self._load()
+            count = len(self._entries)
+            self._entries.clear()
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return count
+
+    def attach_bus(self, bus: EventBus) -> None:
+        def _on_event(event: Event) -> None:
+            if event.type == "conversation.user_message":
+                txt = str(event.payload.get("text") or "").strip()
+                if txt:
+                    self.record("user", txt)
+            elif event.type == "conversation.response_finished":
+                txt = str(event.payload.get("text") or "").strip()
+                if txt:
+                    self.record("assistant", txt)
+
+        bus.subscribe(_on_event, {"conversation.user_message", "conversation.response_finished"})

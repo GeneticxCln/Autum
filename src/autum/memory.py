@@ -60,8 +60,22 @@ class MemoryStore:
     def __init__(self, path: Path) -> None:
         self.path = path.resolve()
         self._entries: dict[str, MemoryEntry] = {}
+        self._last_mtime_ns: int = -1
         self.corrupt_backup: Path | None = None
         self._load()
+
+    def _sync_from_disk(self) -> None:
+        """Reload memory.json if modified externally (e.g. deleted from Settings UI)."""
+        try:
+            st = self.path.stat()
+            mtime = st.st_mtime_ns
+        except OSError:
+            if self._last_mtime_ns != -1:
+                self._entries.clear()
+                self._last_mtime_ns = -1
+            return
+        if mtime != self._last_mtime_ns:
+            self._load()
 
     def _backup_corrupt(self) -> None:
         """Preserve a damaged memory.json file before any future save can overwrite it."""
@@ -75,15 +89,20 @@ class MemoryStore:
             log.warning("could not back up damaged memory file %s: %s", self.path, exc)
 
     def _load(self) -> None:
+        self._entries.clear()
         if not self.path.is_file():
+            self._last_mtime_ns = -1
             return
         try:
+            st = self.path.stat()
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             self._backup_corrupt()
+            self._last_mtime_ns = -1
             return
         if not isinstance(raw, list):
             self._backup_corrupt()
+            self._last_mtime_ns = -1
             return
         for item in raw:
             if isinstance(item, dict) and {"id", "key", "value", "category", "provenance", "created_ms", "updated_ms"} <= item.keys():
@@ -100,6 +119,7 @@ class MemoryStore:
                 except (ValueError, TypeError):
                     continue
                 self._entries[entry.id] = entry
+        self._last_mtime_ns = st.st_mtime_ns
 
     def _save(self) -> None:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -111,6 +131,10 @@ class MemoryStore:
             fh.write(json.dumps(payload, indent=2, sort_keys=True))
         os.chmod(tmp, 0o600)
         tmp.replace(self.path)
+        try:
+            self._last_mtime_ns = self.path.stat().st_mtime_ns
+        except OSError:
+            pass
 
     def remember(
         self,
@@ -120,6 +144,7 @@ class MemoryStore:
         category: str = "general",
         provenance: Provenance = Provenance.USER,
     ) -> MemoryEntry:
+        self._sync_from_disk()
         clean_key = key.strip()
         clean_val = value.strip()
         clean_cat = category.strip().lower() or "general"
@@ -175,6 +200,7 @@ class MemoryStore:
         return entry
 
     def find_by_key(self, key: str) -> MemoryEntry | None:
+        self._sync_from_disk()
         needle = key.strip().lower()
         for entry in self._entries.values():
             if entry.key.lower() == needle:
@@ -182,10 +208,12 @@ class MemoryStore:
         return None
 
     def get(self, identifier: str) -> MemoryEntry | None:
+        self._sync_from_disk()
         ident = identifier.strip()
         return self._entries.get(ident) or self.find_by_key(ident)
 
     def list_all(self, category: str | None = None) -> list[MemoryEntry]:
+        self._sync_from_disk()
         items = list(self._entries.values())
         if category:
             cat = category.strip().lower()
@@ -200,6 +228,7 @@ class MemoryStore:
         category: str | None = None,
         provenance: str | None = None,
     ) -> list[MemoryEntry]:
+        self._sync_from_disk()
         cat = category.strip().lower() if category else None
         pool = [
             e

@@ -34,6 +34,7 @@ from autum.audio import (
     SpeechPlayer,
     VoiceInput,
     check_microphone,
+    read_source_muted,
 )
 from autum.bus import EventBus
 from autum.capabilities import build_default_registry, default_data_dir
@@ -41,6 +42,7 @@ from autum.config import Config
 from autum.diagnostics import (
     DiagnosticsLog,
     SelfDiagnostics,
+    TranscriptLog,
     gpu_vram_gb,
     query_ollama_models,
     register_diagnostic_capabilities,
@@ -404,8 +406,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
         loop.add_signal_handler(sig, stop.set)
 
     aec: EchoCanceller | None = None
-    in_target: str | None = None
-    out_target: str | None = None
+    in_target: str | None = cfg.audio_input.strip() or None
+    out_target: str | None = cfg.audio_output.strip() or None
     if use_aec:
         aec = EchoCanceller()
         if await aec.start():
@@ -419,12 +421,17 @@ async def main(argv: Sequence[str] | None = None) -> int:
         async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=3.0)) as client:
             chat_model = cfg.resolved_chat_model()
             vision_model = cfg.resolved_vision_model()
+            missing_startup_models: list[str] = []
             for req_model in dict.fromkeys((cfg.model, chat_model, vision_model)):
                 problem = await check_ready(client, model=req_model, base_url=cfg.ollama_url)
                 if problem:
-                    log(problem)
-                    return 1
-            mic_ok = await check_microphone()
+                    if problem.startswith("Ollama does not have "):
+                        missing_startup_models.append(req_model)
+                        log(f"WARNING: {problem}")
+                    else:
+                        log(problem)
+                        return 1
+            mic_ok = await check_microphone(target=in_target)
             if not mic_ok:
                 log(f"WARNING: {MIC_HELP}")
 
@@ -432,9 +439,15 @@ async def main(argv: Sequence[str] | None = None) -> int:
             if voice_model != cfg.model:
                 fallback_problem = await check_ready(client, model=voice_model, base_url=cfg.ollama_url)
                 if fallback_problem:
-                    log(f"{cfg.model} has no TTS speech weights in Ollama and fallback {voice_model} is missing: {fallback_problem}")
-                    return 1
-                log(f"{cfg.model} has no TTS speech weights in Ollama; using {voice_model} for voice audio I/O.")
+                    if fallback_problem.startswith("Ollama does not have "):
+                        if voice_model not in missing_startup_models:
+                            missing_startup_models.append(voice_model)
+                        log(f"WARNING: {cfg.model} has no TTS speech weights in Ollama and fallback {voice_model} is not pulled yet.")
+                    else:
+                        log(f"{cfg.model} has no TTS speech weights in Ollama and fallback {voice_model} is missing: {fallback_problem}")
+                        return 1
+                else:
+                    log(f"{cfg.model} has no TTS speech weights in Ollama; using {voice_model} for voice audio I/O.")
 
             chat_effort = await resolve_reasoning_effort(
                 client, chat_model, cfg.chat_think, base_url=cfg.ollama_url
@@ -547,8 +560,18 @@ async def main(argv: Sequence[str] | None = None) -> int:
 
             diag_log = DiagnosticsLog(data_dir / "diagnostics.jsonl", state_snapshot=live_state_snapshot)
             diag_log.attach_bus(bus)
+            transcript_log = TranscriptLog(data_dir / "transcript.jsonl")
+            transcript_log.attach_bus(bus)
             if not mic_ok:
                 bus.emit("runtime.component_error", {"component": "microphone", "error": MIC_HELP})
+            if missing_startup_models:
+                bus.emit(
+                    "runtime.component_error",
+                    {
+                        "component": "models",
+                        "error": f"Missing Ollama model(s): {', '.join(missing_startup_models)}. Open Settings to pull or pick installed models.",
+                    },
+                )
             self_diag = SelfDiagnostics(
                 diag_log,
                 get_config=lambda: active_cfg[0],
@@ -588,7 +611,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                         runtime,
                         transcriber,
                         detector,
-                        target=in_target,
+                        target=voice.target,
                         voice_barge_in=False,
                         smart_barge_in=True,
                         post_speech_cooldown_s=0.45,
@@ -597,13 +620,14 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 return hands_free
 
             reload_lock = asyncio.Lock()
+            startup_preload_pending = bool(missing_startup_models)
 
             async def reload_live_config() -> None:
                 async with reload_lock:
                     await _reload_live_config_locked()
 
             async def _reload_live_config_locked() -> None:
-                nonlocal swapper, silence_ms, barge_in_ms
+                nonlocal swapper, silence_ms, barge_in_ms, startup_preload_pending
                 try:
                     new_cfg = Config.load(args.config)
                 except (OSError, ValueError) as exc:
@@ -651,7 +675,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                     swapper = None
 
                 old_chat, old_vis, old_voice = chat.model, vision.model, speech_synth.model
-                models_changed = (new_chat, new_vis, new_voice) != (old_chat, old_vis, old_voice)
+                models_changed = startup_preload_pending or (new_chat, new_vis, new_voice) != (old_chat, old_vis, old_voice)
 
                 chat.model = new_chat
                 chat.base_url = base
@@ -678,8 +702,19 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 live_excluded_windows[:] = new_cfg.excluded_windows
                 silence_ms = new_cfg.silence_ms
                 barge_in_ms = new_cfg.barge_in_ms
+                new_in = aec.source if aec is not None else (new_cfg.audio_input.strip() or None)
+                new_out = aec.sink if aec is not None else (new_cfg.audio_output.strip() or None)
+                voice.target = new_in
+                speech.target = new_out
                 if hands_free is not None:
                     hands_free.detector.update_thresholds(silence_ms=silence_ms, barge_in_ms=barge_in_ms)
+                    if hands_free.target != new_in:
+                        was_active = hands_free.active
+                        if was_active:
+                            await hands_free.stop()
+                        hands_free.target = new_in
+                        if was_active:
+                            await hands_free.start()
 
                 if new_cfg.mode is not runtime.mode:
                     await handle_command({"command": "set_mode", "mode": new_cfg.mode.value})
@@ -699,6 +734,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                             swapper.active = new_chat
                         if new_chat != new_voice:
                             await preload(client, model=new_chat, base_url=base)
+                        startup_preload_pending = False
                     except Exception as exc:
                         bus.emit("runtime.component_error", {"component": "config", "error": f"model preload failed: {exc}"})
                     finally:
@@ -726,10 +762,12 @@ async def main(argv: Sequence[str] | None = None) -> int:
             mute: asyncio.Task[None] | None = None
             hotkey: PushToTalkKey | None = None
             try:
-                mute = asyncio.create_task(MuteMonitor(bus).run())
+                mute = asyncio.create_task(MuteMonitor(bus, read=lambda: read_source_muted(voice.target)).run())
                 await bubble.start()
 
                 async def _preload_startup() -> None:
+                    if missing_startup_models:
+                        return
                     # Check GPU VRAM headroom (read-only) and warn clearly if selected models
                     # leave too little VRAM for desktop + voice engine.
                     total_vram = await asyncio.to_thread(gpu_vram_gb)

@@ -44,6 +44,8 @@ class Config:
     dynamic_swap: bool = True
     chat_think: bool = False
     voice: str = "female-american-english"
+    audio_input: str = ""
+    audio_output: str = ""
     log_level: str = "INFO"
     data_dir: str = ""
     allowed_read_dirs: tuple[str, ...] = ()
@@ -62,7 +64,17 @@ class Config:
         for bool_field in ("aec", "dynamic_swap", "chat_think", "require_reversible_approval"):
             if not isinstance(getattr(self, bool_field), bool):
                 raise ValueError(f"{bool_field} must be a boolean")
-        for str_field in ("ollama_url", "model", "chat_model", "vision_model", "voice", "log_level", "data_dir"):
+        for str_field in (
+            "ollama_url",
+            "model",
+            "chat_model",
+            "vision_model",
+            "voice",
+            "audio_input",
+            "audio_output",
+            "log_level",
+            "data_dir",
+        ):
             if not isinstance(getattr(self, str_field), str):
                 raise ValueError(f"{str_field} must be a string")
         if not self.model.strip():
@@ -133,6 +145,8 @@ class Config:
             "dynamic_swap": self.dynamic_swap,
             "chat_think": self.chat_think,
             "voice": self.voice,
+            "audio_input": self.audio_input,
+            "audio_output": self.audio_output,
             "log_level": self.log_level,
             "data_dir": self.data_dir,
             "allowed_read_dirs": list(self.allowed_read_dirs),

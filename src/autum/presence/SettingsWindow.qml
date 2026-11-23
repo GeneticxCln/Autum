@@ -46,6 +46,24 @@ Window {
     property bool statusError: false
     property string dataDirValue: ""
 
+    property var audioInputs: []
+    property var audioOutputs: []
+    property string selectedAudioInput: ""
+    property string selectedAudioOutput: ""
+    property string micTestText: ""
+    property bool micTestOk: true
+    property bool micTesting: false
+
+    property var savedMemories: []
+    property var savedNotes: []
+    property var recentTranscript: []
+
+    property var setupMissingModels: []
+    property real setupVramGb: 0
+    property string pullingModel: ""
+    property string pullStatusText: ""
+    property int pullPercent: 0
+
     function openSettings() {
         pendingScrollToDiagnostics = false
         loadFromDisk()
@@ -119,6 +137,114 @@ Window {
             chatModelBox.editText = prevChat
             visionModelBox.editText = prevVision
             voiceModelBox.editText = prevVoice
+            root.refreshSetupStatus()
+        }
+        function onAudioDevicesReady(devices) {
+            const ins = [{ "name": "", "label": "System Default Microphone" }]
+            const outs = [{ "name": "", "label": "System Default Speaker" }]
+            for (const d of (devices && devices.inputs ? devices.inputs : []))
+                ins.push({ "name": d.name, "label": (d.description || d.name) + (d.is_default ? " (Default)" : "") })
+            if (root.selectedAudioInput !== "" && !ins.some(i => i.name === root.selectedAudioInput))
+                ins.push({ "name": root.selectedAudioInput, "label": root.selectedAudioInput + " (Disconnected)" })
+            for (const d of (devices && devices.outputs ? devices.outputs : []))
+                outs.push({ "name": d.name, "label": (d.description || d.name) + (d.is_default ? " (Default)" : "") })
+            if (root.selectedAudioOutput !== "" && !outs.some(o => o.name === root.selectedAudioOutput))
+                outs.push({ "name": root.selectedAudioOutput, "label": root.selectedAudioOutput + " (Disconnected)" })
+            root.audioInputs = ins
+            root.audioOutputs = outs
+            root.syncAudioCombos()
+        }
+        function onSetupStatusReady(st) {
+            if (st) {
+                root.setupMissingModels = st.missing_models || []
+                root.setupVramGb = Number(st.vram_gb || 0)
+            }
+        }
+        function onMicTestReady(res) {
+            root.micTesting = false
+            if (res && res.ok) {
+                root.micTestOk = true
+                root.micTestText = "Microphone OK (RMS " + Number(res.rms || 0).toFixed(3) + ", " + (res.bytes_read || 0) + " bytes)"
+            } else {
+                root.micTestOk = false
+                root.micTestText = (res && res.error) ? res.error : "No audio received from selected microphone"
+            }
+        }
+        function onPullProgress(info) {
+            if (!info)
+                return
+            root.pullPercent = Number(info.percent || 0)
+            if (info.error) {
+                root.pullingModel = ""
+                root.pullStatusText = "Pull failed: " + info.error
+            } else if (info.done) {
+                root.pullingModel = ""
+                root.pullStatusText = "Pulled " + (info.model || "model") + " successfully."
+                root.refreshModels()
+                root.runSelfDiagnosis()
+                if (typeof presence !== "undefined" && presence)
+                    presence.reloadConfig()
+            } else {
+                root.pullStatusText = (info.model || "") + ": " + (info.status || "downloading") + (root.pullPercent > 0 ? (" (" + root.pullPercent + "%)") : "")
+            }
+        }
+    }
+
+    function syncAudioCombos() {
+        let inIdx = 0
+        for (let i = 0; i < audioInputs.length; i++) {
+            if (audioInputs[i].name === selectedAudioInput) { inIdx = i; break }
+        }
+        audioInputBox.currentIndex = inIdx
+        let outIdx = 0
+        for (let i = 0; i < audioOutputs.length; i++) {
+            if (audioOutputs[i].name === selectedAudioOutput) { outIdx = i; break }
+        }
+        audioOutputBox.currentIndex = outIdx
+    }
+
+    function refreshAudioDevices() {
+        if (typeof settingsBridge === "undefined" || !settingsBridge)
+            return
+        if (typeof settingsBridge.listAudioDevicesAsync === "function")
+            settingsBridge.listAudioDevicesAsync()
+    }
+
+    function testSelectedMicrophone() {
+        if (typeof settingsBridge === "undefined" || !settingsBridge || micTesting)
+            return
+        micTesting = true
+        micTestOk = true
+        micTestText = "Listening for 0.6 s..."
+        settingsBridge.testMicrophoneAsync(selectedAudioInput)
+    }
+
+    function refreshMemoryAndNotes() {
+        if (typeof settingsBridge === "undefined" || !settingsBridge)
+            return
+        if (typeof settingsBridge.loadMemoryAndNotes === "function") {
+            const data = settingsBridge.loadMemoryAndNotes()
+            if (data) {
+                savedMemories = data.memories || []
+                savedNotes = data.notes || []
+                recentTranscript = data.transcript || []
+            }
+        }
+    }
+
+    function refreshSetupStatus() {
+        if (typeof settingsBridge === "undefined" || !settingsBridge)
+            return
+        if (typeof settingsBridge.setupStatusAsync === "function") {
+            settingsBridge.setupStatusAsync()
+            return
+        }
+        if (typeof settingsBridge.setupStatus === "function") {
+            const st = settingsBridge.setupStatus()
+            if (st) {
+                setupMissingModels = st.missing_models || []
+                setupVramGb = Number(st.vram_gb || 0)
+            }
         }
     }
 
@@ -144,6 +270,9 @@ Window {
             lastSyncedPresenceMode = presence.mode
         aecSwitch.checked = Boolean(cfg.aec)
         voicePresetField.text = cfg.voice || "female-american-english"
+        selectedAudioInput = cfg.audio_input || ""
+        selectedAudioOutput = cfg.audio_output || ""
+        syncAudioCombos()
         silenceSpin.value = Math.max(100, Math.min(5000, Number(cfg.silence_ms || 700)))
         bargeInSpin.value = Math.max(64, Math.min(2000, Number(cfg.barge_in_ms || 256)))
 
@@ -178,6 +307,9 @@ Window {
             statusText = cfg._load_error
         }
         refreshModels()
+        refreshAudioDevices()
+        refreshMemoryAndNotes()
+        refreshSetupStatus()
         runSelfDiagnosis()
     }
 
@@ -243,6 +375,8 @@ Window {
             "dynamic_swap": dynamicSwapSwitch.checked,
             "chat_think": chatThinkSwitch.checked,
             "voice": voicePresetField.text.trim(),
+            "audio_input": selectedAudioInput,
+            "audio_output": selectedAudioOutput,
             "log_level": logLevelBox.currentText,
             "data_dir": dataDirValue,
             "allowed_read_dirs": allowedDirsList,
@@ -564,7 +698,7 @@ Window {
                             Text {
                                 id: verLabel
                                 anchors.centerIn: parent
-                                text: "v" + ((typeof settingsBridge !== "undefined" && settingsBridge && typeof settingsBridge.appVersion === "function") ? settingsBridge.appVersion() : "1.0.3")
+                                text: "v" + ((typeof settingsBridge !== "undefined" && settingsBridge && typeof settingsBridge.appVersion === "function") ? settingsBridge.appVersion() : "1.1.0")
                                 color: root.accentIce
                                 font.pixelSize: 11
                                 font.weight: Font.Medium
@@ -580,20 +714,20 @@ Window {
 
                 Rectangle {
                     radius: 12
-                    color: presence.connected ? "#132931" : "#261820"
+                    color: (presence && presence.connected) ? "#132931" : "#261820"
                     border.width: 1
-                    border.color: presence.connected ? "#2c6b78" : "#5e3340"
+                    border.color: (presence && presence.connected) ? "#2c6b78" : "#5e3340"
                     implicitHeight: 26
                     implicitWidth: liveLabel.implicitWidth + 20
                     Text {
                         id: liveLabel
                         anchors.centerIn: parent
-                        text: presence.connected
+                        text: (presence && presence.connected)
                               ? ("● Live • " + (presence.mode === "hands_free"
                                                 ? "Hands-Free"
                                                 : (presence.mode === "wake_word" ? "Wake Word (\"Autum\")" : "Push-to-Talk")))
                               : "○ Runtime Offline"
-                        color: presence.connected ? root.accentGlow : root.dangerSoft
+                        color: (presence && presence.connected) ? root.accentGlow : root.dangerSoft
                         font.pixelSize: 11
                         font.weight: Font.Medium
                     }
@@ -626,6 +760,73 @@ Window {
                 x: 18
                 y: 18
                 spacing: 16
+
+                // 0. First-Run / Missing Models Setup Banner
+                SectionCard {
+                    visible: root.setupMissingModels.length > 0 || root.pullingModel !== "" || root.pullStatusText !== ""
+                    heading: "Setup: Missing Local Models"
+                    subtitle: (root.setupVramGb > 0 ? ("Detected " + root.setupVramGb.toFixed(1) + " GB GPU VRAM. ") : "") + "Pull any missing Ollama model with one click below."
+
+                    Repeater {
+                        model: root.setupMissingModels
+                        delegate: Rectangle {
+                            required property string modelData
+                            Layout.fillWidth: true
+                            implicitHeight: 38
+                            radius: 8
+                            color: root.bgInput
+                            border.width: 1
+                            border.color: "#4d3c28"
+
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: 10
+                                anchors.rightMargin: 8
+                                spacing: 8
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: modelData + " (not installed)"
+                                    color: "#ebd39b"
+                                    font.pixelSize: 12
+                                    elide: Text.ElideMiddle
+                                }
+                                Button {
+                                    text: root.pullingModel === modelData ? "Pulling..." : "Pull Model"
+                                    enabled: root.pullingModel === ""
+                                    onClicked: {
+                                        root.pullingModel = modelData
+                                        root.pullPercent = 0
+                                        root.pullStatusText = "Starting pull for " + modelData + "..."
+                                        settingsBridge.pullModelAsync(modelData, ollamaUrlField.text)
+                                    }
+                                    contentItem: Text {
+                                        text: parent.text
+                                        color: parent.enabled ? "#0b0f17" : root.textSecondary
+                                        font.pixelSize: 12
+                                        font.weight: Font.DemiBold
+                                        horizontalAlignment: Text.AlignHCenter
+                                        verticalAlignment: Text.AlignVCenter
+                                    }
+                                    background: Rectangle {
+                                        implicitHeight: 28
+                                        implicitWidth: 94
+                                        radius: 7
+                                        color: parent.enabled ? root.accentIce : root.bgHover
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Text {
+                        visible: root.pullStatusText !== ""
+                        text: root.pullStatusText
+                        color: root.pullStatusText.indexOf("failed") >= 0 ? root.dangerSoft : root.accentGlow
+                        font.pixelSize: 12
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                }
 
                 // 1. AI Models (3 Pickers)
                 SectionCard {
@@ -809,6 +1010,170 @@ Window {
                             id: voicePresetField
                             Layout.fillWidth: true
                             placeholderText: "female-american-english"
+                        }
+                    }
+
+                    // PipeWire Microphone & Speaker Pickers + Live Mic Test
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 6
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Text { text: "Microphone (PipeWire Input)"; color: root.textPrimary; font.pixelSize: 13; Layout.fillWidth: true }
+                            Button {
+                                text: root.micTesting ? "Testing..." : "Test Mic"
+                                enabled: !root.micTesting
+                                onClicked: root.testSelectedMicrophone()
+                                contentItem: Text {
+                                    text: parent.text
+                                    color: root.accentIce
+                                    font.pixelSize: 11
+                                    font.weight: Font.Medium
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    implicitHeight: 26
+                                    implicitWidth: 78
+                                    radius: 7
+                                    color: parent.hovered ? root.bgHover : root.bgInput
+                                    border.width: 1
+                                    border.color: root.borderSubtle
+                                }
+                            }
+                            Button {
+                                text: "Refresh"
+                                onClicked: root.refreshAudioDevices()
+                                contentItem: Text {
+                                    text: parent.text
+                                    color: root.textSecondary
+                                    font.pixelSize: 11
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    implicitHeight: 26
+                                    implicitWidth: 68
+                                    radius: 7
+                                    color: parent.hovered ? root.bgHover : root.bgInput
+                                    border.width: 1
+                                    border.color: root.borderSubtle
+                                }
+                            }
+                        }
+
+                        ComboBox {
+                            id: audioInputBox
+                            Layout.fillWidth: true
+                            implicitHeight: 34
+                            model: root.audioInputs
+                            textRole: "label"
+                            onActivated: (idx) => {
+                                if (idx >= 0 && idx < root.audioInputs.length)
+                                    root.selectedAudioInput = root.audioInputs[idx].name
+                            }
+                            contentItem: Text {
+                                leftPadding: 10
+                                rightPadding: 28
+                                text: audioInputBox.displayText || "System Default Microphone"
+                                color: root.textPrimary
+                                font.pixelSize: 12
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                            }
+                            background: Rectangle {
+                                radius: 8
+                                color: root.bgInput
+                                border.width: 1
+                                border.color: audioInputBox.activeFocus ? root.borderFocus : root.borderSubtle
+                            }
+                            popup: Popup {
+                                y: audioInputBox.height + 2
+                                width: audioInputBox.width
+                                implicitHeight: Math.min(220, contentItem.implicitHeight + 8)
+                                padding: 4
+                                background: Rectangle { color: "#101724"; radius: 8; border.width: 1; border.color: root.borderSubtle }
+                                contentItem: ListView {
+                                    clip: true
+                                    implicitHeight: contentHeight
+                                    model: audioInputBox.popup.visible ? audioInputBox.delegateModel : null
+                                }
+                            }
+                            delegate: ItemDelegate {
+                                width: audioInputBox.width - 8
+                                implicitHeight: 30
+                                highlighted: audioInputBox.highlightedIndex === index
+                                contentItem: Text {
+                                    text: modelData.label
+                                    color: root.textPrimary
+                                    font.pixelSize: 12
+                                    verticalAlignment: Text.AlignVCenter
+                                    elide: Text.ElideRight
+                                }
+                                background: Rectangle { radius: 6; color: parent.highlighted ? root.bgHover : "transparent" }
+                            }
+                        }
+
+                        Text {
+                            visible: root.micTestText !== ""
+                            text: root.micTestText
+                            color: root.micTestOk ? root.accentGlow : root.dangerSoft
+                            font.pixelSize: 11
+                            wrapMode: Text.WordWrap
+                            Layout.fillWidth: true
+                        }
+
+                        Text { text: "Speaker (PipeWire Output)"; color: root.textPrimary; font.pixelSize: 13; Layout.topMargin: 4 }
+                        ComboBox {
+                            id: audioOutputBox
+                            Layout.fillWidth: true
+                            implicitHeight: 34
+                            model: root.audioOutputs
+                            textRole: "label"
+                            onActivated: (idx) => {
+                                if (idx >= 0 && idx < root.audioOutputs.length)
+                                    root.selectedAudioOutput = root.audioOutputs[idx].name
+                            }
+                            contentItem: Text {
+                                leftPadding: 10
+                                rightPadding: 28
+                                text: audioOutputBox.displayText || "System Default Speaker"
+                                color: root.textPrimary
+                                font.pixelSize: 12
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                            }
+                            background: Rectangle {
+                                radius: 8
+                                color: root.bgInput
+                                border.width: 1
+                                border.color: audioOutputBox.activeFocus ? root.borderFocus : root.borderSubtle
+                            }
+                            popup: Popup {
+                                y: audioOutputBox.height + 2
+                                width: audioOutputBox.width
+                                implicitHeight: Math.min(220, contentItem.implicitHeight + 8)
+                                padding: 4
+                                background: Rectangle { color: "#101724"; radius: 8; border.width: 1; border.color: root.borderSubtle }
+                                contentItem: ListView {
+                                    clip: true
+                                    implicitHeight: contentHeight
+                                    model: audioOutputBox.popup.visible ? audioOutputBox.delegateModel : null
+                                }
+                            }
+                            delegate: ItemDelegate {
+                                width: audioOutputBox.width - 8
+                                implicitHeight: 30
+                                highlighted: audioOutputBox.highlightedIndex === index
+                                contentItem: Text {
+                                    text: modelData.label
+                                    color: root.textPrimary
+                                    font.pixelSize: 12
+                                    verticalAlignment: Text.AlignVCenter
+                                    elide: Text.ElideRight
+                                }
+                                background: Rectangle { radius: 6; color: parent.highlighted ? root.bgHover : "transparent" }
+                            }
                         }
                     }
 
@@ -1063,6 +1428,177 @@ Window {
                                         implicitHeight: contentHeight
                                         model: logLevelBox.delegateModel
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 4b. Memory, Notes & Recent Transcript
+                SectionCard {
+                    heading: "Memory, Notes & Recent Transcript"
+                    subtitle: "Inspect or remove saved persistent memories, local notes, and recent spoken turns."
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
+                        Text {
+                            Layout.fillWidth: true
+                            color: root.textSecondary
+                            font.pixelSize: 12
+                            text: root.savedMemories.length + " memories  •  " + root.savedNotes.length + " notes  •  " + root.recentTranscript.length + " recent turns"
+                        }
+                        Button {
+                            text: "Refresh"
+                            onClicked: root.refreshMemoryAndNotes()
+                            contentItem: Text { text: parent.text; color: root.accentIce; font.pixelSize: 11; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                            background: Rectangle { implicitHeight: 28; implicitWidth: 72; radius: 7; color: parent.hovered ? root.bgHover : root.bgInput; border.width: 1; border.color: root.borderSubtle }
+                        }
+                        Button {
+                            visible: root.recentTranscript.length > 0
+                            text: "Clear Transcript"
+                            onClicked: {
+                                if (typeof settingsBridge !== "undefined" && settingsBridge) {
+                                    settingsBridge.clearTranscript()
+                                    root.refreshMemoryAndNotes()
+                                }
+                            }
+                            contentItem: Text { text: parent.text; color: root.dangerSoft; font.pixelSize: 11; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                            background: Rectangle { implicitHeight: 28; implicitWidth: 108; radius: 7; color: parent.hovered ? "#2a1b24" : root.bgInput; border.width: 1; border.color: "#4a2732" }
+                        }
+                    }
+
+                    // Persistent memories
+                    Text {
+                        visible: root.savedMemories.length > 0
+                        text: "Saved Memories"
+                        color: root.textPrimary
+                        font.pixelSize: 12
+                        font.weight: Font.Medium
+                    }
+                    Repeater {
+                        model: root.savedMemories
+                        delegate: Rectangle {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            implicitHeight: memRow.implicitHeight + 12
+                            radius: 8
+                            color: root.bgInput
+                            border.width: 1
+                            border.color: root.borderSubtle
+
+                            RowLayout {
+                                id: memRow
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.leftMargin: 10
+                                anchors.rightMargin: 6
+                                spacing: 8
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: (modelData.key || "") + ": " + (modelData.value || "")
+                                    color: root.textPrimary
+                                    font.pixelSize: 12
+                                    wrapMode: Text.WordWrap
+                                }
+                                Button {
+                                    text: "×"
+                                    onClicked: {
+                                        settingsBridge.deleteMemory(modelData.key || modelData.id || "")
+                                        root.refreshMemoryAndNotes()
+                                    }
+                                    contentItem: Text { text: "×"; color: root.dangerSoft; font.pixelSize: 15; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                                    background: Rectangle { implicitWidth: 24; implicitHeight: 24; radius: 6; color: parent.hovered ? "#2a1b24" : "transparent" }
+                                }
+                            }
+                        }
+                    }
+
+                    // Local notes
+                    Text {
+                        visible: root.savedNotes.length > 0
+                        text: "Saved Notes"
+                        color: root.textPrimary
+                        font.pixelSize: 12
+                        font.weight: Font.Medium
+                    }
+                    Repeater {
+                        model: root.savedNotes
+                        delegate: Rectangle {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            implicitHeight: noteRow.implicitHeight + 12
+                            radius: 8
+                            color: root.bgInput
+                            border.width: 1
+                            border.color: root.borderSubtle
+
+                            RowLayout {
+                                id: noteRow
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.leftMargin: 10
+                                anchors.rightMargin: 6
+                                spacing: 8
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 2
+                                    Text { text: modelData.title || ""; color: root.accentIce; font.pixelSize: 12; font.weight: Font.Medium }
+                                    Text { text: modelData.content || ""; color: root.textSecondary; font.pixelSize: 11; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                                }
+                                Button {
+                                    text: "×"
+                                    onClicked: {
+                                        settingsBridge.deleteNote(modelData.title || "")
+                                        root.refreshMemoryAndNotes()
+                                    }
+                                    contentItem: Text { text: "×"; color: root.dangerSoft; font.pixelSize: 15; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                                    background: Rectangle { implicitWidth: 24; implicitHeight: 24; radius: 6; color: parent.hovered ? "#2a1b24" : "transparent" }
+                                }
+                            }
+                        }
+                    }
+
+                    // Recent transcript turns
+                    Text {
+                        visible: root.recentTranscript.length > 0
+                        text: "Recent Conversation"
+                        color: root.textPrimary
+                        font.pixelSize: 12
+                        font.weight: Font.Medium
+                    }
+                    Repeater {
+                        model: root.recentTranscript
+                        delegate: Rectangle {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            implicitHeight: txCol.implicitHeight + 10
+                            radius: 8
+                            color: modelData.role === "user" ? "#111b2a" : "#0e1522"
+                            border.width: 1
+                            border.color: root.borderSubtle
+
+                            ColumnLayout {
+                                id: txCol
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.top
+                                anchors.margins: 6
+                                spacing: 2
+                                Text {
+                                    text: (modelData.role === "user" ? "You" : "Autum") + (modelData.timestamp ? ("  •  " + modelData.timestamp) : "")
+                                    color: modelData.role === "user" ? root.accentGlow : root.accentIce
+                                    font.pixelSize: 10
+                                    font.weight: Font.DemiBold
+                                }
+                                Text {
+                                    text: modelData.text || ""
+                                    color: root.textPrimary
+                                    font.pixelSize: 12
+                                    wrapMode: Text.WordWrap
+                                    Layout.fillWidth: true
                                 }
                             }
                         }

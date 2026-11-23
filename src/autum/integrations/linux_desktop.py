@@ -27,6 +27,7 @@ from typing import Any, Awaitable, Callable, Sequence
 from autum.integrations import IntegrationContext
 from autum.integrations.kwin_windows import SNAP_POSITIONS, KWinController, normalize_position
 from autum.integrations.screen_watch import ScreenWatcher
+from autum.integrations.window_backends import detect_window_controller
 from autum.logging import redact_sensitive
 from autum.perception import is_excluded_path, resolve_allowed_path
 from autum.tools import Capability, PermissionLevel, ToolRegistry
@@ -366,7 +367,7 @@ class LinuxDesktopIntegration:
         self.launcher = launcher
         self.app_dirs = app_dirs
         self.screen_watcher = screen_watcher if screen_watcher is not None else ScreenWatcher()
-        self.window_controller = window_controller if window_controller is not None else KWinController()
+        self.window_controller = window_controller if window_controller is not None else detect_window_controller()
         self._set_obs: Callable[[str], None] | None = None
         self._end_obs: Callable[[str], None] | None = None
 

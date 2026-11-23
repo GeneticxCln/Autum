@@ -28,6 +28,40 @@ tar -C "${APPDIR}/usr" -xzf "${STAGE}/python.tar.gz" --strip-components=1
 "${APPDIR}/usr/bin/python3" -m pip install --no-cache-dir --upgrade pip
 "${APPDIR}/usr/bin/python3" -m pip install --no-cache-dir "${ROOT}[desktop]"
 
+# Prune unused PySide6/Qt modules that Autum never imports (~200 MiB savings)
+SITE_PKG="${APPDIR}/usr/lib/python3.12/site-packages"
+PYSIDE_DIR="${SITE_PKG}/PySide6"
+if [[ -d "${PYSIDE_DIR}" ]]; then
+  UNUSED_QT=(
+    WebEngine WebEngineCore WebEngineQuick WebEngineWidgets
+    Pdf PdfWidgets
+    3DCore 3DExtras 3DInput 3DLogic 3DQuick 3DQuickExtras 3DQuickInput 3DQuickRender 3DQuickScene2D 3DRender
+    Quick3D Quick3DAssetImport Quick3DAssetUtils Quick3DEffects Quick3DHelpers Quick3DParticles Quick3DRuntimeRender Quick3DUtils
+    Multimedia MultimediaWidgets SpatialAudio
+    Charts Graphs DataVisualization
+    Designer UiTools Help Linguist
+    Sql Location Positioning Bluetooth Sensors Nfc SerialPort SerialBus
+    WebSockets WebChannel WebView HttpServer OpcUa RemoteObjects
+    VirtualKeyboard TextToSpeech Test StateMachine Scxml
+  )
+  for mod in "${UNUSED_QT[@]}"; do
+    rm -rf \
+      "${PYSIDE_DIR}/Qt${mod}"* \
+      "${PYSIDE_DIR}/Qt/lib/libQt6${mod}"* \
+      "${PYSIDE_DIR}/Qt/qml/Qt${mod}"* \
+      "${PYSIDE_DIR}/Qt/plugins/"*"${mod}"* \
+      "${PYSIDE_DIR}/Qt/libexec/QtWebEngineProcess" \
+      "${PYSIDE_DIR}/Qt/resources/qtwebengine"* \
+      "${PYSIDE_DIR}/Qt/translations/qtwebengine"* 2>/dev/null || true
+  done
+  rm -rf "${PYSIDE_DIR}/examples" "${PYSIDE_DIR}/include" "${PYSIDE_DIR}/typesystems" "${PYSIDE_DIR}/glue" 2>/dev/null || true
+fi
+find "${SITE_PKG}" -type d \( -name "tests" -o -name "test" -o -name "__pycache__" \) -prune -exec rm -rf {} + 2>/dev/null || true
+
+# Verify pruned bundle still imports Autum and required PySide6 modules cleanly
+QT_QPA_PLATFORM=offscreen "${APPDIR}/usr/bin/python3" -c \
+  "import autum, PySide6.QtCore, PySide6.QtGui, PySide6.QtQml, PySide6.QtQuick, PySide6.QtNetwork; print('AppDir smoke OK:', autum.__version__)"
+
 install -m 0644 "${ROOT}/contrib/autum.desktop" "${APPDIR}/autum.desktop"
 install -m 0644 "${ROOT}/contrib/autum.desktop" "${APPDIR}/usr/share/applications/autum.desktop"
 install -m 0644 "${ROOT}/assets/autum-icon.png" "${APPDIR}/autum.png"

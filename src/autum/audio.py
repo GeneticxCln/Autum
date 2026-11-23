@@ -97,9 +97,17 @@ def _kill(proc: asyncio.subprocess.Process | None) -> None:
             pass
 
 
-async def check_microphone(spawn_: Spawn = spawn, timeout_s: float = MIC_STALL_S) -> bool:
+async def check_microphone(
+    spawn_: Spawn = spawn,
+    timeout_s: float = MIC_STALL_S,
+    target: str | None = None,
+) -> bool:
     """True if the microphone delivers audio within timeout_s (nothing is kept)."""
-    proc = await spawn_("pw-record", "--raw", "--rate", str(MIC_RATE), "--channels", "1", "--format", "s16", "-", stdout=PIPE)
+    target_args = ("--target", target) if target else ()
+    proc = await spawn_(
+        "pw-record", *target_args, "--raw", "--rate", str(MIC_RATE), "--channels", "1", "--format", "s16", "-",
+        stdout=PIPE,
+    )
     try:
         await asyncio.wait_for(proc.stdout.readexactly(MIC_RATE // 50), timeout_s)  # 10 ms of audio
         return True
@@ -108,6 +116,133 @@ async def check_microphone(spawn_: Spawn = spawn, timeout_s: float = MIC_STALL_S
     finally:
         _kill(proc)
         await proc.wait()
+
+
+def list_pipewire_devices(timeout_s: float = 2.0) -> dict[str, list[dict[str, object]]]:
+    """Return available PipeWire microphone inputs (non-monitor) and speaker outputs."""
+    import json
+    import subprocess
+
+    def _run(*cmd: str) -> str:
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, check=False)
+            return res.stdout if res.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    default_src = _run("pactl", "get-default-source").strip()
+    default_sink = _run("pactl", "get-default-sink").strip()
+
+    def _parse(kind: str, default_name: str, skip_monitors: bool) -> list[dict[str, object]]:
+        raw = _run("pactl", "-f", "json", "list", kind)
+        items: list[dict[str, object]] = []
+        if raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    for entry in parsed:
+                        if not isinstance(entry, dict):
+                            continue
+                        name = str(entry.get("name") or "").strip()
+                        if not name:
+                            continue
+                        if skip_monitors and name.endswith(".monitor"):
+                            continue
+                        if name in (AEC_SOURCE, AEC_SINK):
+                            continue
+                        desc = str(entry.get("description") or name).strip()
+                        state = str(entry.get("state") or "UNKNOWN").upper()
+                        items.append(
+                            {
+                                "name": name,
+                                "description": desc,
+                                "state": state,
+                                "is_default": name == default_name,
+                            }
+                        )
+                    return items
+            except ValueError:
+                pass
+        # Fallback to `pactl list short <kind>` when JSON output is unavailable
+        short = _run("pactl", "list", "short", kind)
+        for line in short.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            name = parts[1].strip()
+            if not name or (skip_monitors and name.endswith(".monitor")) or name in (AEC_SOURCE, AEC_SINK):
+                continue
+            state = parts[-1].strip().upper() if len(parts) >= 5 else "UNKNOWN"
+            items.append(
+                {
+                    "name": name,
+                    "description": name,
+                    "state": state,
+                    "is_default": name == default_name,
+                }
+            )
+        return items
+
+    return {
+        "inputs": _parse("sources", default_src, skip_monitors=True),
+        "outputs": _parse("sinks", default_sink, skip_monitors=False),
+    }
+
+
+def probe_microphone_sync(target: str = "", duration_s: float = 0.6, timeout_s: float = 2.0) -> dict[str, object]:
+    """Capture a short PCM snippet from `target` (or default source) and return health & RMS level."""
+    import select
+    import subprocess
+
+    clean_target = (target or "").strip()
+    cmd = ["pw-record"]
+    if clean_target:
+        cmd.extend(["--target", clean_target])
+    cmd.extend(["--raw", "--rate", str(MIC_RATE), "--channels", "1", "--format", "s16", "--latency", "20ms", "-"])
+    want_bytes = max(320, int(duration_s * MIC_RATE * 2))
+    buf = bytearray()
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        return {"ok": False, "rms": 0.0, "bytes_read": 0, "device": clean_target or "default", "error": str(exc)}
+    deadline = time.monotonic() + timeout_s
+    try:
+        assert proc.stdout is not None
+        fd = proc.stdout.fileno()
+        while len(buf) < want_bytes:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                break
+            ready, _, _ = select.select([fd], [], [], min(0.15, rem))
+            if not ready:
+                continue
+            chunk = proc.stdout.read1(min(3200, want_bytes - len(buf)))  # type: ignore[attr-defined]
+            if not chunk:
+                break
+            buf.extend(chunk)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+    if len(buf) < MIC_RATE // 50:
+        return {
+            "ok": False,
+            "rms": 0.0,
+            "bytes_read": len(buf),
+            "device": clean_target or "default",
+            "error": "No audio received within 2 seconds (microphone may be stalled, muted, or disconnected).",
+        }
+    level = round(rms(bytes(buf)), 4)
+    return {
+        "ok": True,
+        "rms": level,
+        "bytes_read": len(buf),
+        "device": clean_target or "default",
+        "error": "",
+    }
 
 
 class Transcriber(Protocol):
@@ -500,7 +635,19 @@ class SpeechPlayer:
         self.bus.emit("speech.output_level", {"rms": round(level, 4)}, turn_id=self._turn, operation_id=op)
 
 
-async def read_source_muted() -> bool | None:
+async def read_source_muted(target: str | None = None) -> bool | None:
+    if target:
+        proc = await asyncio.create_subprocess_exec(
+            "pactl", "get-source-mute", target, stdout=PIPE, stderr=asyncio.subprocess.DEVNULL
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), 2.0)
+        except asyncio.TimeoutError:
+            _kill(proc)
+            await proc.wait()
+            return None
+        if proc.returncode == 0:
+            return b"yes" in out.lower()
     proc = await asyncio.create_subprocess_exec(
         "wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@", stdout=PIPE, stderr=asyncio.subprocess.DEVNULL
     )

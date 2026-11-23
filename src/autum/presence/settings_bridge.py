@@ -109,6 +109,11 @@ class SettingsBridge(QObject):
 
     @Slot("QVariantMap", result="QVariantMap")
     def saveAndApply(self, raw: dict[str, Any]) -> dict[str, Any]:
+        prev: Config | None = None
+        try:
+            prev = Config.load(self._config_path)
+        except Exception:
+            prev = None
         try:
             allowed_dirs = [str(p).strip() for p in (raw.get("allowed_read_dirs") or []) if str(p).strip()]
             excluded = [str(w).strip() for w in (raw.get("excluded_windows") or []) if str(w).strip()]
@@ -138,9 +143,17 @@ class SettingsBridge(QObject):
             saved = cfg.save(self._config_path)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+        restart_fields: list[str] = []
+        if prev is not None:
+            if cfg.aec != prev.aec:
+                restart_fields.append("AEC")
+            if cfg.enabled_integrations != prev.enabled_integrations:
+                restart_fields.append("integrations")
+            if cfg.data_dir != prev.data_dir:
+                restart_fields.append("data folder")
         if self._model is not None:
             self._model.reloadConfig()
-        return {"ok": True, "path": str(saved)}
+        return {"ok": True, "path": str(saved), "restart_required": restart_fields}
 
     @Slot(str)
     def setModeAndPersist(self, mode: str) -> None:

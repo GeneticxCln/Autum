@@ -52,7 +52,7 @@ from autum.ollama import (
     check_ready,
     preload,
     resolve_speech_model,
-    tune_large_model_vram,
+    unload,
 )
 from autum.perception import OllamaVision, register_perception_capabilities
 from autum.runtime import Mode, Runtime, State
@@ -344,7 +344,6 @@ async def main(argv: Sequence[str] | None = None) -> int:
             voice_model = await resolve_speech_model(client, cfg.model, base_url=cfg.ollama_url)
             if voice_model != cfg.model:
                 log(f"{cfg.model} has no TTS speech weights in Ollama; using {voice_model} for voice audio I/O.")
-            await tune_large_model_vram(client, chat_model, base_url=cfg.ollama_url)
 
             _FAST_TAGS = ("gemma4", "gemma-4", "qwen3", "qwen-3")
             chat_effort = None if cfg.chat_think else ("none" if any(k in chat_model.lower() for k in _FAST_TAGS) else None)
@@ -516,12 +515,12 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 if resolved_voice != new_voice:
                     log(f"{new_voice} has no TTS speech weights in Ollama; using {resolved_voice} for voice audio I/O.")
                 new_voice = resolved_voice
-                await tune_large_model_vram(client, new_chat, base_url=base)
 
                 c_eff = None if new_cfg.chat_think else ("none" if any(k in new_chat.lower() for k in _FAST_TAGS) else None)
                 v_eff = None if new_cfg.chat_think else ("none" if any(k in new_vis.lower() for k in _FAST_TAGS) else None)
 
                 need_swap = new_cfg.dynamic_swap and len({m for m in (new_chat, new_vis) if m != new_voice}) > 1
+                prev_swapper = swapper
                 if need_swap:
                     if swapper is None:
                         swapper = ModelSwapper(
@@ -534,6 +533,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
                         swapper.base_url = base
                         swapper.pinned = frozenset((new_voice,))
                 else:
+                    if prev_swapper is not None and prev_swapper.active and prev_swapper.active not in (new_chat, new_voice):
+                        await unload(client, model=prev_swapper.active, base_url=base)
                     swapper = None
 
                 chat.model = new_chat

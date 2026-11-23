@@ -274,32 +274,6 @@ async def resolve_speech_model(client: httpx.AsyncClient, model: str, base_url: 
     return model
 
 
-async def tune_large_model_vram(client: httpx.AsyncClient, model: str, base_url: str = OLLAMA) -> None:
-    """Ensure >=10.5 GB GGUF models (e.g. 12B Q8_0) leave enough VRAM on 16 GB GPUs for the pinned voice model."""
-    base = base_url.rstrip("/")
-    try:
-        tags = await client.get(f"{base}/api/tags", timeout=3)
-        if tags.status_code != 200:
-            return
-        size_bytes = 0
-        for m in tags.json().get("models", []):
-            if m.get("name") == model:
-                size_bytes = int(m.get("size") or 0)
-                break
-        if size_bytes < int(10.5 * (1024**3)):
-            return
-        show = await client.post(f"{base}/api/show", json={"name": model}, timeout=3)
-        if show.status_code == 200 and "num_gpu" in (show.json().get("parameters") or ""):
-            return
-        await client.post(
-            f"{base}/api/create",
-            json={"model": model, "from": model, "parameters": {"num_ctx": 2048, "num_gpu": 35}, "stream": False},
-            timeout=15,
-        )
-    except (httpx.HTTPError, ValueError):
-        pass
-
-
 async def check_ready(client: httpx.AsyncClient, model: str = MODEL, base_url: str = OLLAMA) -> str | None:
     """None if Ollama runs and has the model; otherwise what to do about it."""
     try:

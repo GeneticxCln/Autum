@@ -569,6 +569,42 @@ def test_hands_free_smart_barge_in_ignores_speaker_echo_and_interrupts_on_wake_q
     user_msgs = [m["content"] for m in rt_wake.history if m["role"] == "user"]
     assert "what time is it right now?" in user_msgs
 
+    # 3. Follow-up questions & noun-initial questions are NEVER falsely dropped or mangled
+    rt = Runtime(EventBus("echo"), MockInference("ok"), MockSpeech(EventBus("echo")), mode=Mode.HANDS_FREE)
+    rt.current_spoken_text = "The capital of France is Paris and it is famous for the Eiffel Tower."
+    assert rt.is_self_echo("capital of France is Paris and it is famous") is True
+    assert rt.is_self_echo("What is the capital of France?") is False
+    assert rt.is_self_echo("Paris?") is False
+
+    assert Runtime.clean_wake_transcript("Atom bombs, how do they work?") == ("Atom bombs, how do they work?", False)
+    assert Runtime.clean_wake_transcript("Autumn leaves are falling") == ("Autumn leaves are falling", False)
+    assert Runtime.clean_wake_transcript("Otto von Bismarck") == ("Otto von Bismarck", False)
+    assert Runtime.clean_wake_transcript("Autum, what time is it?") == ("what time is it?", False)
+    assert Runtime.clean_wake_transcript("Hey Autumn, tell me a joke") == ("tell me a joke", False)
+
+    # 4. Runtime.max_history setter actually resizes history deque maxlen live
+    rt.max_history = 4
+    assert rt.max_history == 4 and rt.history.maxlen == 4
+
+    # 5. Loud first syllable must NOT cause normal ongoing speech to be treated as silence
+    import array, math
+
+    def _sine_frame(amp: float) -> bytes:
+        return array.array("h", [int(amp * 32767 * math.sin(2 * math.pi * 400 * i / 16000)) for i in range(512)]).tobytes()
+
+    det = TurnDetector(lambda _pcm: 0.9, min_speech_ms=96, silence_ms=160)
+    det._use_energy_gate = True
+    # 5 loud frames (RMS ~0.35), then 20 normal frames (RMS ~0.03) — must stay in speech without ending early!
+    started = False
+    ended_early = False
+    for f in [_sine_frame(0.5)] * 5 + [_sine_frame(0.045)] * 20:
+        ev = det.feed(f)
+        if ev and ev.kind == "speech_started":
+            started = True
+        if ev and ev.kind == "speech_ended":
+            ended_early = True
+    assert started and not ended_early and det.in_speech
+
 
 def test_hands_free_respects_hard_mute_and_resumes_on_unmute():
     async def scenario():

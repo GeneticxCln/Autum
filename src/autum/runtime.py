@@ -169,6 +169,16 @@ class Runtime:
     # ----- state ---------------------------------------------------------
 
     @property
+    def max_history(self) -> int:
+        return self.history.maxlen or 20
+
+    @max_history.setter
+    def max_history(self, value: int) -> None:
+        limit = max(1, int(value))
+        if self.history.maxlen != limit:
+            self.history = deque(self.history, maxlen=limit)
+
+    @property
     def capturing(self) -> bool:
         return self._capture_count > 0
 
@@ -199,9 +209,16 @@ class Runtime:
         return False
 
     _WAKE_WORDS = frozenset(
-        {"autum", "autumn", "atom", "otto", "stop", "wait", "hold", "cancel", "pause", "quiet", "enough", "listen"}
+        {"autum", "autumn", "stop", "wait", "hold", "cancel", "pause", "quiet", "enough", "listen"}
     )
     _WAKE_GREETINGS = frozenset({"hey", "hi", "ok", "okay", "yo", "excuse", "no"})
+    _QUESTION_HEADS = frozenset(
+        {
+            "what", "why", "how", "when", "where", "who", "which", "whose",
+            "can", "could", "would", "should", "do", "does", "did", "is", "are",
+            "tell", "show", "open", "close", "move", "focus", "check", "run",
+        }
+    )
     _STOP_PHRASES = frozenset(
         {
             "stop",
@@ -221,8 +238,14 @@ class Runtime:
     )
 
     def is_self_echo(self, transcript: str) -> bool:
-        """True if `transcript` is speaker bleed of Autum's own active speech rather than a user wake call or question."""
-        words = re.findall(r"[a-z0-9']+", (transcript or "").lower())
+        """True if `transcript` is verbatim speaker bleed of Autum's own active speech.
+
+        Uses ordered word-bigram matching (requiring >= 3 words and >= 65% consecutive
+        bigrams in order) so genuine follow-up questions like 'What is the capital of France?'
+        or short queries like 'Paris?' are NEVER falsely discarded as echo.
+        """
+        raw = (transcript or "").strip()
+        words = re.findall(r"[a-z0-9']+", raw.lower())
         if not words:
             return True
         # Explicit wake-on-call ("Autum, ...", "Hey Autum, ...", "Stop", "Wait, ...") is NEVER echo
@@ -230,24 +253,36 @@ class Runtime:
             return False
         if len(words) >= 2 and words[0] in self._WAKE_GREETINGS and words[1] in self._WAKE_WORDS:
             return False
-        spoken_words = set(re.findall(r"[a-z0-9']+", (self.current_spoken_text or "").lower()))
-        if spoken_words:
-            overlap = sum(1 for w in words if w in spoken_words) / len(words)
-            if overlap >= 0.50:
+        # Short follow-up questions ("Paris?", "Really?") and direct questions are NOT speaker bleed
+        if raw.endswith("?") and (len(words) <= 2 or words[0] in self._QUESTION_HEADS):
+            return False
+        if len(words) < 3:
+            return False
+        spoken_words = re.findall(r"[a-z0-9']+", (self.current_spoken_text or "").lower())
+        if len(spoken_words) < 2:
+            return False
+        spoken_bigrams = {(spoken_words[i], spoken_words[i + 1]) for i in range(len(spoken_words) - 1)}
+        cand_bigrams = [(words[i], words[i + 1]) for i in range(len(words) - 1)]
+        if cand_bigrams:
+            matched = sum(1 for bg in cand_bigrams if bg in spoken_bigrams)
+            if matched / len(cand_bigrams) >= 0.65:
                 return True
         return False
 
     @classmethod
     def clean_wake_transcript(cls, transcript: str) -> tuple[str, bool]:
-        """Strip optional leading wake call ('Autum,', 'Hey Autum,') and detect pure stop commands.
+        """Strip optional leading wake call ('Autum,', 'Hey Autum,', 'Autumn,') and detect pure stop commands.
 
+        Never strips ordinary nouns like 'Atom bombs...' or 'Autumn leaves...'.
         Returns `(cleaned_text, is_stop_only)`.
         """
         raw = (transcript or "").strip()
         if not raw:
             return "", False
+        # Strip "Autum" (optional greeting + separator) OR "Autumn" ONLY when preceded by
+        # a greeting ("Hey Autumn ...") or followed immediately by punctuation ("Autumn, ...").
         cleaned = re.sub(
-            r"^\s*(?:(?:hey|hi|ok|okay|yo)\s+)?(?:autum|autumn|atom|otto)\b[\s,.:;!\-]*",
+            r"^\s*(?:(?:hey|hi|ok|okay|yo)\s+(?:autum|autumn)\b[\s,.:;!\-]*|autum\b[\s,.:;!\-]*|autumn[,.:;!\-]+\s*)",
             "",
             raw,
             flags=re.IGNORECASE,
@@ -255,8 +290,8 @@ class Runtime:
         norm = re.sub(r"[^a-z0-9\s]+", "", (cleaned or raw).lower()).strip()
         norm = re.sub(r"\s+", " ", norm)
         if not cleaned or norm in cls._STOP_PHRASES:
-            # If user only said "Autum, stop" or "Stop" or "Wait" (without a follow-up question)
-            if not cleaned and re.sub(r"[^a-z0-9\s]+", "", raw.lower()).strip() in {"autum", "autumn", "hey autum", "hey autumn"}:
+            bare = re.sub(r"[^a-z0-9\s]+", "", raw.lower()).strip()
+            if not cleaned and bare in {"autum", "autumn", "hey autum", "hey autumn"}:
                 return "", True
             if norm in cls._STOP_PHRASES:
                 return "", True

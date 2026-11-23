@@ -202,7 +202,10 @@ Window {
         const res = settingsBridge.saveAndApply(payload)
         if (res && res.ok) {
             statusError = false
-            statusText = "Saved & applied live"
+            const needsRestart = res.restart_required || []
+            statusText = needsRestart.length > 0
+                ? ("Saved & applied (restart Autum for " + needsRestart.join(", ") + ")")
+                : "Saved & applied live"
             refreshModels()
             runSelfDiagnosis()
         } else {

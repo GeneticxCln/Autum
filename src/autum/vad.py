@@ -92,7 +92,7 @@ class TurnDetector:
         self._in_speech = False
         self._speech_run = 0
         self._silence_run = 0
-        self._peak_rms = 0.0
+        self._noise_rms = 0.005
         self._use_energy_gate = isinstance(scorer, SileroVad)
 
     @property
@@ -106,7 +106,6 @@ class TurnDetector:
         self._in_speech = False
         self._speech_run = 0
         self._silence_run = 0
-        self._peak_rms = 0.0
         if hasattr(self.scorer, "reset"):
             self.scorer.reset()
 
@@ -120,18 +119,18 @@ class TurnDetector:
     def feed(self, pcm_frame: bytes, *, speaking: bool = False, min_rms: float = 0.012) -> TurnEvent | None:
         prob = float(self.scorer(pcm_frame))
         frame_rms = self._frame_rms(pcm_frame) if self._use_energy_gate else 1.0
-        eff_min_rms = max(0.012, min_rms)
+        if self._use_energy_gate and not self._in_speech and prob < 0.20:
+            self._noise_rms = 0.92 * self._noise_rms + 0.08 * min(0.015, max(0.002, frame_rms))
+        eff_min_rms = max(0.012, min_rms, self._noise_rms * 2.0)
         if not self._in_speech:
             self._pre_roll.append(pcm_frame)
             is_voice = prob >= self.threshold and (not self._use_energy_gate or frame_rms >= eff_min_rms)
             if is_voice:
                 self._speech_run += 1
                 self._speech_probs.append(prob)
-                self._peak_rms = max(self._peak_rms, frame_rms)
             else:
                 self._speech_run = 0
                 self._speech_probs.clear()
-                self._peak_rms = 0.0
             need = self.barge_in_frames if speaking else self.min_speech_frames
             if self._speech_run >= need:
                 self._in_speech = True
@@ -143,22 +142,17 @@ class TurnDetector:
             return None
 
         self._utterance.append(pcm_frame)
-        self._peak_rms = max(self._peak_rms, frame_rms)
-        if speaking and self._use_energy_gate:
-            min_continue_rms = max(eff_min_rms, self._peak_rms * 0.45)
-            cont_prob = self.threshold
-        else:
-            min_continue_rms = max(eff_min_rms * 0.85, self._peak_rms * 0.25) if self._use_energy_gate else 0.0
-            cont_prob = self.neg_threshold
-        if prob >= cont_prob and frame_rms >= min_continue_rms:
+        # Never scale the continuation floor off a loud peak syllable (which cuts off
+        # normal speech after a loud start); anchor it gently above the quiet noise floor.
+        min_continue_rms = max(0.009, min_rms * 0.80, self._noise_rms * 1.6) if self._use_energy_gate else 0.0
+        if prob >= self.neg_threshold and frame_rms >= min_continue_rms:
             self._silence_run = 0
             if prob >= self.threshold:
                 self._speech_probs.append(prob)
         else:
             self._silence_run += 1
 
-        max_f = min(self.max_frames, max(1, math.ceil(2800 / FRAME_MS))) if speaking and self._use_energy_gate else self.max_frames
-        if self._silence_run >= self.silence_frames or len(self._utterance) >= max_f:
+        if self._silence_run >= self.silence_frames or len(self._utterance) >= self.max_frames:
             trim = max(0, self._silence_run - self.tail_frames)
             frames = self._utterance[:-trim] if trim else self._utterance
             pcm = b"".join(frames)
@@ -168,6 +162,5 @@ class TurnDetector:
             self._in_speech = False
             self._speech_run = 0
             self._silence_run = 0
-            self._peak_rms = 0.0
             return TurnEvent("speech_ended", pcm=pcm, confidence=conf)
         return None

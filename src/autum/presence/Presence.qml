@@ -168,9 +168,21 @@ Window {
         hovering: talkArea.hoveringOrb && !talkArea.dragging
     }
 
-    // Left-drag moves the orb anywhere on screen; holding talks immediately
-    // with 0 ms clipping (aborted silently if the press turns into a drag);
-    // right-click opens Hands-Free toggle, Self-Diagnose, and Settings.
+    Timer {
+        id: dragGraceTalkTimer
+        interval: 140
+        repeat: false
+        onTriggered: {
+            if (talkArea.leftHeld && !talkArea.dragging && !talkArea.talking) {
+                talkArea.talking = true
+                presence.talkStart()
+            }
+        }
+    }
+
+    // Left-drag moves the orb anywhere on screen; holding talks immediately at
+    // 0 ms when idle (or after a brief 140 ms drag grace window while Autum is
+    // speaking so dragging the orb out of the way never interrupts her reply).
     MouseArea {
         id: talkArea
         anchors.fill: parent
@@ -202,6 +214,7 @@ Window {
                 if (!dragging) {
                     const moveDist = Math.hypot(mouse.x - pressX, mouse.y - pressY)
                     if (moveDist >= 7) {
+                        dragGraceTalkTimer.stop()
                         dragging = true
                         if (talking) {
                             talking = false
@@ -228,13 +241,18 @@ Window {
             curY = mouse.y
             leftHeld = true
             dragging = false
-            // In push_to_talk mode (or when answering an approval prompt), start
-            // recording immediately at 0 ms so the first syllable is never clipped;
-            // in hands_free mode, don't cancel active speech if the user is just
-            // dragging the orb across the screen.
+            // In push_to_talk mode (or when answering an approval prompt):
+            // - At rest, start recording at 0 ms so the first syllable is never clipped.
+            // - While speaking/busy, use a 140 ms drag grace window so dragging the orb
+            //   out of the way never interrupts Autum's reply or opens the microphone.
             if (presence.mode !== "hands_free" || win.st === "waiting_for_approval") {
-                talking = true
-                presence.talkStart()
+                if (win.speaking || win.busy) {
+                    talking = false
+                    dragGraceTalkTimer.restart()
+                } else {
+                    talking = true
+                    presence.talkStart()
+                }
             } else {
                 talking = false
             }
@@ -242,6 +260,7 @@ Window {
         onReleased: (mouse) => {
             if (mouse.button !== Qt.LeftButton)
                 return
+            dragGraceTalkTimer.stop()
             if (dragging) {
                 const dx = Math.round(curX - pressX)
                 const dy = Math.round(curY - pressY)
@@ -253,7 +272,7 @@ Window {
                     settingsBridge.savePosition(win.marginRight, win.marginBottom)
             } else if (talking) {
                 presence.talkFinish()
-            } else if (presence.mode === "hands_free" && (win.speaking || win.busy)) {
+            } else if (win.speaking || win.busy) {
                 presence.stopSpeaking()
             }
             leftHeld = false
@@ -261,6 +280,7 @@ Window {
             talking = false
         }
         onCanceled: {
+            dragGraceTalkTimer.stop()
             if (talking)
                 presence.talkAbort()
             leftHeld = false

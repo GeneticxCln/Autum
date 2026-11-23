@@ -622,8 +622,10 @@ class HandsFreeInput:
 
     def _handle_frame(self, frame: bytes) -> None:
         now = time.monotonic()
-        # Never start a new utterance while Autum is transcribing (processing) or loading.
-        if self._runtime_state in ("processing", "loading"):
+        # Ignore microphone frames only while models are still loading at startup.
+        # During State.PROCESSING (transcribing a mid-sentence pause), keep listening
+        # so the second half of a paused sentence is never thrown away.
+        if self._runtime_state == "loading":
             if self.detector.in_speech:
                 self.detector.reset()
             self._candidate_barge_in = False
@@ -640,15 +642,17 @@ class HandsFreeInput:
                 self.detector.reset()
                 return
 
+        # Only treat incoming audio as a speaker-barge-in window while Autum is
+        # actually speaking out of the speakers (or during the brief post-speech echo tail).
         in_barge_window = self.smart_barge_in and (
-            self._runtime_state in ("thinking", "speaking") or self._autum_speaking or now < self._cooldown_until
+            self._runtime_state == "speaking" or now < self._cooldown_until
         )
         frame_rms = TurnDetector._frame_rms(frame) if self.smart_barge_in else 1.0
         if in_barge_window and not self.detector.in_speech and frame_rms < 0.055:
             self._bleed_rms = 0.90 * self._bleed_rms + 0.10 * max(0.012, frame_rms)
 
         min_rms = max(0.018, self._bleed_rms * 1.25) if in_barge_window else 0.012
-        event = self.detector.feed(frame, speaking=(self._autum_speaking or in_barge_window), min_rms=min_rms)
+        event = self.detector.feed(frame, speaking=in_barge_window or self._autum_speaking, min_rms=min_rms)
 
         # In smart_barge_in mode, if the user speaks unmistakably louder than the
         # speakers for barge_in_frames while a candidate turn is recording, cut

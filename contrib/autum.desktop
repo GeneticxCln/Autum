@@ -1,9 +1,10 @@
 [Desktop Entry]
 Type=Application
 Name=Autum
-Comment=Local voice-first AI assistant
-Path=/home/quinton/Projects/Autum
-Exec=/usr/bin/env PYTHONPATH=/home/quinton/Projects/Autum/src /usr/bin/python3 -m autum
+GenericName=Local Voice Assistant
+Comment=Local, model-agnostic voice-first AI desktop assistant
+Exec=autum
+Icon=autum
 Terminal=false
-NoDisplay=true
-Categories=Utility;
+Categories=Utility;AudioVideo;
+StartupNotify=false

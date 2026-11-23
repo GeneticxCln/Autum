@@ -1,132 +1,57 @@
-# Autum
+<p align="center">
+  <img src="assets/autum-orb.png" width="180" alt="Autum 3D Stardust Orb" />
+</p>
 
-A local, voice-first AI assistant with a runtime-driven visual presence,
-verified local capabilities, user-requested perception, and user-controlled
-persistent memory. See [the development plan](Autum-Development-Plan.md),
-[the runtime contract](docs/m0-runtime-contract.md),
-[ADR 0001](docs/adr/0001-runtime-language-and-event-transport.md),
-[ADR 0002](docs/adr/0002-voice-pipeline-and-resource-budget.md), and the
-[acceptance matrix](docs/acceptance-matrix.md).
+<h1 align="center">Autum</h1>
 
-## Run Autum
+<p align="center">
+  <strong>Local, model-agnostic voice-first AI assistant for Linux.</strong><br/>
+  A floating 3D stardust orb powered by local <a href="https://ollama.com">Ollama</a> models and PipeWire audio — zero cloud dependencies.
+</p>
 
-Autum is **model-agnostic** — this project does not bundle or provide AI models.
-You can use any locally installed Ollama models (`127.0.0.1:11434`) for each of
-the three roles (**Brain/Chat**, **Vision**, and **Voice**) and swap them live
-at any time from **Right-Click → Settings...** (or `~/.config/autum/config.toml`).
+<p align="center">
+  <a href="https://github.com/GeneticxCln/Autum/releases"><img src="https://img.shields.io/github/v/release/GeneticxCln/Autum?color=7cc7e8" alt="Release" /></a>
+  <a href="https://github.com/GeneticxCln/Autum/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/GeneticxCln/Autum/ci.yml?label=tests" alt="Tests" /></a>
+  <img src="https://img.shields.io/badge/platform-Linux%20(Wayland%20%2F%20X11)-blue" alt="Linux" />
+</p>
 
-*Models tested during development (RTX 4060 Ti 16 GB with dynamic VRAM swap):*
-- **Brain / Chat:** `gemma4:12b`, `qwen3:8b`, `lfm3-omni:2b`
-- **Vision:** `qwen3-vl:8b`, `gemma4:12b`
-- **Voice (STT + TTS):** `lfm3-omni:2b`
+---
 
-Requires local Ollama, PipeWire (`pw-record`, `pw-play`, `wpctl`), PySide6
-(`qt6-declarative`), and on Wayland `layer-shell-qt` (X11 fallback included).
+## Features
+
+- **3 Listening Modes** (switch live via right-click orb menu or Settings):
+  - **Push-to-Talk** — hold the orb to talk, drag anywhere on screen.
+  - **Wake Word (`"Autum"`)** — ignores room/TV chatter until you call `"Autum"` / `"Hey Autum"`, with a 12 s follow-up window.
+  - **Hands-Free** — continuous Silero VAD conversation with speaker echo filtering and barge-in.
+- **Model-Agnostic Local AI** — pick any locally installed Ollama models for **Brain/Chat**, **Vision**, and **Voice (STT/TTS)** in Settings with dynamic GPU VRAM swapping.
+- **Local Tools & Desktop Control** — clock, timers, local notes, persistent memory, scoped document/image reading, live opt-in screen watch, KDE Plasma / KWin window management, app launching, and built-in self-diagnosis.
+- **Privacy by Default** — localhost-only Ollama, fail-closed `allowed_read_dirs`, excluded password/wallet windows, secret redaction in logs, and explicit approval for destructive actions.
+
+## Install
+
+Download the latest release from [**Releases**](https://github.com/GeneticxCln/Autum/releases):
+
+| Package | Command |
+| :--- | :--- |
+| **AppImage** (any Linux distro) | `chmod +x Autum-*-x86_64.AppImage && ./Autum-*-x86_64.AppImage` |
+| **Debian / Ubuntu (`.deb`)** | `sudo apt install ./autum_*_all.deb` |
+| **Fedora / openSUSE (`.rpm`)** | `sudo dnf install ./autum-*.noarch.rpm` |
+| **From source** | `pip install ".[desktop]" && autum` |
+
+## Prerequisites & Recommended Models
+
+1. **Linux with PipeWire** (`pw-record`, `pw-play`, `wpctl`) and [**Ollama**](https://ollama.com) running locally.
+2. Pull any models you prefer (recommended 16 GB GPU setup — 100% GPU with ~3 GB desktop headroom):
+   ```bash
+   ollama pull lfm3-omni:2b   # Voice STT + TTS (~1.6 GB)
+   ollama pull gemma4:12b     # Brain / Chat (~8.0 GB)
+   ollama pull qwen3-vl:8b    # Vision (~6.2 GB, swapped on demand)
+   ```
+3. Launch **Autum** from your app menu or run `autum`. Right-click the orb to switch listening mode, open **Settings** (shows version & live model pickers), or run **Self-Diagnose**.
+
+## Development
 
 ```bash
-# Push-to-talk (default)
+PYTHONPATH=src python3 -m pytest -q
 PYTHONPATH=src python3 -m autum
-
-# Hands-free conversation (streaming Silero VAD v6 + voice barge-in)
-PYTHONPATH=src python3 -m autum --hands-free          # with headphones
-PYTHONPATH=src python3 -m autum --hands-free --aec    # with speakers (PipeWire WebRTC AEC)
-```
-
-Autum runs in the background. Her visual presence is a 300 px 3D stippled face
-suspended inside a frosted stardust orb that follows you across windows and
-virtual desktops via Wayland `wlr-layer-shell`:
-
-- **Move anywhere:** click and drag the orb anywhere on screen (position is remembered across restarts)
-- **Right-click menu:** toggle **Hands-Free Mode**, **Stop Speaking**, run **Self-Diagnose...**, open **Settings...**, or **Reset Position**
-- **Hold to talk:** press and hold the orb briefly (or hold the global shortcut, suggested `Meta+Z`), speak, and release; holding while Autum speaks interrupts her immediately
-- **Idle:** frosted silver-ice, slow stardust orbit and gentle 3D breathing sway
-- **Listening / speech detected:** cool ice-cyan, gathered inward, attentive gaze, warm open-mic edge aura
-- **Thinking / processing:** silver-violet swirling stardust bands with subtle crown wave
-- **Speaking:** luminous silver-blue with audio-reactive jaw articulation and outward stardust burst
-- **Waiting for approval:** warm gold tint
-- **Observing (image / document / window / screen):** cool cyan-teal outer halo and attentive eye sheen
-- **Muted:** grey with a lower-right gap (controlled only by your OS mic mute; Autum never unmutes it)
-
-## Capabilities & Privacy
-
-- **Local tools:** clock (`get_time`), countdown timers (`set_timer`,
-  `list_timers`, `cancel_timer`), local notes (`create_note` — never overwrites,
-  `list_notes`, `read_note`, `delete_note`).
-- **Perception (user-requested only):** `inspect_image` (local `lfm3-omni:2b`
-  vision) and `read_document` (text/markdown/code/PDF). Secret stores
-  (`~/.ssh`, `~/.gnupg`, `.env`, `*.kdbx`, `*.pem`, etc.) are blocked and
-  outputs are tagged `observed` (untrusted data, never commands).
-- **Persistent memory (user-selected only):** `remember_fact`,
-  `recall_memories`, and `forget_memory` stored in
-  `~/.local/share/autum/memory.json` with provenance tracking and secret
-  exclusion. Conversations are not saved by default, and raw WAV audio is
-  released after every turn.
-- **Replaceable Linux desktop integration (`linux_desktop`):**
-  - **Info & files:** `system_info`, scoped `list_directory` (`allowed_read_dirs`).
-  - **Eyes (opt-in live screen vision):** `start_screen_watch` (one-time KDE ScreenCast share picker; keeps a single downscaled JPEG in RAM while the cloud's cyan-teal halo stays lit), `look_at_screen` (instant local vision on the latest live frame), `stop_screen_watch`, and one-shot `inspect_selected_window`.
-  - **Hands (KDE KWin window control & apps):** `open_application`, `list_windows`, `focus_window`, `move_window` (snap/tile left/right/top/bottom/center/corners, coordinates, or move to another virtual desktop), `window_state` (minimize/maximize/restore), and `close_window` *(irreversible — requires approval)*. Password managers and wallets are excluded.
-- **Approvals & audit:** irreversible actions (`delete_note`, `forget_memory`,
-  `close_window`) always require explicit user approval (single-use, timed,
-  anti-spoofed). Actions are recorded in a redacted audit log at
-  `~/.local/share/autum/audit.jsonl`.
-- **Self-awareness, self-diagnosis & problem log:** Autum knows her live AI
-  models, GPU VRAM residency, listening mode, microphone state, and folder
-  permissions on every turn. She can run `self_diagnose` on demand, inspect
-  recent errors with `list_problems`, and record bugs or failures with
-  `log_problem` into a redacted, owner-only diagnostics log at
-  `~/.local/share/autum/diagnostics.jsonl` (`0600`) — also viewable under
-  **Right-Click → Self-Diagnose...**.
-
-## Configuration
-
-Right-click the orb and choose **Settings...** to edit all settings visually
-(including live Ollama model pickers for **Brain/Chat**, **Vision**, and
-**Voice**, dynamic VRAM swap, thinking mode, Hands-Free/AEC, allowed folders,
-approvals, and excluded windows) and apply changes live without restarting.
-
-Settings are saved with owner-only permissions (`0600`) at
-`~/.config/autum/config.toml` (or `--config PATH`):
-
-```toml
-mode = "push_to_talk"               # or "hands_free"
-chat_model = "gemma4:12b"           # any local Ollama model for Brain/Chat
-vision_model = "qwen3-vl:8b"        # any local Ollama model for Vision
-model = "lfm3-omni:2b"              # any local Ollama model for Voice (STT/TTS)
-dynamic_swap = true                 # unload Brain/Vision on swap for 16 GB GPUs
-chat_think = false
-aec = false
-silence_ms = 700
-barge_in_ms = 256
-max_history = 20
-max_context_chars = 10000
-allowed_read_dirs = ["~/Documents"] # fail-closed until folders are added
-enabled_integrations = ["linux_desktop"]
-require_reversible_approval = false
-approval_timeout_s = 20.0
-```
-
-## Optional autostart (systemd user service)
-
-A template unit is provided in [contrib/autum.service](contrib/autum.service):
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp contrib/autum.service ~/.config/systemd/user/autum.service
-systemctl --user daemon-reload
-systemctl --user enable --now autum.service
-```
-
-## Tests
-
-```bash
-python3 -m pytest -q
-```
-
-## M1 Benchmark Tools (Optional Re-measurement)
-
-See [docs/m1-benchmark-methodology.md](docs/m1-benchmark-methodology.md):
-
-```bash
-python3 -m bench.record_corpus
-python3 -m bench.attended
 ```

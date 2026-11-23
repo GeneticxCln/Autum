@@ -17,6 +17,7 @@ from typing import Any
 
 from PySide6.QtCore import QObject, Signal, Slot
 
+from autum import __version__
 from autum.config import Config, default_config_path
 from autum.diagnostics import query_ollama_models
 
@@ -45,6 +46,10 @@ class SettingsBridge(QObject):
         self._seq_lock = threading.Lock()
         self._models_seq = 0
         self._diag_seq = 0
+
+    @Slot(result=str)
+    def appVersion(self) -> str:
+        return __version__
 
     @Slot(result="QVariantMap")
     def loadSettings(self) -> dict[str, Any]:

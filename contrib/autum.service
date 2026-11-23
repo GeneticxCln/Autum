@@ -5,9 +5,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/Projects/Autum
-Environment=PYTHONPATH=%h/Projects/Autum/src
-ExecStart=/usr/bin/python3 -m autum
+ExecStart=/usr/bin/autum
 Restart=on-failure
 RestartSec=5
 

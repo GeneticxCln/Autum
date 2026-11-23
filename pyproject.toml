@@ -4,18 +4,34 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autum"
-version = "0.1.0"
-description = "Local voice-first assistant"
+version = "1.0.0"
+description = "Local, model-agnostic voice-first AI desktop assistant"
+readme = "README.md"
 requires-python = ">=3.12"
-# The core runtime uses only the standard library. Model, audio, and presence
-# dependencies belong to the optional components that use them.
+# The core runtime uses only the standard library; full desktop & voice deps are in [project.optional-dependencies].
 dependencies = []
+
+[project.optional-dependencies]
+desktop = [
+    "httpx>=0.27",
+    "numpy>=1.26",
+    "PySide6>=6.7",
+    "faster-whisper>=1.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/GeneticxCln/Autum"
+Repository = "https://github.com/GeneticxCln/Autum"
+Issues = "https://github.com/GeneticxCln/Autum/issues"
 
 [project.scripts]
 autum = "autum.__main__:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"autum.presence" = ["*.qml", "*.npz"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

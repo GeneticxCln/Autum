@@ -25,6 +25,7 @@ from typing import Callable, Sequence
 
 import httpx
 
+from autum import __version__
 from autum.audio import (
     MIC_HELP,
     EchoCanceller,
@@ -281,6 +282,11 @@ class BubbleSupervisor:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="python3 -m autum")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"Autum {__version__}",
+    )
     parser.add_argument(
         "--config",
         type=Path,

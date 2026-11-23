@@ -546,11 +546,30 @@ Window {
                 ColumnLayout {
                     Layout.fillWidth: true
                     spacing: 2
-                    Text {
-                        text: "Autum Settings"
-                        color: root.textPrimary
-                        font.pixelSize: 19
-                        font.weight: Font.DemiBold
+                    RowLayout {
+                        spacing: 8
+                        Text {
+                            text: "Autum Settings"
+                            color: root.textPrimary
+                            font.pixelSize: 19
+                            font.weight: Font.DemiBold
+                        }
+                        Rectangle {
+                            radius: 9
+                            implicitHeight: 20
+                            implicitWidth: verLabel.implicitWidth + 14
+                            color: "#172233"
+                            border.width: 1
+                            border.color: root.borderSubtle
+                            Text {
+                                id: verLabel
+                                anchors.centerIn: parent
+                                text: "v" + ((typeof settingsBridge !== "undefined" && settingsBridge && typeof settingsBridge.appVersion === "function") ? settingsBridge.appVersion() : "1.0.0")
+                                color: root.accentIce
+                                font.pixelSize: 11
+                                font.weight: Font.Medium
+                            }
+                        }
                     }
                     Text {
                         text: "Model-agnostic local assistant — pick any Ollama models and apply live"

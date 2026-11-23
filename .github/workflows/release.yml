@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.0)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve version and tag
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="v$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Qt offscreen libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libxcb-cursor0 libfontconfig1
+
+      - name: Install dependencies & run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONPATH: src
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pytest ".[desktop]"
+          python3 -m pytest -q
+
+  build-python:
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist & wheel
+        run: |
+          python3 -m pip install --upgrade pip build
+          python3 -m build
+          python3 -c '
+          import glob, zipfile
+          whl = glob.glob("dist/*.whl")[0]
+          with zipfile.ZipFile(whl) as z:
+              names = z.namelist()
+          assert any(n.endswith("Presence.qml") for n in names), "Missing Presence.qml in wheel"
+          assert any(n.endswith("SettingsWindow.qml") for n in names), "Missing SettingsWindow.qml in wheel"
+          assert any(n.endswith("face_cloud.npz") for n in names), "Missing face_cloud.npz in wheel"
+          print("Verified wheel contents:", whl)
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-python
+          path: dist/*
+
+  build-deb:
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build .deb package
+        run: |
+          chmod +x packaging/build_deb.sh
+          ./packaging/build_deb.sh "${{ needs.test.outputs.version }}"
+          dpkg-deb --info dist/autum_*_all.deb
+          dpkg-deb --contents dist/autum_*_all.deb | head -n 30
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-deb
+          path: dist/*.deb
+
+  build-rpm:
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rpmbuild
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm
+      - name: Build .rpm package
+        run: |
+          chmod +x packaging/build_rpm.sh
+          ./packaging/build_rpm.sh "${{ needs.test.outputs.version }}"
+          rpm -qpl dist/autum-*.rpm | head -n 30
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-rpm
+          path: dist/*.rpm
+
+  build-appimage:
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install AppImage build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl file desktop-file-utils
+      - name: Build x86_64 AppImage
+        run: |
+          chmod +x packaging/build_appimage.sh
+          ./packaging/build_appimage.sh "${{ needs.test.outputs.version }}"
+          APPIMAGE_EXTRACT_AND_RUN=1 ./dist/Autum-*-x86_64.AppImage --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-appimage
+          path: dist/*.AppImage
+
+  publish:
+    needs: [test, build-python, build-deb, build-rpm, build-appimage]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: release-files
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.test.outputs.tag }}
+          name: Autum ${{ needs.test.outputs.tag }}
+          generate_release_notes: true
+          files: release-files/*

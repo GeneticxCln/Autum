@@ -818,6 +818,216 @@ def test_wake_word_mode_ignores_chatter_wakes_on_name_and_interrupts_on_name():
     assert user_msgs == ["what time is it?", "open Chrome please", "tell me a joke"]
 
 
+def test_extract_wake_call_autumn_unpunctuated_and_mid_sentence_rejection():
+    # Bug 3: unpunctuated "Autumn <question/command>" at start wakes Autum
+    assert Runtime.extract_wake_call("Autumn what time is it?") == (True, "what time is it?", False)
+    assert Runtime.extract_wake_call("Autumn what's on my screen?") == (True, "what's on my screen?", False)
+    assert Runtime.extract_wake_call("Autumn can you open Chrome?") == (True, "can you open Chrome?", False)
+    assert Runtime.extract_wake_call("Autumn is it raining?") == (True, "is it raining?", False)
+    assert Runtime.extract_wake_call("Autumn turn on the lights") == (True, "turn on the lights", False)
+    assert Runtime.extract_wake_call("Autumn stop") == (True, "", True)
+    assert Runtime.extract_wake_call("Autumn") == (True, "", False)
+    # Ordinary sentences starting with "Autumn" as a noun/subject stay ignored
+    assert Runtime.extract_wake_call("Autumn leaves are falling") == (False, "Autumn leaves are falling", False)
+    assert Runtime.extract_wake_call("Autumn is my favorite season") == (False, "Autumn is my favorite season", False)
+    assert Runtime.extract_wake_call("Autumn was very cold last year") == (False, "Autumn was very cold last year", False)
+    assert Runtime.extract_wake_call("Autumn can be rainy") == (False, "Autumn can be rainy", False)
+    # Bug 4: mid-sentence "autumn" or "autum" never wakes Autum
+    assert Runtime.extract_wake_call("I love autumn, the leaves are great") == (
+        False,
+        "I love autumn, the leaves are great",
+        False,
+    )
+    assert Runtime.extract_wake_call("We visited Paris in autumn, it was lovely") == (
+        False,
+        "We visited Paris in autumn, it was lovely",
+        False,
+    )
+    assert Runtime.extract_wake_call("I told my friend about Autum yesterday") == (
+        False,
+        "I told my friend about Autum yesterday",
+        False,
+    )
+
+
+def test_wake_word_background_chatter_does_not_flicker_ui_or_cancel_thinking_or_speaking():
+    import struct
+
+    loud_frame = struct.pack("<512h", *([12000, -12000] * 256))  # ~0.366 RMS (> 0.085 loud cut threshold)
+
+    class ScriptedTranscriber:
+        def __init__(self, items):
+            self.items = iter(items)
+
+        async def transcribe(self, _wav: bytes) -> str:
+            return next(self.items)
+
+    async def scenario():
+        bus = EventBus("wake-quiet")
+        log = Recorder(bus)
+        tx = ScriptedTranscriber(
+            [
+                "ordinary background conversation in the room",  # idle -> no UI flicker
+                "the television is playing news right now",      # during THINKING -> no cancel
+                "wait",                                          # TV "wait" during THINKING -> no cancel
+                "loud background talking over the speakers",     # loud during SPEAKING -> no cut
+            ]
+        )
+        speech = MockSpeech(bus, synth_s=0.005, per_char_s=0.015)
+        inf = MockInference(
+            "Here is a complete answer that should never be interrupted by background talk.",
+            token_delay_s=0.02,
+        )
+        runtime = Runtime(
+            bus,
+            inf,
+            speech,
+            mode=Mode.WAKE_WORD,
+            transcriber=tx,
+            direct_audio=False,
+        )
+        proc = StreamingRecordProc()
+
+        async def spawn_(*args, **kw):
+            return proc
+
+        hf = HandsFreeInput(
+            bus,
+            runtime,
+            tx,
+            _hf_detector(),
+            spawn_=spawn_,
+            voice_barge_in=False,
+            smart_barge_in=True,
+        )
+        await hf.start()
+        await asyncio.sleep(0.02)
+
+        # Bug 6: background chatter while idle must NEVER emit audio.speech_started or flicker states
+        proc.push(*([_hf_frame(1)] * 12 + [_hf_frame(0)] * 6))
+        await asyncio.sleep(0.06)
+        assert log.of("audio.speech_started") == []
+        idle_states = [e.payload["to"] for e in log.of("runtime.state_changed")]
+        assert "speech_detected" not in idle_states
+        assert "processing" not in idle_states
+
+        # Bug 1: start a reply so Autum is THINKING, then feed TV speech + TV "wait"
+        runtime.submit_text("explain gravity")
+        deadline = time.monotonic() + 1.0
+        while runtime.state is not State.THINKING and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        assert runtime.state is State.THINKING
+
+        proc.push(*([_hf_frame(1)] * 12 + [_hf_frame(0)] * 6))
+        await asyncio.sleep(0.03)
+        proc.push(*([_hf_frame(1)] * 12 + [_hf_frame(0)] * 6))
+        await asyncio.sleep(0.03)
+        assert log.of("operation.cancel_requested") == []
+
+        # Bug 2: wait until Autum is SPEAKING, then blast loud (~0.366 RMS) background speech
+        deadline = time.monotonic() + 2.0
+        while runtime.state is not State.SPEAKING and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert runtime.state is State.SPEAKING
+
+        proc.push(*([loud_frame] * 12 + [_hf_frame(0)] * 6))
+        await runtime.wait_until_settled()
+        await asyncio.sleep(0.05)
+        await hf.stop()
+        return log, runtime
+
+    log, runtime = run(scenario())
+    assert log.of("operation.cancel_requested") == []
+    assert log.of("operation.cancelled") == []
+    assert len(log.of("conversation.response_finished")) == 1
+    assert runtime.history[-1]["content"].strip().startswith("Here is a complete answer")
+
+
+def test_wake_word_followup_accepted_during_and_right_after_yes_prompt():
+    class ScriptedTranscriber:
+        def __init__(self, items):
+            self.items = iter(items)
+
+        async def transcribe(self, _wav: bytes) -> str:
+            return next(self.items)
+
+    async def scenario(speak_during_yes: bool):
+        bus = EventBus("wake-yes")
+        log = Recorder(bus)
+        tx = ScriptedTranscriber(
+            [
+                "Autum",
+                "Yes?",             # speaker echo of Autum's own "Yes?" must be ignored!
+                "what time is it?", # user follow-up during or right after "Yes?" must be answered!
+            ]
+            if speak_during_yes
+            else [
+                "Autum",
+                "what time is it?",
+            ]
+        )
+        # Slow enough that "Yes?" stays in State.SPEAKING while user speaks
+        speech = MockSpeech(bus, synth_s=0.01, per_char_s=0.08)
+        runtime = Runtime(
+            bus,
+            MockInference("It is noon."),
+            speech,
+            mode=Mode.WAKE_WORD,
+            transcriber=tx,
+            direct_audio=False,
+        )
+        proc = StreamingRecordProc()
+
+        async def spawn_(*args, **kw):
+            return proc
+
+        hf = HandsFreeInput(
+            bus,
+            runtime,
+            tx,
+            _hf_detector(),
+            spawn_=spawn_,
+            voice_barge_in=False,
+            smart_barge_in=True,
+            post_speech_cooldown_s=0.45,
+        )
+        await hf.start()
+        await asyncio.sleep(0.02)
+
+        # 1. Say bare "Autum" -> Autum starts speaking "Yes?"
+        proc.push(*([_hf_frame(1)] * 12 + [_hf_frame(0)] * 6))
+        deadline = time.monotonic() + 2.0
+        while runtime.state is not State.SPEAKING and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        assert runtime.state is State.SPEAKING
+        assert runtime.in_wake_window is True
+
+        if speak_during_yes:
+            # 2a. First, speaker bleed of "Yes?" during "Yes?" playback is discarded as echo
+            proc.push(*([_hf_frame(1)] * 12 + [_hf_frame(0)] * 6))
+            await asyncio.sleep(0.03)
+            assert runtime.in_wake_window is True
+            # 2b. User starts question WHILE "Yes?" is still playing
+            proc.push(*([_hf_frame(1)] * 12 + [_hf_frame(0)] * 6))
+        else:
+            # Wait for "Yes?" to finish, then speak immediately inside the 0.45s cooldown window
+            await runtime.wait_until_settled()
+            assert runtime.state is State.LISTENING
+            proc.push(*([_hf_frame(1)] * 12 + [_hf_frame(0)] * 6))
+
+        deadline = time.monotonic() + 2.0
+        while len(log.of("conversation.response_finished")) < 1 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        await runtime.wait_until_settled()
+        await hf.stop()
+        return [m["content"] for m in runtime.history if m["role"] == "user"]
+
+    # Bug 5a: follow-up started while "Yes?" is still playing (and "Yes?" echo ignored)
+    assert run(scenario(speak_during_yes=True)) == ["what time is it?"]
+    # Bug 5b: follow-up started within 0.45s after "Yes?" finished
+    assert run(scenario(speak_during_yes=False)) == ["what time is it?"]
+
+
 def test_hands_free_respects_hard_mute_and_resumes_on_unmute():
     async def scenario():
         bus = EventBus("s")

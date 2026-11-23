@@ -514,6 +514,7 @@ class HandsFreeInput:
         self._cooldown_until = 0.0
         self._bleed_rms = 0.018
         self._candidate_barge_in = False
+        self._candidate_check_echo = False
         self._loud_run = 0
         self._errored = False
         self._turn: str | None = None
@@ -629,6 +630,7 @@ class HandsFreeInput:
             if self.detector.in_speech:
                 self.detector.reset()
             self._candidate_barge_in = False
+            self._candidate_check_echo = False
             self._loud_run = 0
             return
         if not self.voice_barge_in and not self.smart_barge_in:
@@ -642,11 +644,18 @@ class HandsFreeInput:
                 self.detector.reset()
                 return
 
+        # In wake_word mode, ALWAYS buffer & verify for the wake word silently first
+        # (never flicker the bubble to "Hearing you"/"Processing", never cancel an
+        # active THINKING/SPEAKING reply, and never trigger loud-RMS cuts on TV/room
+        # speech without checking for "Autum" or an open wake window!).
+        is_wake_mode = str(getattr(self.runtime, "mode", "")) == "wake_word"
+        in_wake_window = bool(getattr(self.runtime, "in_wake_window", False))
         # Only treat incoming audio as a speaker-barge-in window while Autum is
         # actually speaking out of the speakers (or during the brief post-speech echo tail).
         in_barge_window = self.smart_barge_in and (
             self._runtime_state == "speaking" or now < self._cooldown_until
         )
+        silent_verify = is_wake_mode or in_barge_window
         frame_rms = TurnDetector._frame_rms(frame) if self.smart_barge_in else 1.0
         if in_barge_window and not self.detector.in_speech and frame_rms < 0.055:
             self._bleed_rms = 0.90 * self._bleed_rms + 0.10 * max(0.012, frame_rms)
@@ -654,10 +663,15 @@ class HandsFreeInput:
         min_rms = max(0.018, self._bleed_rms * 1.25) if in_barge_window else 0.012
         event = self.detector.feed(frame, speaking=in_barge_window or self._autum_speaking, min_rms=min_rms)
 
-        # In smart_barge_in mode, if the user speaks unmistakably louder than the
-        # speakers for barge_in_frames while a candidate turn is recording, cut
-        # playback immediately rather than waiting for end-of-sentence.
-        if in_barge_window and self._candidate_barge_in and self.detector.in_speech and self._turn is not None:
+        # In hands_free smart_barge_in mode (NOT wake_word mode!), loud close-mic voice
+        # cuts playback immediately without waiting for end-of-sentence.
+        if (
+            not is_wake_mode
+            and in_barge_window
+            and self._candidate_barge_in
+            and self.detector.in_speech
+            and self._turn is not None
+        ):
             if frame_rms >= max(0.085, self._bleed_rms * 2.4):
                 self._loud_run += 1
                 if self._loud_run >= self.detector.barge_in_frames:
@@ -672,17 +686,26 @@ class HandsFreeInput:
             else:
                 self._loud_run = 0
 
+        if self._candidate_barge_in and in_barge_window:
+            self._candidate_check_echo = True
+
         if event is None:
             return
         if event.kind == "speech_started":
             self._turn = new_id()
             self._loud_run = 0
-            if in_barge_window:
+            accept_direct = not in_barge_window and (
+                self._runtime_state == "waiting_for_approval"
+                or (is_wake_mode and in_wake_window and self._runtime_state in ("idle", "listening"))
+            )
+            if silent_verify and not accept_direct:
                 # Buffer quietly first and verify via wake-word / non-echo transcript
-                # (unless promoted early above by loud close-mic voice).
+                # without flickering the bubble or cancelling an in-progress reply.
                 self._candidate_barge_in = True
+                self._candidate_check_echo = in_barge_window
                 return
             self._candidate_barge_in = False
+            self._candidate_check_echo = False
             self.bus.emit(
                 "audio.speech_started",
                 {"mode": "hands_free"},
@@ -692,7 +715,9 @@ class HandsFreeInput:
         elif event.kind == "speech_ended" and self._turn is not None:
             turn, self._turn = self._turn, None
             was_candidate = self._candidate_barge_in
+            was_check_echo = self._candidate_check_echo
             self._candidate_barge_in = False
+            self._candidate_check_echo = False
             self._loud_run = 0
             waiting_approval = str(getattr(self.runtime, "state", "")) == "waiting_for_approval"
             min_s = MIN_APPROVAL_UTTERANCE_S if waiting_approval else MIN_UTTERANCE_S
@@ -708,7 +733,7 @@ class HandsFreeInput:
                 return
             wav = wav_bytes(highpass_pcm(event.pcm, MIC_RATE), MIC_RATE)
             if was_candidate:
-                self._track(self._verify_barge_in(turn, wav))
+                self._track(self._verify_barge_in(turn, wav, check_echo=was_check_echo))
                 return
             ended = self.bus.emit(
                 "audio.speech_ended",
@@ -734,6 +759,8 @@ class HandsFreeInput:
         self.bus.emit("audio.capture_stopped")
 
     def _drop_turn(self) -> None:
+        self._candidate_barge_in = False
+        self._candidate_check_echo = False
         if self._turn is not None:
             turn, self._turn = self._turn, None
             self._nothing_heard(turn)
@@ -778,12 +805,12 @@ class HandsFreeInput:
         elif event.turn_id in self._awaiting_transcript:
             self._track(self._transcribe(event.turn_id))
 
-    async def _verify_barge_in(self, turn: str, wav: bytes) -> None:
-        """Transcribe a candidate hands-free utterance captured while Autum was speaking.
+    async def _verify_barge_in(self, turn: str, wav: bytes, *, check_echo: bool = True) -> None:
+        """Transcribe a candidate utterance captured while Autum was speaking or in wake_word mode.
 
-        If it is her own speaker echo, discard it silently so she keeps talking.
-        If it is a user wake call ('Autum, ...') or a new question, interrupt
-        her speech immediately and answer the new question.
+        If it is her own speaker echo (or background speech without 'Autum' in wake_word mode),
+        discard it silently so she keeps listening/thinking/talking without flickering the UI.
+        If it is a user wake call ('Autum, ...') or a valid follow-up, dispatch it cleanly.
         """
         try:
             text = (await self.transcriber.transcribe(wav)).strip()
@@ -793,7 +820,10 @@ class HandsFreeInput:
             return
         barge_fn = getattr(self.runtime, "barge_in_with_text", None)
         if callable(barge_fn):
-            barge_fn(text, turn_id=turn)
+            try:
+                barge_fn(text, turn_id=turn, check_echo=check_echo)
+            except TypeError:
+                barge_fn(text, turn_id=turn)
 
     async def _transcribe(self, turn: str) -> None:
         wav = self._awaiting_transcript.pop(turn, None)

@@ -257,12 +257,15 @@ class Runtime:
             return False
         if len(words) >= 2 and words[0] in self._WAKE_GREETINGS and words[1] in self._WAKE_WORDS:
             return False
-        # Short follow-up questions ("Paris?", "Really?") and direct questions are NOT speaker bleed
+        # Short follow-up questions ("Paris?", "Really?") and direct questions are NOT speaker bleed,
+        # except verbatim bleed of Autum's own single-word "Yes?" wake acknowledgement.
+        spoken_words = re.findall(r"[a-z0-9']+", (self.current_spoken_text or "").lower())
+        if spoken_words == ["yes"] and words == ["yes"]:
+            return True
         if raw.endswith("?") and (len(words) <= 2 or words[0] in self._QUESTION_HEADS):
             return False
         if len(words) < 3:
             return False
-        spoken_words = re.findall(r"[a-z0-9']+", (self.current_spoken_text or "").lower())
         if len(spoken_words) < 2:
             return False
         spoken_bigrams = {(spoken_words[i], spoken_words[i + 1]) for i in range(len(spoken_words) - 1)}
@@ -301,63 +304,117 @@ class Runtime:
                 return "", True
         return (cleaned or raw), False
 
-    _WAKE_CALL_RE = re.compile(
-        r"(?:^|[\s,.;:!?])(?:(?:hey|hi|ok|okay|yo)\s+)?(?:autum|autumn)\b[\s,.:;!\-]*",
-        re.IGNORECASE,
+    _AUTUMN_FOLLOWERS = frozenset(
+        {
+            "what", "what's", "whats", "why", "why's", "how", "how's", "hows",
+            "when", "when's", "where", "where's", "wheres", "who", "who's", "whos",
+            "which", "whose", "please", "tell", "show", "open", "close", "turn",
+            "move", "focus", "look", "check", "set", "start", "stop", "wait",
+            "hold", "cancel", "pause", "quiet", "list", "read", "remember",
+            "forget", "help", "run", "give", "find", "switch", "minimize",
+            "maximize", "restore", "diagnose", "log", "explain", "define",
+            "translate", "summarize", "write", "create", "delete", "play",
+            "search", "remind", "mute", "unmute", "launch", "quit", "restart",
+            "take", "make", "get", "go", "shut", "never", "nevermind",
+            "hello", "hi", "hey", "thanks", "thank", "sorry", "you", "you're",
+            "i", "i'm", "i've", "i'd", "let's", "do", "don't", "did", "didn't",
+            "good",
+        }
     )
+    _AUTUMN_AUX_SECOND = frozenset({"you", "i", "we", "it", "there", "that", "this", "he", "she", "they"})
+    _AUTUMN_AUX_FIRST = frozenset({"can", "could", "would", "will", "should", "are", "is", "was", "were", "have", "has", "may"})
+
+    @property
+    def in_wake_window(self) -> bool:
+        """True while the 12-second follow-up window after bare 'Autum' / 'Yes?' is active."""
+        return self.mode is Mode.WAKE_WORD and time.monotonic() < self._wake_window_until
 
     @classmethod
     def extract_wake_call(cls, transcript: str) -> tuple[bool, str, bool]:
-        """Parse a wake-word call ('Autum', 'Hey Autum, ...', 'Autumn, ...').
+        """Parse a start-of-utterance wake-word call ('Autum...', 'Hey Autum...', 'Autumn what...').
+
+        Anchored to the start of the utterance so mid-sentence mentions like
+        'I love autumn, the leaves are great' never wake Autum. Accepts unpunctuated
+        'Autumn what time is it?' while still rejecting noun phrases like
+        'Autumn leaves are falling' or 'Autumn is my favorite season'.
 
         Returns `(called_wake_word, remaining_question, is_stop_only)`.
         """
         raw = (transcript or "").strip()
         if not raw:
             return False, "", False
-        # Require explicit wake name ("Autum" / "Hey Autum" / "Autumn" as greeting or followed by pause/end)
-        m = re.search(
-            r"(?:^|[\s,.;:!?])(?:(?:hey|hi|ok|okay|yo)\s+(?:autum|autumn)\b[\s,.:;!\-]*|autum\b[\s,.:;!\-]*|autumn(?:[,.:;!\-]+\s*|\s*$))",
+        # 1. Explicit greeting + Autum/Autumn, or Autum at start, or Autumn + punctuation/end at start
+        m = re.match(
+            r"^\s*(?:(?:hey|hi|ok|okay|yo)\s+(?:autum|autumn)\b[\s,.:;!\-]*|autum\b[\s,.:;!\-]*|autumn(?:[,.:;!\-]+\s*|\s*$))",
             raw,
             flags=re.IGNORECASE,
         )
         if m is None:
-            # Also allow pure stop words ("stop", "wait") while speaking
-            norm = re.sub(r"[^a-z0-9\s]+", "", raw.lower()).strip()
-            norm = re.sub(r"\s+", " ", norm)
+            # 2. Unpunctuated "Autumn <question/command word>..." at start (STT often spells Autum as Autumn)
+            m2 = re.match(r"^\s*autumn\s+([a-z']+)(.*)$", raw, flags=re.IGNORECASE)
+            if m2 is not None:
+                first_word = m2.group(1).lower()
+                rest_after = m2.group(2)
+                second_m = re.match(r"^\s+([a-z']+)", rest_after, flags=re.IGNORECASE)
+                second_word = second_m.group(1).lower() if second_m else ""
+                is_direct_call = first_word in cls._AUTUMN_FOLLOWERS or (
+                    first_word in cls._AUTUMN_AUX_FIRST and second_word in cls._AUTUMN_AUX_SECOND
+                )
+                if is_direct_call:
+                    remainder = (m2.group(1) + rest_after).strip()
+                    norm_rem = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]+", "", remainder.lower()).strip())
+                    if norm_rem in cls._STOP_PHRASES:
+                        return True, "", True
+                    return True, remainder, False
+            # Pure stop phrases ("stop", "wait") while speaking
+            norm = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]+", "", raw.lower()).strip())
             if norm in cls._STOP_PHRASES:
                 return False, "", True
             return False, raw, False
         remainder = raw[m.end() :].strip()
-        norm_rem = re.sub(r"[^a-z0-9\s]+", "", remainder.lower()).strip()
-        norm_rem = re.sub(r"\s+", " ", norm_rem)
+        norm_rem = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]+", "", remainder.lower()).strip())
         if remainder and norm_rem in cls._STOP_PHRASES:
             return True, "", True
         return True, remainder, False
 
-    def barge_in_with_text(self, transcript: str, turn_id: str | None = None) -> bool:
-        """Interrupt active speech with a verified wake-on-call or new question."""
-        if self.is_self_echo(transcript):
+    def barge_in_with_text(
+        self,
+        transcript: str,
+        turn_id: str | None = None,
+        *,
+        check_echo: bool = True,
+    ) -> bool:
+        """Handle a quietly captured utterance (during speech, or any utterance in wake_word mode)."""
+        if check_echo and self.is_self_echo(transcript):
             return False
         if self.mode is Mode.WAKE_WORD:
             woke, remainder, is_stop = self.extract_wake_call(transcript)
-            if is_stop and (woke or self._op is not None):
+            in_window = self.in_wake_window
+            if is_stop and (woke or in_window):
+                self._wake_window_until = 0.0
                 self._cancel_pending_transcription()
                 if self._op is not None:
                     self._begin_cancel("barge_in", None)
                 elif self.state not in (State.IDLE, State.LISTENING):
                     self._set_state(self.rest_state, "barge_in")
                 return True
-            if not woke:
+            if woke:
+                if not remainder:
+                    # Bare "Autum" -> stop any active reply, open 12s follow-up window, say "Yes?"
+                    self._cancel_pending_transcription()
+                    self._wake_window_until = time.monotonic() + 12.0
+                    if self._op is not None:
+                        self._begin_cancel("barge_in", None)
+                    else:
+                        self.announce("Yes?")
+                    return True
+                cleaned = remainder
+            elif in_window:
+                # Follow-up spoken during or immediately after "Yes?" inside the 12s wake window
+                cleaned = transcript.strip()
+            else:
+                # Background speech without calling "Autum" -> ignore completely without cancelling!
                 return False
-            if not remainder:
-                # Bare "Autum" while speaking -> stop speaking and open follow-up wake window
-                self._cancel_pending_transcription()
-                self._wake_window_until = time.monotonic() + 12.0
-                if self._op is not None:
-                    self._begin_cancel("barge_in", None)
-                return True
-            cleaned = remainder
         else:
             cleaned, is_stop = self.clean_wake_transcript(transcript)
             if is_stop:
@@ -370,8 +427,9 @@ class Runtime:
             if not cleaned:
                 return False
         tid = turn_id or new_id()
-        # Use direct start if in WAKE_WORD so _on_final_transcript doesn't re-strip wake word
-        self._wake_window_until = time.monotonic() + 12.0 if self.mode is Mode.WAKE_WORD else 0.0
+        # Keep wake window open across this synthetic dispatch so _on_final_transcript accepts `cleaned`
+        if self.mode is Mode.WAKE_WORD:
+            self._wake_window_until = time.monotonic() + 12.0
         self.bus.emit("audio.speech_started", {"mode": "hands_free"}, provenance=Provenance.USER, turn_id=tid)
         self.bus.emit("audio.speech_ended", {"confidence": 1.0}, provenance=Provenance.USER, turn_id=tid)
         self.bus.emit("audio.transcribed", {"text": cleaned, "final": True}, provenance=Provenance.USER, turn_id=tid)
@@ -587,7 +645,7 @@ class Runtime:
         if self.mode is Mode.WAKE_WORD:
             woke, remainder, is_stop = self.extract_wake_call(raw_text)
             in_wake_window = time.monotonic() < self._wake_window_until
-            if is_stop and (woke or in_wake_window or self._op is not None):
+            if is_stop and (woke or in_wake_window):
                 self._wake_window_until = 0.0
                 if self._op is not None:
                     self._begin_cancel("barge_in", event)

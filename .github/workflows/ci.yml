@@ -24,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install pytest ".[desktop]"
+          python3 -m pip install pytest scipy ".[desktop]"
 
       - name: Run test suite
         env:

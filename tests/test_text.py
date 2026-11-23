@@ -35,6 +35,15 @@ def test_speakable_removes_markup_urls_and_reasoning():
     assert speakable(raw) == "Sure — see for details."
 
 
+def test_chunker_and_speakable_strip_gemma4_and_lfm3_thought_blocks():
+    gemma_raw = "<|channel>thought\nThinking about user greeting.\n<channel|>Hello there. How can I help?"
+    lfm_raw = "<|think|>\nInternal reasoning\n<|/think|>Hi! Ready when you are."
+    assert stream(gemma_raw, step=2) == ["Hello there.", "How can I help?"]
+    assert stream(lfm_raw, step=2) == ["Hi!", "Ready when you are."]
+    assert speakable(gemma_raw) == "Hello there. How can I help?"
+    assert speakable(lfm_raw) == "Hi! Ready when you are."
+
+
 def test_text_without_punctuation_is_cut_at_a_space_after_max_chars():
     chunks = stream("word " * 30, SentenceChunker(max_chars=50))
     assert all(len(c) <= 50 for c in chunks)

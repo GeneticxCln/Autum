@@ -58,6 +58,7 @@ from autum.ollama import (
     OmniTranscriber,
     check_ready,
     preload,
+    resolve_reasoning_effort,
     resolve_speech_model,
     unload,
 )
@@ -397,9 +398,12 @@ async def main(argv: Sequence[str] | None = None) -> int:
                     return 1
                 log(f"{cfg.model} has no TTS speech weights in Ollama; using {voice_model} for voice audio I/O.")
 
-            _FAST_TAGS = ("gemma4", "gemma-4", "qwen3", "qwen-3")
-            chat_effort = None if cfg.chat_think else ("none" if any(k in chat_model.lower() for k in _FAST_TAGS) else None)
-            vision_effort = None if cfg.chat_think else ("none" if any(k in vision_model.lower() for k in _FAST_TAGS) else None)
+            chat_effort = await resolve_reasoning_effort(
+                client, chat_model, cfg.chat_think, base_url=cfg.ollama_url
+            )
+            vision_effort = await resolve_reasoning_effort(
+                client, vision_model, cfg.chat_think, base_url=cfg.ollama_url
+            )
             # Only send raw WAV directly into chat when the omni voice model itself is the chat model;
             # otherwise let lfm3-omni:2b transcribe speech cleanly into text for the chat model.
             direct_audio = chat_model == voice_model and "omni" in chat_model.lower()
@@ -579,8 +583,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
                     log(f"{new_voice} has no TTS speech weights in Ollama; using {resolved_voice} for voice audio I/O.")
                 new_voice = resolved_voice
 
-                c_eff = None if new_cfg.chat_think else ("none" if any(k in new_chat.lower() for k in _FAST_TAGS) else None)
-                v_eff = None if new_cfg.chat_think else ("none" if any(k in new_vis.lower() for k in _FAST_TAGS) else None)
+                c_eff = await resolve_reasoning_effort(client, new_chat, new_cfg.chat_think, base_url=base)
+                v_eff = await resolve_reasoning_effort(client, new_vis, new_cfg.chat_think, base_url=base)
 
                 need_swap = new_cfg.dynamic_swap and len({m for m in (new_chat, new_vis) if m != new_voice}) > 1
                 prev_swapper = swapper
@@ -599,6 +603,9 @@ async def main(argv: Sequence[str] | None = None) -> int:
                     if prev_swapper is not None and prev_swapper.active and prev_swapper.active not in (new_chat, new_voice):
                         await unload(client, model=prev_swapper.active, base_url=prev_swapper.base_url)
                     swapper = None
+
+                old_chat, old_vis, old_voice = chat.model, vision.model, speech_synth.model
+                models_changed = (new_chat, new_vis, new_voice) != (old_chat, old_vis, old_voice)
 
                 chat.model = new_chat
                 chat.base_url = base
@@ -632,25 +639,24 @@ async def main(argv: Sequence[str] | None = None) -> int:
                     await handle_command({"command": "set_mode", "mode": new_cfg.mode.value})
 
                 active_cfg[0] = new_cfg
-                runtime.begin_model_load(new_chat)
-                t_rel = time.monotonic()
-                try:
-                    # Unload any heavy chat/vision model before preloading voice_model so
-                    # voice_model ALWAYS claims 100% GPU VRAM first instead of spilling to CPU.
-                    if new_chat != new_voice:
-                        await unload(client, model=new_chat, base_url=base)
-                    if new_vis not in (new_voice, new_chat):
-                        await unload(client, model=new_vis, base_url=base)
-                    await preload(client, model=new_voice, base_url=base)
-                    if swapper is not None:
-                        swapper.active = None
-                        await swapper.ensure_active(new_chat)
-                    if new_chat != new_voice:
-                        await preload(client, model=new_chat, base_url=base)
-                except Exception as exc:
-                    bus.emit("runtime.component_error", {"component": "config", "error": f"model preload failed: {exc}"})
-                finally:
-                    runtime.finish_model_load(new_chat, (time.monotonic() - t_rel) * 1000.0)
+                if models_changed:
+                    runtime.begin_model_load(new_chat)
+                    t_rel = time.monotonic()
+                    try:
+                        for old_m in dict.fromkeys((old_chat, old_vis, old_voice)):
+                            if old_m and old_m not in (new_voice, new_chat):
+                                await unload(client, model=old_m, base_url=base)
+                        if new_voice != old_voice and new_chat != new_voice:
+                            await unload(client, model=new_chat, base_url=base)
+                        await preload(client, model=new_voice, base_url=base)
+                        if swapper is not None:
+                            swapper.active = new_chat
+                        if new_chat != new_voice:
+                            await preload(client, model=new_chat, base_url=base)
+                    except Exception as exc:
+                        bus.emit("runtime.component_error", {"component": "config", "error": f"model preload failed: {exc}"})
+                    finally:
+                        runtime.finish_model_load(new_chat, (time.monotonic() - t_rel) * 1000.0)
                 log(
                     f"reloaded settings (mode={new_cfg.mode.value}, chat={new_chat}, "
                     f"vision={new_vis}, voice={new_voice}, swap={bool(swapper)})."

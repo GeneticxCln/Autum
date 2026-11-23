@@ -7,7 +7,12 @@ import re
 _ABBREVIATIONS = frozenset({"e.g.", "i.e.", "mr.", "mrs.", "ms.", "dr.", "vs.", "st."})
 _SENTENCE_END = re.compile(r"[.!?…]+[\"')\]]*\s|\n+")
 _CLAUSE_END = re.compile(r"[,;:—]\s")
-_THINK = re.compile(r"<think>.*?(?:</think>|$)|</think>", re.DOTALL)
+_THINK = re.compile(
+    r"<think>.*?(?:</think>|$)|</think>"
+    r"|<\|think\|>.*?(?:<\|/think\|>|$)|<\|/think\|>"
+    r"|<\|channel>thought.*?(?:<channel\|>|$)|<channel\|>",
+    re.DOTALL,
+)
 _TOOL_CALL_TAG = re.compile(r"<\|tool_call>.*?(?:<tool_call\|>|$)|<tool_call\|>|<\|[^|>]{1,40}\|>", re.DOTALL)
 _URL = re.compile(r"https?://\S+")
 _MARKUP = re.compile(r"[*_#`>|~]+")
@@ -15,6 +20,8 @@ _SPACES = re.compile(r"\s+")
 
 _HIDDEN_TAGS: tuple[tuple[str, str], ...] = (
     ("<think>", "</think>"),
+    ("<|think|>", "<|/think|>"),
+    ("<|channel>thought", "<channel|>"),
     ("<|tool_call>", "<tool_call|>"),
 )
 

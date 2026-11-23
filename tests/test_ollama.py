@@ -133,3 +133,29 @@ def test_speech_falls_back_to_lfm3_omni_when_hf_gguf_lacks_speech_capability():
     assert active_model == MODEL
     assert pcm == b"\x01\x02\x03\x04"
     assert calls == ["hf.co/NeosQ/LFM3-Omni-2B-Uncensored:F16", MODEL]
+
+
+def test_resolve_reasoning_effort_detects_known_and_custom_hf_thinking_models():
+    from autum.ollama import resolve_reasoning_effort
+
+    def handler(request):
+        body = json.loads(request.content) if request.content else {}
+        name = body.get("name", "")
+        if "custom-thinker" in name:
+            return httpx.Response(200, json={"capabilities": ["completion", "thinking"]})
+        if "template-thinker" in name:
+            return httpx.Response(200, json={"capabilities": ["completion"], "template": "{%- if enable_thinking %}"})
+        return httpx.Response(200, json={"capabilities": ["completion"], "template": "{{ .Prompt }}"})
+
+    async def scenario():
+        async with fake_ollama(handler) as client:
+            return (
+                await resolve_reasoning_effort(client, "hf.co/Abiray/Gemma-4-12B-it-AEON:Q4_K_M", False),
+                await resolve_reasoning_effort(client, "hf.co/NeosQ/LFM3-Omni-2B-Uncensored:F16", False),
+                await resolve_reasoning_effort(client, "hf.co/author/custom-thinker:Q4_K_M", False),
+                await resolve_reasoning_effort(client, "hf.co/author/template-thinker:Q4_K_M", False),
+                await resolve_reasoning_effort(client, "hf.co/author/plain-llama:Q4_K_M", False),
+                await resolve_reasoning_effort(client, "gemma4:12b", True),
+            )
+
+    assert run(scenario()) == ("none", "none", "none", "none", None, None)

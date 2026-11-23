@@ -148,7 +148,12 @@ class OmniChat:
         next_auto_idx = 0
         hidden_close: str | None = None
         think_buf = ""
-        hidden_tags = (("<think>", "</think>"), ("<|tool_call>", "<tool_call|>"))
+        hidden_tags = (
+            ("<think>", "</think>"),
+            ("<|think|>", "<|/think|>"),
+            ("<|channel>thought", "<channel|>"),
+            ("<|tool_call>", "<tool_call|>"),
+        )
         max_open = max(len(o) for o, _ in hidden_tags)
 
         async def _run_stream() -> AsyncIterator[str | ToolCall]:
@@ -346,6 +351,47 @@ async def unload(client: httpx.AsyncClient, model: str, base_url: str = OLLAMA) 
         await client.post(f"{base_url.rstrip('/')}/api/generate", json={"model": model, "keep_alive": 0}, timeout=10)
     except httpx.HTTPError:
         pass
+
+
+_THINKING_MODEL_TAGS: tuple[str, ...] = (
+    "gemma4",
+    "gemma-4",
+    "qwen3",
+    "qwen-3",
+    "lfm3",
+    "lfm-3",
+    "deepseek",
+    "qwq",
+    "r1",
+)
+
+
+async def resolve_reasoning_effort(
+    client: httpx.AsyncClient,
+    model: str,
+    chat_think: bool,
+    base_url: str = OLLAMA,
+) -> str | None:
+    """Return `'none'` when `chat_think` is False and `model` supports thinking."""
+    if chat_think:
+        return None
+    low = model.lower()
+    if any(tag in low for tag in _THINKING_MODEL_TAGS):
+        return "none"
+    base = base_url.rstrip("/")
+    try:
+        r = await client.post(f"{base}/api/show", json={"name": model}, timeout=2.5)
+        if r.status_code == 200:
+            info = r.json() or {}
+            caps = info.get("capabilities")
+            if isinstance(caps, list) and "thinking" in caps:
+                return "none"
+            tmpl = str(info.get("template") or "")
+            if any(tok in tmpl for tok in ("enable_thinking", "<|think|>", "<|channel>thought", "<think>")):
+                return "none"
+    except (httpx.HTTPError, ValueError):
+        pass
+    return None
 
 
 async def resolve_speech_model(client: httpx.AsyncClient, model: str, base_url: str = OLLAMA) -> str:

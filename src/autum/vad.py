@@ -85,6 +85,7 @@ class TurnDetector:
         self.silence_frames = max(1, math.ceil(silence_ms / FRAME_MS))
         self.tail_frames = max(0, math.ceil(tail_ms / FRAME_MS))
         self.max_frames = max(1, math.ceil(max_utterance_s * 1000 / FRAME_MS))
+        self._pre_roll_ms = pre_roll_ms
         pre_frames = max(self.min_speech_frames, self.barge_in_frames, math.ceil(pre_roll_ms / FRAME_MS))
         self._pre_roll: deque[bytes] = deque(maxlen=pre_frames)
         self._utterance: list[bytes] = []
@@ -98,6 +99,16 @@ class TurnDetector:
     @property
     def in_speech(self) -> bool:
         return self._in_speech
+
+    def update_thresholds(self, *, silence_ms: int | None = None, barge_in_ms: int | None = None) -> None:
+        """Update live silence/barge-in thresholds and resize _pre_roll to preserve barge-in lead-in."""
+        if silence_ms is not None:
+            self.silence_frames = max(1, math.ceil(silence_ms / FRAME_MS))
+        if barge_in_ms is not None:
+            self.barge_in_frames = max(1, math.ceil(barge_in_ms / FRAME_MS))
+            pre_frames = max(self.min_speech_frames, self.barge_in_frames, math.ceil(self._pre_roll_ms / FRAME_MS))
+            if self._pre_roll.maxlen != pre_frames:
+                self._pre_roll = deque(self._pre_roll, maxlen=pre_frames)
 
     def reset(self) -> None:
         self._pre_roll.clear()

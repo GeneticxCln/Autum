@@ -10,72 +10,20 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import threading
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QObject, Signal, Slot
 
 from autum.config import Config, default_config_path
+from autum.diagnostics import query_ollama_models
 
 
 def _presence_state_path(config_path: Path | None = None) -> Path:
     base = (config_path or default_config_path()).parent
     return base / "presence.json"
-
-
-def query_ollama_models(ollama_url: str = "http://127.0.0.1:11434", timeout_s: float = 2.0) -> list[dict[str, Any]]:
-    """Query local Ollama for installed models and their live GPU residency."""
-    parsed = urllib.parse.urlparse(ollama_url)
-    if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
-        return []
-    base = ollama_url.rstrip("/")
-
-    loaded_map: dict[str, str] = {}
-    try:
-        with urllib.request.urlopen(f"{base}/api/ps", timeout=timeout_s) as resp:
-            ps_data = json.loads(resp.read().decode("utf-8", errors="replace"))
-        for item in ps_data.get("models", []):
-            name = str(item.get("name") or "")
-            if name:
-                vram = int(item.get("size_vram") or 0)
-                size = int(item.get("size") or 0)
-                if size > 0 and vram >= size:
-                    loaded_map[name] = "100% GPU"
-                elif vram > 0:
-                    loaded_map[name] = f"{round(vram / max(size, 1) * 100)}% GPU"
-                else:
-                    loaded_map[name] = "loaded"
-    except (OSError, ValueError, urllib.error.URLError):
-        pass
-
-    try:
-        with urllib.request.urlopen(f"{base}/api/tags", timeout=timeout_s) as resp:
-            tags_data = json.loads(resp.read().decode("utf-8", errors="replace"))
-    except (OSError, ValueError, urllib.error.URLError):
-        return []
-
-    out: list[dict[str, Any]] = []
-    for m in tags_data.get("models", []):
-        name = str(m.get("name") or "")
-        if not name:
-            continue
-        size_bytes = int(m.get("size") or 0)
-        details = m.get("details") or {}
-        out.append(
-            {
-                "name": name,
-                "size_gb": round(size_bytes / (1024**3), 1),
-                "params": str(details.get("parameter_size") or ""),
-                "loaded": name in loaded_map,
-                "status": loaded_map.get(name, ""),
-            }
-        )
-    out.sort(key=lambda item: (not item["loaded"], item["name"].lower()))
-    return out
 
 
 class SettingsBridge(QObject):
@@ -94,6 +42,9 @@ class SettingsBridge(QObject):
         super().__init__(parent)
         self._model = model
         self._config_path = config_path
+        self._seq_lock = threading.Lock()
+        self._models_seq = 0
+        self._diag_seq = 0
 
     @Slot(result="QVariantMap")
     def loadSettings(self) -> dict[str, Any]:
@@ -152,9 +103,16 @@ class SettingsBridge(QObject):
                 restart_fields.append("integrations")
             if cfg.data_dir != prev.data_dir:
                 restart_fields.append("data folder")
+        applied_live = False
         if self._model is not None:
+            applied_live = bool(getattr(self._model, "_connected", False))
             self._model.reloadConfig()
-        return {"ok": True, "path": str(saved), "restart_required": restart_fields}
+        return {
+            "ok": True,
+            "path": str(saved),
+            "restart_required": restart_fields,
+            "applied_live": applied_live,
+        }
 
     @Slot(str)
     def setModeAndPersist(self, mode: str) -> None:
@@ -192,13 +150,31 @@ class SettingsBridge(QObject):
 
     @Slot(str, result="QVariantList")
     def listOllamaModels(self, ollama_url: str = "") -> list[dict[str, Any]]:
-        url = (ollama_url or "").strip() or Config.load(self._config_path).ollama_url
-        return query_ollama_models(url)
+        url = (ollama_url or "").strip()
+        if not url:
+            try:
+                url = Config.load(self._config_path).ollama_url
+            except Exception:
+                url = Config().ollama_url
+        try:
+            return query_ollama_models(url)
+        except Exception:
+            return []
 
     @Slot(str)
     def listOllamaModelsAsync(self, ollama_url: str = "") -> None:
+        with self._seq_lock:
+            self._models_seq += 1
+            seq = self._models_seq
+
         def _worker() -> None:
-            models = self.listOllamaModels(ollama_url)
+            try:
+                models = self.listOllamaModels(ollama_url)
+            except Exception:
+                models = []
+            with self._seq_lock:
+                if seq != self._models_seq:
+                    return
             self.modelsReady.emit(models)
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -223,19 +199,31 @@ class SettingsBridge(QObject):
     @Slot(int, int)
     def savePosition(self, margin_right: int, margin_bottom: int) -> None:
         path = _presence_state_path(self._config_path)
+        parent_existed = path.parent.exists()
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(path.parent, 0o700)
-        tmp = path.with_suffix(".json.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        if not parent_existed or path.parent.name == "autum":
+            try:
+                os.chmod(path.parent, 0o700)
+            except OSError:
+                pass
+        fd, tmp_name = tempfile.mkstemp(prefix=".presence.", suffix=".tmp", dir=str(path.parent))
+        tmp = Path(tmp_name)
+        fd_owned = True
         try:
             os.fchmod(fd, 0o600)
             fh = os.fdopen(fd, "w", encoding="utf-8")
+            fd_owned = False
+            with fh:
+                fh.write(json.dumps({"margin_right": int(margin_right), "margin_bottom": int(margin_bottom)}))
+            tmp.replace(path)
         except Exception:
-            os.close(fd)
+            if fd_owned:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            tmp.unlink(missing_ok=True)
             raise
-        with fh:
-            fh.write(json.dumps({"margin_right": int(margin_right), "margin_bottom": int(margin_bottom)}))
-        tmp.replace(path)
 
     @Slot()
     def resetPosition(self) -> None:
@@ -268,8 +256,31 @@ class SettingsBridge(QObject):
 
     @Slot()
     def runDiagnosticsAsync(self) -> None:
+        with self._seq_lock:
+            self._diag_seq += 1
+            seq = self._diag_seq
+
         def _worker() -> None:
-            rep = self.runDiagnostics()
+            try:
+                rep = self.runDiagnostics()
+            except Exception as exc:
+                rep = {
+                    "overall_status": "error",
+                    "checks": [
+                        {
+                            "section": "diagnostics",
+                            "title": "Self-Diagnosis",
+                            "status": "error",
+                            "summary": f"Diagnostics failed: {exc}",
+                            "details": "",
+                            "suggestion": "Check config.toml and Ollama URL.",
+                        }
+                    ],
+                    "recent_problems": [],
+                }
+            with self._seq_lock:
+                if seq != self._diag_seq:
+                    return
             self.diagnosticsReady.emit(rep)
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -278,6 +289,8 @@ class SettingsBridge(QObject):
     def clearProblems(self) -> dict[str, Any]:
         from autum.diagnostics import DiagnosticsLog
 
+        with self._seq_lock:
+            self._diag_seq += 1
         store = DiagnosticsLog(self._diagnostics_path())
         cleared = store.clear()
         return {"ok": True, "cleared": cleared}

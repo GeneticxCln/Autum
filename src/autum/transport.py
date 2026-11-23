@@ -84,6 +84,8 @@ class EventServer:
         self.path = path or default_socket_path()
         self._snapshot: dict[str, Event] = {}
         self._clients: set[asyncio.Queue] = set()
+        self._client_handles: dict[asyncio.Queue, tuple[asyncio.Task, asyncio.StreamWriter]] = {}
+        self._writers: set[asyncio.StreamWriter] = set()
         self._server: asyncio.AbstractServer | None = None
         self._tasks: set[asyncio.Task] = set()
         bus.subscribe(self._publish)
@@ -103,12 +105,24 @@ class EventServer:
             os.umask(old_umask)
 
     async def close(self) -> None:
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
-        for task in list(self._tasks):
+        server, self._server = self._server, None
+        if server is not None:
+            server.close()
+        for writer in list(self._writers):
+            try:
+                writer.close()
+            except Exception:
+                pass
+        tasks = list(self._tasks)
+        for task in tasks:
             task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if server is not None:
+            try:
+                await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
         try:
             self.path.unlink()
         except FileNotFoundError:
@@ -139,14 +153,24 @@ class EventServer:
                 queue.put_nowait(line)
             except asyncio.QueueFull:
                 self._clients.discard(queue)
+                handle = self._client_handles.pop(queue, None)
                 _drop_slow(queue)
+                if handle is not None:
+                    sender_task, writer = handle
+                    sender_task.cancel()
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         queue: asyncio.Queue = asyncio.Queue(CLIENT_QUEUE)
         for event in sorted(self._snapshot.values(), key=lambda e: e.mono_ns):  # replay in time order
             queue.put_nowait(event.to_json().encode() + b"\n")
         self._clients.add(queue)
+        self._writers.add(writer)
         sender = asyncio.create_task(self._send(queue, writer))
+        self._client_handles[queue] = (sender, writer)
         self._tasks.add(sender)
         sender.add_done_callback(self._tasks.discard)
         try:
@@ -165,10 +189,12 @@ class EventServer:
                     await self.on_command(command)
                 except Exception:
                     log.exception("command %s failed", command["command"])
-        except ConnectionError:
+        except (ConnectionError, asyncio.CancelledError):
             pass
         finally:
             self._clients.discard(queue)
+            self._client_handles.pop(queue, None)
+            self._writers.discard(writer)
             sender.cancel()
             writer.close()
             try:

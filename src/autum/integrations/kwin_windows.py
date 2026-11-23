@@ -71,7 +71,7 @@ def normalize_position(position: str | None) -> str | None:
         raise ValueError(f"position must be one of {sorted(SNAP_POSITIONS)}")
     return mapped
 
-_NORM_RE = re.compile(r"[^a-z0-9]+")
+_NORM_RE = re.compile(r"[^\w]+", re.UNICODE)
 _APP_ALIASES: dict[str, tuple[str, ...]] = {
     "browser": ("chrome", "chromium", "firefox", "brave", "vivaldi", "edge", "zen", "librewolf"),
     "web browser": ("chrome", "chromium", "firefox", "brave", "vivaldi", "edge", "zen", "librewolf"),
@@ -123,7 +123,7 @@ def _run_kwin_js_sync(body_js: str, timeout_s: float = 4.0) -> Any:
     script = (
         f"function __reply(v) {{ callDBus({json.dumps(unique)}, {json.dumps(obj_path)}, "
         f"{json.dumps(iface_name)}, 'Reply', JSON.stringify(v)); }}\n"
-        f"try {{\n{body_js}\n}} catch (e) {{ __reply({{error: String(e)}}); }}\n"
+        f"try {{\n(function() {{\n{body_js}\n}})();\n}} catch (e) {{ __reply({{error: String(e)}}); }}\n"
     )
     plugin_name = f"autum_win_{token}"
     with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as fh:
@@ -217,7 +217,7 @@ for (var i = 0; i < ws.length; i++) {
     out.push({
         id: String(w.internalId),
         app: String(w.resourceClass || ""),
-        title: String(w.caption || "").slice(0, 60),
+        title: String(w.caption || ""),
         x: Math.round(g.x), y: Math.round(g.y),
         width: Math.round(g.width), height: Math.round(g.height),
         minimized: Boolean(w.minimized),
@@ -229,7 +229,15 @@ for (var i = 0; i < ws.length; i++) {
 __reply(out);
 """
         raw = await asyncio.to_thread(_run_kwin_js_sync, js)
-        return [w for w in raw if not _is_excluded_window(w.get("title", ""), w.get("app", ""), excluded)]
+        filtered = []
+        for w in raw:
+            full_title = str(w.get("title", ""))
+            if _is_excluded_window(full_title, str(w.get("app", "")), excluded):
+                continue
+            item = dict(w)
+            item["title"] = full_title[:60]
+            filtered.append(item)
+        return filtered
 
     async def resolve_window(self, query: str, excluded: Sequence[str] = ()) -> dict[str, Any]:
         """Resolve a user/model window reference strictly to one controllable window."""
@@ -385,8 +393,10 @@ else {{
         else if (spec.position === "bottom_left") {{ nx = area.x; ny = area.y + halfH; nw = halfW; nh = area.height - halfH; }}
         else if (spec.position === "bottom_right") {{ nx = area.x + halfW; ny = area.y + halfH; nw = area.width - halfW; nh = area.height - halfH; }}
         else if (spec.position === "center") {{
-            if (nw >= area.width - 40 && spec.width === null) nw = Math.round(area.width * 0.72);
-            if (nh >= area.height - 60 && spec.height === null) nh = Math.round(area.height * 0.78);
+            if (spec.width !== null) nw = spec.width;
+            else if (nw >= area.width - 40) nw = Math.round(area.width * 0.72);
+            if (spec.height !== null) nh = spec.height;
+            else if (nh >= area.height - 60) nh = Math.round(area.height * 0.78);
             nx = area.x + Math.round((area.width - nw) / 2);
             ny = area.y + Math.round((area.height - nh) / 2);
         }}

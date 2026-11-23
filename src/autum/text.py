@@ -7,14 +7,14 @@ import re
 _ABBREVIATIONS = frozenset({"e.g.", "i.e.", "mr.", "mrs.", "ms.", "dr.", "vs.", "st."})
 _SENTENCE_END = re.compile(r"[.!?…]+[\"')\]]*\s|\n+")
 _CLAUSE_END = re.compile(r"[,;:—]\s")
-_THINK = re.compile(r"<think>.*?(</think>|$)", re.DOTALL)
+_THINK = re.compile(r"<think>.*?(?:</think>|$)|</think>", re.DOTALL)
 _URL = re.compile(r"https?://\S+")
 _MARKUP = re.compile(r"[*_#`>|~]+")
 _SPACES = re.compile(r"\s+")
 
 
 class SentenceChunker:
-    """Split a token stream at sentence ends.
+    """Split a token stream at sentence ends while stripping streamed <think>...</think> blocks.
 
     The first chunk may also end at a clause break once it is at least
     ``first_clause_chars`` long, so the first audio starts sooner. Text
@@ -27,15 +27,54 @@ class SentenceChunker:
         self._first = True
         self._first_clause_chars = first_clause_chars
         self._max_chars = max_chars
+        self._in_think = False
+        self._think_buf = ""
+
+    def _filter_think(self, delta: str) -> str:
+        """Strip <think>...</think> across arbitrary token/line boundaries."""
+        self._think_buf += delta
+        out: list[str] = []
+        while self._think_buf:
+            if self._in_think:
+                end_idx = self._think_buf.find("</think>")
+                if end_idx < 0:
+                    self._think_buf = self._think_buf[-7:] if len(self._think_buf) > 7 else self._think_buf
+                    break
+                self._think_buf = self._think_buf[end_idx + 8 :]
+                self._in_think = False
+            else:
+                start_idx = self._think_buf.find("<think>")
+                if start_idx < 0:
+                    partial = 0
+                    for k in range(1, min(7, len(self._think_buf) + 1)):
+                        if "<think>".startswith(self._think_buf[-k:]):
+                            partial = k
+                    emit = self._think_buf[:-partial] if partial else self._think_buf
+                    self._think_buf = self._think_buf[-partial:] if partial else ""
+                    if emit:
+                        out.append(emit)
+                    break
+                if start_idx > 0:
+                    out.append(self._think_buf[:start_idx])
+                self._think_buf = self._think_buf[start_idx + 7 :]
+                self._in_think = True
+        return "".join(out)
 
     def feed(self, delta: str) -> list[str]:
-        self._buffer += delta
+        visible = self._filter_think(delta)
+        if not visible:
+            return []
+        self._buffer += visible
         chunks: list[str] = []
         while chunk := self._take():
             chunks.append(chunk)
         return chunks
 
     def flush(self) -> list[str]:
+        if self._think_buf and not self._in_think:
+            self._buffer += self._think_buf
+        self._think_buf = ""
+        self._in_think = False
         rest, self._buffer = self._buffer.strip(), ""
         return [rest] if rest else []
 

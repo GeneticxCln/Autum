@@ -105,6 +105,7 @@ class _Operation:
     id: str
     turn_id: str
     task: asyncio.Task[None]
+    is_announcement: bool = False
 
 
 class Runtime:
@@ -148,7 +149,10 @@ class Runtime:
         self._op: _Operation | None = None
         self._input_turn: str | None = None
         self._transcribe_task: asyncio.Task[None] | None = None
+        self._transcribe_tasks: set[asyncio.Task[None]] = set()
         self._transcribe_turn: str | None = None
+        self._tx_gen: int = 0
+        self._cancel_seq: int = 0
         self._paused_segments: list[str] = []
         self._approval_turn: tuple[str, str, int] | None = None  # (turn_id, source_mode, started_mono_ns)
         self._turn_observed = False
@@ -383,8 +387,20 @@ class Runtime:
         turn_id: str | None = None,
         *,
         check_echo: bool = True,
+        captured_at_ns: int | None = None,
     ) -> bool:
         """Handle a quietly captured utterance (during speech, or any utterance in wake_word mode)."""
+        # If we entered WAITING_FOR_APPROVAL while this candidate utterance was transcribing,
+        # resolve via ApprovalGate using its TRUE capture timestamp (anti-spoofing §5.2) instead
+        # of forging a fresh audio.speech_started timestamp.
+        if self.state is State.WAITING_FOR_APPROVAL and self.approval_gate.pending is not None:
+            resolved = self.resolve_approval(
+                transcript,
+                provenance=Provenance.USER,
+                source="hands_free",
+                captured_at_ns=captured_at_ns if captured_at_ns is not None else 0,
+            )
+            return resolved is not None
         if check_echo and self.is_self_echo(transcript):
             return False
         if self.mode is Mode.WAKE_WORD:
@@ -400,12 +416,15 @@ class Runtime:
                 return True
             if woke:
                 if not remainder:
-                    # Bare "Autum" -> stop any active reply, open 12s follow-up window, say "Yes?"
+                    # Bare "Autum" -> stop any active reply or transcription, open 12s window, say "Yes?"
                     self._cancel_pending_transcription()
                     self._wake_window_until = time.monotonic() + 12.0
                     if self._op is not None:
                         self._begin_cancel("barge_in", None)
+                        self.announce("Yes?")
                     else:
+                        if self.state not in (State.IDLE, State.LISTENING):
+                            self._set_state(self.rest_state, "wake_word_detected")
                         self.announce("Yes?")
                     return True
                 cleaned = remainder
@@ -618,6 +637,14 @@ class Runtime:
         self._input_turn = None
         raw_text = str(event.payload["text"]).strip()
         if not raw_text:
+            # If capture was aborted/muted while still in SPEECH_DETECTED (no speech_ended),
+            # return cleanly to rest instead of starting a response from SPEECH_DETECTED.
+            if self.muted or self.state is State.SPEECH_DETECTED:
+                self._cancel_pending_transcription()
+                if self.state not in (State.IDLE, State.LISTENING):
+                    self._set_state(self.rest_state, "capture_aborted", event)
+                self._drain_pending_announcements()
+                return
             # A too-short sound (e.g. "um") ended after a mid-sentence pause:
             # 1) If the first half is still transcribing, hand control back to it
             #    so the first half is neither lost nor dropped.
@@ -710,10 +737,13 @@ class Runtime:
                 if self._transcribe_task is not None and not self._transcribe_task.done()
                 else None
             )
+            gen = self._tx_gen
             task = asyncio.get_running_loop().create_task(
-                self._transcribe_and_respond(turn_id, audio, prev_task=prev_task)
+                self._transcribe_and_respond(turn_id, audio, prev_task=prev_task, gen=gen)
             )
             self._transcribe_task = task
+            self._transcribe_tasks.add(task)
+            task.add_done_callback(self._transcribe_tasks.discard)
             self._transcribe_turn = turn_id
             self._track(task)
             return
@@ -726,6 +756,7 @@ class Runtime:
         wav: bytes,
         *,
         prev_task: asyncio.Task[None] | None = None,
+        gen: int = 0,
     ) -> None:
         if prev_task is not None:
             try:
@@ -734,13 +765,15 @@ class Runtime:
                 raise
             except Exception:
                 pass
+        if gen != self._tx_gen:
+            return
         try:
             text = (await self.transcriber.transcribe(wav)).strip()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self.bus.emit("runtime.component_error", {"component": "transcription", "error": str(exc)})
-            if turn_id == self._input_turn:
+            if gen == self._tx_gen and turn_id == self._input_turn:
                 self._input_turn = None
                 self._paused_segments.clear()
                 self._set_state(self.rest_state, "transcription_failed")
@@ -750,6 +783,8 @@ class Runtime:
             if self._transcribe_task is asyncio.current_task():
                 self._transcribe_task = None
                 self._transcribe_turn = None
+        if gen != self._tx_gen:
+            return
         if turn_id != self._input_turn:
             # If the user resumed speaking mid-sentence (a newer _input_turn is active),
             # preserve this first half so the next segment merges into one full sentence.
@@ -783,17 +818,19 @@ class Runtime:
         self._cancel_pending_transcription()
         if self._op is not None:
             self._begin_cancel("user_command", None)
+        elif self.state is State.SPEECH_DETECTED:
+            self._set_state(self.rest_state, "user_command")
         self._start_response(text, "text", new_id(), None)
 
     def _cancel_pending_transcription(self) -> bool:
-        had_pending = self._input_turn is not None or (
-            self._transcribe_task is not None and not self._transcribe_task.done()
-        )
+        had_pending = self._input_turn is not None or any(not t.done() for t in self._transcribe_tasks)
+        self._tx_gen += 1
         self._input_turn = None
         self._transcribe_turn = None
         self._paused_segments.clear()
-        if self._transcribe_task is not None and not self._transcribe_task.done():
-            self._transcribe_task.cancel()
+        for task in list(self._transcribe_tasks):
+            if not task.done():
+                task.cancel()
         self._transcribe_task = None
         return had_pending
 
@@ -833,7 +870,7 @@ class Runtime:
         self.bus.fence.open(op_id)
         self._set_state(State.THINKING, "announcement")
         task = asyncio.get_running_loop().create_task(self._speak_announcement(op_id, spoken))
-        self._op = _Operation(op_id, new_id(), task)
+        self._op = _Operation(op_id, new_id(), task, is_announcement=True)
         self._track(task)
 
     def _drain_pending_announcements(self) -> None:
@@ -927,7 +964,7 @@ class Runtime:
             operation_id=op_id,
             tool_call_id=tc_id,
         )
-        if cap.permission_level is PermissionLevel.IRREVERSIBLE and self.mode is Mode.HANDS_FREE:
+        if cap.permission_level is PermissionLevel.IRREVERSIBLE and self.mode in (Mode.HANDS_FREE, Mode.WAKE_WORD):
             prompt = f"Should I {resolved_target}? Hold your talk key and say yes to confirm, or no to cancel."
         else:
             prompt = f"Should I {resolved_target}? Say yes to confirm, or no to cancel."
@@ -979,6 +1016,7 @@ class Runtime:
                 chunker = SentenceChunker()
                 parts: list[str] = []
                 tool_calls: list[ToolCall] = []
+                step_spoke = False
                 active_tools = tool_schemas if step < max_steps - 1 else None
                 async for item in self._stream_inference(messages, op_id, active_tools):
                     if not self.bus.fence.is_live(op_id):
@@ -996,15 +1034,17 @@ class Runtime:
                             operation_id=op_id,
                             cause=started,
                         )
-                        self._speak(chunker.feed(item), op_id, turn_id)
+                        if self._speak(chunker.feed(item), op_id, turn_id):
+                            step_spoke = True
                 if not self.bus.fence.is_live(op_id):
                     return
                 if tool_calls and self.tools is not None:
                     preamble = "".join(parts)
                     if preamble:
-                        self._speak(chunker.flush(), op_id, turn_id)
+                        if self._speak(chunker.flush(), op_id, turn_id):
+                            step_spoke = True
                         emitted_parts.append(preamble)
-                        if self.state is State.SPEAKING:
+                        if step_spoke or self.state is State.SPEAKING:
                             await self.speech.drain(op_id)
                             if not self.bus.fence.is_live(op_id):
                                 return
@@ -1087,12 +1127,15 @@ class Runtime:
         self._set_state(self.rest_state, "response_finished", finished)
         self._drain_pending_announcements()
 
-    def _speak(self, chunks: list[str], op_id: str, turn_id: str | None) -> None:
+    def _speak(self, chunks: list[str], op_id: str, turn_id: str | None) -> bool:
+        enqueued = False
         for chunk in chunks:
             spoken = speakable(chunk)
             if spoken and self.bus.fence.is_live(op_id):
                 self.current_spoken_text = f"{self.current_spoken_text} {spoken}".strip()
                 self.speech.enqueue(spoken, operation_id=op_id, turn_id=turn_id)
+                enqueued = True
+        return enqueued
 
     def _fail(self, op_id: str, exc: Exception) -> None:
         if self._op is None or self._op.id != op_id:
@@ -1126,6 +1169,9 @@ class Runtime:
         if op is None:
             return None
         requested_ns = time.monotonic_ns()
+        self._cancel_seq += 1
+        cancel_seq = self._cancel_seq
+        was_observed = self._turn_observed
         self._op = None
         self._approval_turn = None
         self._turn_observed = False
@@ -1140,20 +1186,25 @@ class Runtime:
             operation_id=op.id,
             cause=cause,
         )
-        if spoken:
+        if spoken and not op.is_announcement:
             self.history.append(
-                {"role": "assistant", "content": f"{spoken} [interrupted by the user]"}
+                {
+                    "role": "assistant",
+                    "content": f"{spoken} [interrupted by the user]",
+                    "observed": was_observed,
+                }
             )
+            self._trim_history()
         op.task.cancel()
         if State.INTERRUPTED in TRANSITIONS[self.state]:
             self._set_state(State.INTERRUPTED, source, cause)
         finishing = asyncio.get_running_loop().create_task(
-            self._finish_cancel(op, source, requested_ns)
+            self._finish_cancel(op, source, requested_ns, cancel_seq)
         )
         self._track(finishing)
         return finishing
 
-    async def _finish_cancel(self, op: _Operation, source: str, requested_ns: int) -> None:
+    async def _finish_cancel(self, op: _Operation, source: str, requested_ns: int, cancel_seq: int) -> None:
         """Asynchronous part: wait for the task to stop, then close the operation."""
         done, _ = await asyncio.wait({op.task}, timeout=self.cancel_timeout_s)
         clean = bool(done)
@@ -1178,7 +1229,7 @@ class Runtime:
             operation_id=op.id,
         )
         self.bus.fence.close(op.id)
-        if self.state is State.INTERRUPTED:
+        if self.state is State.INTERRUPTED and cancel_seq == self._cancel_seq:
             self._set_state(self.rest_state, "cancelled", cancelled)
             self._drain_pending_announcements()
 

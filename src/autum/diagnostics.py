@@ -15,21 +15,89 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 import datetime as dt
+import http.client
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Any, Callable
 
 from autum.bus import EventBus
 from autum.config import Config, default_config_path
 from autum.events import Event, new_id
 from autum.logging import redact_sensitive
-from autum.presence.settings_bridge import query_ollama_models
 from autum.tools import Capability, PermissionLevel, ToolRegistry
 
 MAX_LOG_ENTRIES = 500
+
+
+def query_ollama_models(ollama_url: str = "http://127.0.0.1:11434", timeout_s: float = 2.0) -> list[dict[str, Any]]:
+    """Query local Ollama for installed models and their live GPU residency (headless, no Qt dependency)."""
+    try:
+        parsed = urllib.parse.urlparse(ollama_url)
+        port = parsed.port
+    except ValueError:
+        return []
+    if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+        return []
+    if port is not None and not (1 <= port <= 65535):
+        return []
+    base = ollama_url.rstrip("/")
+
+    loaded_map: dict[str, str] = {}
+    try:
+        with urllib.request.urlopen(f"{base}/api/ps", timeout=timeout_s) as resp:
+            ps_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        if isinstance(ps_data, dict):
+            for item in ps_data.get("models") or []:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "")
+                if name:
+                    vram = int(item.get("size_vram") or 0)
+                    size = int(item.get("size") or 0)
+                    if size > 0 and vram >= size:
+                        loaded_map[name] = "100% GPU"
+                    elif vram > 0:
+                        loaded_map[name] = f"{round(vram / max(size, 1) * 100)}% GPU"
+                    else:
+                        loaded_map[name] = "loaded"
+    except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException):
+        pass
+
+    try:
+        with urllib.request.urlopen(f"{base}/api/tags", timeout=timeout_s) as resp:
+            tags_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException):
+        return []
+
+    out: list[dict[str, Any]] = []
+    if isinstance(tags_data, dict):
+        for m in tags_data.get("models") or []:
+            if not isinstance(m, dict):
+                continue
+            name = str(m.get("name") or "")
+            if not name:
+                continue
+            size_bytes = int(m.get("size") or 0)
+            details = m.get("details") if isinstance(m.get("details"), dict) else {}
+            out.append(
+                {
+                    "name": name,
+                    "size_gb": round(size_bytes / (1024**3), 1),
+                    "params": str(details.get("parameter_size") or ""),
+                    "loaded": name in loaded_map,
+                    "status": loaded_map.get(name, ""),
+                }
+            )
+    out.sort(key=lambda item: (not item["loaded"], item["name"].lower()))
+    return out
 
 
 def _now_iso() -> str:
@@ -64,21 +132,25 @@ class DiagnosticsLog:
     ) -> None:
         self.path = path
         self._state_snapshot = state_snapshot
+        self._lock = threading.RLock()
         self._recent: deque[dict[str, Any]] = deque(maxlen=MAX_LOG_ENTRIES)
         self._last_mtime_ns: int = -1
         self._disk_lines: int = 0
         self.total_errors = 0
         self.total_tool_failures = 0
         self.last_problem: dict[str, Any] | None = None
-        self._ensure_file()
-        self._load_existing()
+        with self._lock:
+            self._ensure_file()
+            self._load_existing()
 
     def _ensure_file(self) -> None:
+        parent_existed = self.path.parent.exists()
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        try:
-            os.chmod(self.path.parent, 0o700)
-        except OSError:
-            pass
+        if not parent_existed or self.path.parent.name == "autum":
+            try:
+                os.chmod(self.path.parent, 0o700)
+            except OSError:
+                pass
         if self.path.exists():
             try:
                 os.chmod(self.path, 0o600)
@@ -86,46 +158,53 @@ class DiagnosticsLog:
                 pass
 
     def _load_existing(self) -> None:
-        if not self.path.is_file():
-            self._last_mtime_ns = -1
-            self._disk_lines = 0
-            return
-        try:
-            st = self.path.stat()
-            self._last_mtime_ns = st.st_mtime_ns
-            lines = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
-            self._disk_lines = len(lines)
-        except OSError:
-            return
-        self._recent.clear()
-        for line in lines[-MAX_LOG_ENTRIES:]:
+        with self._lock:
+            if not self.path.is_file():
+                self._last_mtime_ns = -1
+                self._disk_lines = 0
+                return
             try:
-                item = json.loads(line)
-                if isinstance(item, dict):
-                    self._recent.append(item)
-                    self.last_problem = item
-            except ValueError:
-                continue
-        if len(lines) > MAX_LOG_ENTRIES:
-            self._compact_disk()
+                st = self.path.stat()
+                self._last_mtime_ns = st.st_mtime_ns
+                lines = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
+                self._disk_lines = len(lines)
+            except OSError:
+                return
+            self._recent.clear()
+            for line in lines[-MAX_LOG_ENTRIES:]:
+                try:
+                    item = json.loads(line)
+                    if isinstance(item, dict):
+                        self._recent.append(item)
+                        self.last_problem = item
+                except ValueError:
+                    continue
+            if len(lines) > MAX_LOG_ENTRIES:
+                self._compact_disk()
 
     def _compact_disk(self) -> None:
-        self._ensure_file()
-        tmp = self.path.with_suffix(".jsonl.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                for entry in self._recent:
-                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            tmp.replace(self.path)
-            self._disk_lines = len(self._recent)
-            self._last_mtime_ns = self.path.stat().st_mtime_ns
-        except OSError:
+        with self._lock:
+            self._ensure_file()
+            fd, tmp_name = tempfile.mkstemp(prefix=".diagnostics.", suffix=".tmp", dir=str(self.path.parent))
+            tmp = Path(tmp_name)
+            fd_owned = True
             try:
-                os.close(fd)
+                os.fchmod(fd, 0o600)
+                fh = os.fdopen(fd, "w", encoding="utf-8")
+                fd_owned = False
+                with fh:
+                    for entry in list(self._recent):
+                        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                tmp.replace(self.path)
+                self._disk_lines = len(self._recent)
+                self._last_mtime_ns = self.path.stat().st_mtime_ns
             except OSError:
-                pass
+                if fd_owned:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                tmp.unlink(missing_ok=True)
 
     def attach_bus(self, bus: EventBus) -> None:
         """Automatically record runtime component errors and failed tool calls."""
@@ -207,68 +286,77 @@ class DiagnosticsLog:
             except Exception:
                 pass
 
-        self._recent.append(entry)
-        self.last_problem = entry
-        self._append_to_disk(entry)
+        with self._lock:
+            self._recent.append(entry)
+            self.last_problem = entry
+            self._append_to_disk(entry)
         return entry
 
     def _append_to_disk(self, entry: dict[str, Any]) -> None:
-        self._ensure_file()
-        line = json.dumps(entry, ensure_ascii=False) + "\n"
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "a", encoding="utf-8") as fh:
-                fh.write(line)
-            self._disk_lines += 1
-            if self._disk_lines > MAX_LOG_ENTRIES:
-                self._compact_disk()
-            else:
-                self._last_mtime_ns = self.path.stat().st_mtime_ns
-        except Exception:
+        with self._lock:
+            self._ensure_file()
+            line = json.dumps(entry, ensure_ascii=False) + "\n"
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            fd_owned = True
             try:
-                os.close(fd)
-            except OSError:
-                pass
+                os.fchmod(fd, 0o600)
+                fh = os.fdopen(fd, "a", encoding="utf-8")
+                fd_owned = False
+                with fh:
+                    fh.write(line)
+                self._disk_lines += 1
+                if self._disk_lines > MAX_LOG_ENTRIES:
+                    self._compact_disk()
+                else:
+                    self._last_mtime_ns = self.path.stat().st_mtime_ns
+            except Exception:
+                if fd_owned:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
     def recent_problems(self, limit: int = 20) -> list[dict[str, Any]]:
-        self._load_from_disk_if_updated()
-        n = max(1, min(100, int(limit)))
-        items = list(self._recent)[-n:]
-        items.reverse()
-        return items
+        with self._lock:
+            self._load_from_disk_if_updated()
+            n = max(1, min(100, int(limit)))
+            items = list(self._recent)[-n:]
+            items.reverse()
+            return items
 
     def _load_from_disk_if_updated(self) -> None:
-        if not self.path.is_file():
-            self._recent.clear()
-            self.last_problem = None
-            self._last_mtime_ns = -1
-            self._disk_lines = 0
-            return
-        try:
-            mtime = self.path.stat().st_mtime_ns
-        except OSError:
-            return
-        if mtime == self._last_mtime_ns:
-            return
-        self._load_existing()
+        with self._lock:
+            if not self.path.is_file():
+                self._recent.clear()
+                self.last_problem = None
+                self._last_mtime_ns = -1
+                self._disk_lines = 0
+                return
+            try:
+                mtime = self.path.stat().st_mtime_ns
+            except OSError:
+                return
+            if mtime == self._last_mtime_ns:
+                return
+            self._load_existing()
 
     def clear(self) -> int:
-        count = len(self._recent)
-        self._recent.clear()
-        self.last_problem = None
-        self._disk_lines = 0
-        self._ensure_file()
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-        finally:
-            os.close(fd)
-        try:
-            self._last_mtime_ns = self.path.stat().st_mtime_ns
-        except OSError:
-            self._last_mtime_ns = -1
-        return count
+        with self._lock:
+            count = len(self._recent)
+            self._recent.clear()
+            self.last_problem = None
+            self._disk_lines = 0
+            self._ensure_file()
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
+            try:
+                self._last_mtime_ns = self.path.stat().st_mtime_ns
+            except OSError:
+                self._last_mtime_ns = -1
+            return count
 
 
 def _run_cmd(args: list[str], timeout_s: float = 2.0) -> tuple[int, str]:
@@ -394,15 +482,30 @@ def run_system_health_checks(
 
     # 3. Desktop Eyes & Hands (Wayland / X11)
     wayland = os.environ.get("WAYLAND_DISPLAY", "")
+    x11 = os.environ.get("DISPLAY", "")
     desktop_env = os.environ.get("XDG_CURRENT_DESKTOP", "Linux")
+    has_display = bool(wayland or x11)
+    has_desktop_int = "linux_desktop" in cfg.enabled_integrations
+    if not has_desktop_int:
+        desk_status = "warning"
+        desk_summary = f"{desktop_env} • Desktop integration disabled"
+        desk_suggestion = "Enable Linux Desktop Integration in Settings to use window control and screen watch."
+    elif not has_display:
+        desk_status = "warning"
+        desk_summary = f"{desktop_env} (headless) • No Wayland/X11 display detected"
+        desk_suggestion = "Run Autum inside a graphical desktop session for window control and screen watch."
+    else:
+        desk_status = "ok"
+        desk_summary = f"{desktop_env} ({'Wayland' if wayland else 'X11'}) • Eyes & Hands ready"
+        desk_suggestion = ""
     checks.append(
         {
             "section": "desktop",
             "title": "Desktop Integration",
-            "status": "ok",
-            "summary": f"{desktop_env} ({'Wayland' if wayland else 'X11'}) • Eyes & Hands ready",
+            "status": desk_status,
+            "summary": desk_summary,
             "details": f"Integrations: {', '.join(cfg.enabled_integrations) or 'none'}",
-            "suggestion": "",
+            "suggestion": desk_suggestion,
         }
     )
 
@@ -561,6 +664,7 @@ def register_diagnostic_capabilities(
             },
             output_schema={"type": "object"},
             permission_level=PermissionLevel.READ_ONLY,
+            observed_output=True,
             execute=_exec_self_diagnose,
             verify=lambda _a, res: asyncio.sleep(0, result=isinstance(res, dict) and "overall_status" in res),
             target_summary=lambda a: f"self-diagnosis ({a.get('focus', 'all')})",
@@ -619,7 +723,7 @@ def register_diagnostic_capabilities(
                 "additionalProperties": False,
             },
             output_schema={"type": "object"},
-            permission_level=PermissionLevel.READ_ONLY,
+            permission_level=PermissionLevel.REVERSIBLE,
             execute=_exec_log_problem,
             verify=lambda _a, res: asyncio.sleep(0, result=bool(res.get("logged"))),
             target_summary=lambda a: f"log problem in {a.get('component', 'general')}: {a.get('summary', '')[:60]}",
@@ -645,6 +749,7 @@ def register_diagnostic_capabilities(
             },
             output_schema={"type": "object"},
             permission_level=PermissionLevel.READ_ONLY,
+            observed_output=True,
             execute=_exec_list_problems,
             verify=lambda _a, res: asyncio.sleep(0, result=isinstance(res.get("problems"), list)),
             target_summary=lambda _a: "list recent diagnostic problems",

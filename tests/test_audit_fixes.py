@@ -308,7 +308,7 @@ def test_look_at_screen_blocks_excluded_active_window_and_move_verifies_position
     assert verified.status == "verified"
 
 
-# 7. PresenceModel latency buffers stay bounded over long sessions
+# 7. PresenceModel latency buffers stay bounded & RMS ticks don't pollute changed/applied_ms
 def test_presence_model_latency_buffers_stay_bounded(tmp_path):
     pytest.importorskip("PySide6")
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
@@ -317,11 +317,23 @@ def test_presence_model_latency_buffers_stay_bounded(tmp_path):
 
     _ = QGuiApplication.instance() or QGuiApplication([])
     model = PresenceModel(tmp_path / "none.sock")
+    changed_count = [0]
+    model.changed.connect(lambda: changed_count.__setitem__(0, changed_count[0] + 1))
     bus = EventBus("s")
     op = new_id()
     bus.fence.open(op)
-    for i in range(600):
+    # High-rate RMS ticks only emit levelChanged, never polluting applied_ms or changed
+    for i in range(50):
         ev = bus.emit("speech.output_level", {"rms": 0.1 + (i % 5) * 0.05}, operation_id=op)
+        model.apply(ev)
+    assert len(model.applied_ms) == 0
+    assert changed_count[0] == 0
+    # State transitions stay bounded at 256
+    for i in range(400):
+        ev = bus.emit(
+            "runtime.state_changed",
+            {"from": "idle", "to": "thinking" if i % 2 else "idle", "reason": "t", "microphone": "off", "observation": "none"},
+        )
         model.apply(ev)
     assert len(model.applied_ms) == 256
 
@@ -679,3 +691,327 @@ def test_loading_guard_capture_refcount_queued_timer_traceback_redaction_and_pol
 
     audible = run(scenario())
     assert any("pasta timer is done" in text for _, text, _ in audible)
+
+
+# 21. Full-codebase audit regression suite (real JS engine, real Unix sockets, real GLib, real TOML/JSON)
+def test_kwin_move_window_js_parses_cleanly_in_real_qjsengine():
+    """Verify KWin move_window JS parses and runs cleanly in Qt's real QJSEngine (no top-level return SyntaxError)."""
+    pytest.importorskip("PySide6")
+    import json as _json
+    from PySide6.QtQml import QJSEngine
+    from autum.integrations import kwin_windows
+
+    captured_scripts: list[str] = []
+
+    def fake_run_js(body_js: str, timeout_s: float = 4.0):
+        wrapped = (
+            "var __replied = null;\n"
+            "function __reply(v) { __replied = JSON.stringify(v); }\n"
+            f"try {{\n(function() {{\n{body_js}\n}})();\n}} catch (e) {{ __reply({{error: String(e)}}); }}\n"
+            "__replied;"
+        )
+        captured_scripts.append(wrapped)
+        eng = QJSEngine()
+        # Provide minimal KWin mock globals so we actually execute the center + desktop error branches!
+        mock_env = """
+        var KWin = { MaximizeArea: 1 };
+        var winObj = {
+            internalId: "w1", caption: "Firefox", resourceClass: "firefox",
+            minimized: false,
+            frameGeometry: { x: 0, y: 0, width: 1000, height: 800 },
+            desktops: [{ x11DesktopNumber: 1 }],
+            setMaximize: function() {}
+        };
+        var workspace = {
+            windowList: function() { return [winObj]; },
+            desktops: [{ x11DesktopNumber: 1 }],
+            clientArea: function() { return { x: 0, y: 0, width: 1920, height: 1080 }; },
+            activeWindow: winObj
+        };
+        """
+        eng.evaluate(mock_env)
+        val = eng.evaluate(wrapped)
+        assert not val.isError(), f"KWin JS syntax/runtime error: {val.toString()}"
+        return _json.loads(val.toString())
+
+    wm = kwin_windows.KWinController()
+
+    async def fake_list(_excluded=()):
+        return [{"id": "w1", "app": "firefox", "title": "Firefox", "maximized": False, "desktop": 1}]
+
+    wm.list_windows = fake_list  # type: ignore[method-assign]
+    orig = kwin_windows._run_kwin_js_sync
+    kwin_windows._run_kwin_js_sync = fake_run_js
+    try:
+        # Center with explicit width/height must center using NEW width/height (800x600 -> x=560, y=240)
+        res = run(wm.move_window("firefox", position="center", width=800, height=600))
+        assert res["target_x"] == 560 and res["target_y"] == 240
+        assert res["target_width"] == 800 and res["target_height"] == 600
+        # Nonexistent desktop returns clean error inside IIFE without SyntaxError
+        res_err = run(wm.move_window("firefox", desktop=5))
+        assert "does not exist" in res_err["error"]
+    finally:
+        kwin_windows._run_kwin_js_sync = orig
+
+
+def test_event_server_close_does_not_deadlock_with_connected_client(tmp_path):
+    """EventServer.close() must return promptly on Python 3.12+/3.14 even with an active connected client."""
+    from autum.transport import EventServer
+
+    async def scenario():
+        bus = EventBus("close-test")
+        sock = tmp_path / "events.sock"
+
+        async def on_cmd(_c):
+            pass
+
+        srv = EventServer(bus, on_cmd, path=sock)
+        await srv.start()
+        reader, writer = await asyncio.open_unix_connection(str(sock))
+        await asyncio.sleep(0.02)
+        assert srv.client_count == 1
+        # Must NOT deadlock!
+        await asyncio.wait_for(srv.close(), timeout=2.0)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
+        assert not sock.exists()
+
+    run(scenario())
+
+
+def test_config_validation_unicode_toml_and_logging_redaction_json_safety(tmp_path):
+    import json as _json
+    from autum.logging import configure_logging, redact_sensitive
+    from autum.tools import AuditLog
+
+    # Bare string allowed_read_dirs must be rejected (no '/' char-by-char sandbox bypass!)
+    with pytest.raises(ValueError, match="list of strings"):
+        Config(allowed_read_dirs="/home/alice/Documents")  # type: ignore[arg-type]
+    # Non-finite NaN timeout, invalid port, bad types, empty model, bad log_level all raise ValueError
+    with pytest.raises(ValueError):
+        Config(approval_timeout_s=float("nan"))
+    with pytest.raises(ValueError):
+        Config(ollama_url="http://127.0.0.1:abc")
+    with pytest.raises(ValueError):
+        Config(silence_ms="700")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        Config(model="   ")
+    with pytest.raises(ValueError):
+        Config(log_level="basic_format")
+
+    # Non-BMP Unicode round-trips cleanly through to_toml() -> tomllib.loads()
+    cfg = Config(allowed_read_dirs=(str(tmp_path / "docs_🔥"),))
+    saved = cfg.save(tmp_path / "cfg.toml")
+    reloaded = Config.load(saved)
+    assert reloaded.allowed_read_dirs == cfg.allowed_read_dirs
+
+    # configure_logging ignores invalid attribute names safely
+    configure_logging("basic_format")
+
+    # redact_sensitive preserves valid JSON and redacts escaped, quoted, and JSON secrets
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    rec1 = audit.record("tool_requested", args={"content": 'password="supersecret"'})
+    assert "supersecret" not in _json.dumps(rec1)
+    rec2 = audit.record("tool_requested", args={"password": "my_json_secret", "api_key": "tok_999"})
+    assert "my_json_secret" not in _json.dumps(rec2) and "tok_999" not in _json.dumps(rec2)
+    assert "phrase" not in redact_sensitive('password="my secret phrase"')
+    assert "my_token_123" not in redact_sensitive('Authorization: Bearer "my_token_123"')
+
+
+def test_multiline_think_block_never_leaks_into_speech():
+    from autum.text import SentenceChunker, speakable
+
+    chunker = SentenceChunker()
+    chunks = []
+    for token in ["<thi", "nk>\nStep 1: check.\nStep 2: verify.\n</th", "ink>Hello ", "world. ", "How are you?"]:
+        chunks.extend(chunker.feed(token))
+    chunks.extend(chunker.flush())
+    spoken = " ".join(speakable(c) for c in chunks if speakable(c))
+    assert "Step 1" not in spoken and "Step 2" not in spoken and "think" not in spoken.lower()
+    assert "Hello world." in spoken and "How are you?" in spoken
+
+
+def test_notes_crlf_verification_and_memory_category_unicode_and_rollback(tmp_path):
+    from autum.capabilities import build_default_registry
+    from autum.tools import ToolCall
+
+    async def scenario():
+        bus = EventBus("notes-crlf")
+        reg, timers, _notes = build_default_registry(tmp_path / "data")
+        op = new_id()
+        bus.fence.open(op)
+        out = await reg.execute(
+            ToolCall("n1", "create_note", {"title": "crlf", "content": "line1\r\nline2"}),
+            bus=bus, operation_id=op, turn_id="t1",
+        )
+        timers.stop_all()
+        return out
+
+    out = run(scenario())
+    assert out.status == "verified"
+
+    # MemoryStore: category + query, Unicode search, and observed entries never starve USER context
+    store = MemoryStore(tmp_path / "mem.json")
+    store.remember("city", "München", category="profile", provenance=Provenance.USER)
+    store.remember("drink", "espresso coffee", category="preference", provenance=Provenance.USER)
+    store.remember("work_drink", "filter coffee", category="work", provenance=Provenance.USER)
+    for i in range(12):
+        store.remember(f"obs_{i}", f"coffee note {i}", category="general", provenance=Provenance.OBSERVED)
+
+    assert [e.key for e in store.search("münchen")] == ["city"]
+    assert [e.key for e in store.search("coffee", category="preference")] == ["drink"]
+    ctx = store.select_for_context("coffee", max_entries=5)
+    assert any(e.key == "drink" for e in ctx)
+    assert all(e.provenance == Provenance.USER.value for e in ctx)
+
+
+def test_excluded_paths_parent_dirs_multi_suffix_and_symlink_listing(tmp_path):
+    from autum.integrations import IntegrationContext
+    from autum.integrations.linux_desktop import LinuxDesktopIntegration
+    from autum.perception import is_excluded_path
+    from autum.tools import ToolCall, ToolRegistry
+
+    allowed = tmp_path / "docs"
+    (allowed / "passwords").mkdir(parents=True)
+    secret_inside = allowed / "passwords" / "bank.txt"
+    secret_inside.write_text("1234")
+    pem_txt = allowed / "server.pem.txt"
+    pem_txt.write_text("data")
+    ok_file = allowed / "readme.txt"
+    ok_file.write_text("hello")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("nope")
+    (allowed / "escape_link").symlink_to(outside)
+
+    assert is_excluded_path(secret_inside) is not None
+    assert is_excluded_path(pem_txt) is not None
+    assert is_excluded_path(ok_file) is None
+
+    async def scenario():
+        bus = EventBus("dir-sym")
+        reg = ToolRegistry()
+        LinuxDesktopIntegration().register(reg, IntegrationContext(allowed_read_dirs=(allowed,)))
+        op = new_id()
+        bus.fence.open(op)
+        return await reg.execute(
+            ToolCall("d1", "list_directory", {"path": str(allowed)}),
+            bus=bus, operation_id=op, turn_id="t1",
+        )
+
+    out = run(scenario())
+    names = [e["name"] for e in out.result["entries"]]
+    assert "readme.txt" in names
+    assert "escape_link" not in names
+    assert "passwords" not in names
+    assert "server.pem.txt" not in names
+
+
+def test_runtime_submit_text_during_speech_detected_and_observed_interrupt_taint():
+    async def scenario():
+        bus = EventBus("rt-edge")
+        speech = MockSpeech(bus, synth_s=0.005, per_char_s=0.02)
+        rt = Runtime(bus, MockInference("Hello from text."), speech, mode=Mode.HANDS_FREE)
+        # 1. submit_text during State.SPEECH_DETECTED must not raise InvalidTransition
+        bus.emit("audio.speech_started", {"mode": "hands_free"}, provenance=Provenance.USER, turn_id="t1")
+        assert rt.state is State.SPEECH_DETECTED
+        rt.submit_text("override question")
+        await rt.wait_until_settled()
+        assert rt.state is State.IDLE
+
+        # 2. Interrupting an observed turn must preserve observed=True on history
+        rt._turn_observed = True
+        rt.submit_text("second turn")
+        deadline = time.monotonic() + 2.0
+        while rt.state is not State.SPEAKING and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        rt._turn_observed = True
+        await rt.cancel("barge_in")
+        await rt.wait_until_settled()
+        interrupted_entries = [e for e in rt.history if "interrupted" in str(e.get("content", ""))]
+        return interrupted_entries
+
+    interrupted = run(scenario())
+    assert interrupted and interrupted[-1].get("observed") is True
+
+
+def test_diagnostics_capabilities_mark_observed_and_enum_validation(tmp_path):
+    from autum.diagnostics import DiagnosticsLog, SelfDiagnostics, register_diagnostic_capabilities
+    from autum.tools import PermissionLevel, ToolCall, ToolRegistry
+
+    store = DiagnosticsLog(tmp_path / "diagnostics.jsonl")
+    sd = SelfDiagnostics(store, get_config=Config, get_live_state=lambda: {})
+    reg = ToolRegistry()
+    register_diagnostic_capabilities(reg, sd)
+
+    assert reg.get("self_diagnose").observed_output is True
+    assert reg.get("list_problems").observed_output is True
+    assert reg.get("log_problem").permission_level is PermissionLevel.REVERSIBLE
+
+    # Enum validation rejects invalid focus / severity
+    async def scenario():
+        bus = EventBus("enum-test")
+        op = new_id()
+        bus.fence.open(op)
+        return await reg.execute(
+            ToolCall("c1", "self_diagnose", {"focus": "bogus"}),
+            bus=bus, operation_id=op, turn_id="t1",
+        )
+
+    out = run(scenario())
+    assert out.status == "invalid" and "must be one of" in (out.error or "")
+
+
+def test_hotkey_stop_exits_real_glib_mainloop():
+    """Verify PushToTalkKey.stop() actually quits a real GLib.MainLoop cleanly (no GLib.MainContext.invoke error)."""
+    gi = pytest.importorskip("gi")
+    from gi.repository import GLib
+    import threading
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        hk = PushToTalkKey(loop, lambda: None, lambda: None, lambda _m: None)
+        ctx = GLib.MainContext.new()
+        ml = GLib.MainLoop.new(ctx, False)
+        started = threading.Event()
+        exited = threading.Event()
+
+        def worker():
+            ctx.push_thread_default()
+            hk._glib_context = ctx
+            hk._glib_loop = ml
+            started.set()
+            ml.run()
+            ctx.pop_thread_default()
+            exited.set()
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        assert started.wait(2.0)
+        await asyncio.sleep(0.02)
+        hk.stop()
+        assert exited.wait(2.0), "GLib MainLoop did not exit after PushToTalkKey.stop()"
+        t.join(timeout=1.0)
+
+    run(scenario())
+
+
+def test_approval_gate_rejects_hands_free_for_irreversible_even_if_mode_switched():
+    from autum.tools import ApprovalGate, PermissionLevel
+
+    async def scenario():
+        gate = ApprovalGate()
+        pending = gate.open(
+            action="close_window", target="firefox", level=PermissionLevel.IRREVERSIBLE,
+            operation_id="op1", tool_call_id="tc1",
+        )
+        gate.mark_prompt_finished()
+        # Even with hands_free_mode=False (e.g. switched to PTT mid-transcription), source="hands_free" must be rejected
+        res = gate.resolve("yes", provenance=Provenance.USER, source="hands_free", hands_free_mode=False)
+        gate.cancel()
+        return res, pending.future.result()
+
+    res, fut = run(scenario())
+    assert res is None and fut == "denied"

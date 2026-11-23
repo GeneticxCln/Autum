@@ -37,15 +37,15 @@ Window {
 
     function clampMarginRight(val) {
         const minM = -pad
-        const screenW = Screen.width > size ? Screen.width : 3840
-        const maxM = Math.max(minM, screenW - size - pad)
+        const availW = Screen.desktopAvailableWidth > size ? Screen.desktopAvailableWidth : (Screen.width > size ? Screen.width : 3840)
+        const maxM = Math.max(minM, availW - size - pad)
         return Math.max(minM, Math.min(maxM, Math.round(val)))
     }
 
     function clampMarginBottom(val) {
         const minM = -pad
-        const screenH = Screen.height > size ? Screen.height : 2160
-        const maxM = Math.max(minM, screenH - size - pad)
+        const availH = Screen.desktopAvailableHeight > size ? Screen.desktopAvailableHeight : (Screen.height > size ? Screen.height : 2160)
+        const maxM = Math.max(minM, availH - size - pad)
         return Math.max(minM, Math.min(maxM, Math.round(val)))
     }
 
@@ -130,17 +130,40 @@ Window {
             win.spin += win.spinSpeed * dt
             win.swirl += win.swirlSpeed * dt
             win.phase += dt
-            if (talkArea.dragging) {
+            if (talkArea.dragging && talkArea.hasDragDelta && !talkArea.awaitingCommit) {
                 const dx = Math.round(talkArea.curX - talkArea.pressX)
                 const dy = Math.round(talkArea.curY - talkArea.pressY)
+                talkArea.hasDragDelta = false
                 if (dx !== 0 || dy !== 0) {
-                    win.marginRight = win.clampMarginRight(win.marginRight - dx)
-                    win.marginBottom = win.clampMarginBottom(win.marginBottom - dy)
+                    const oldMR = win.marginRight
+                    const oldMB = win.marginBottom
+                    const newMR = win.clampMarginRight(oldMR - dx)
+                    const newMB = win.clampMarginBottom(oldMB - dy)
+                    const appliedDx = oldMR - newMR
+                    const appliedDy = oldMB - newMB
+                    if (appliedDx !== 0 || appliedDy !== 0) {
+                        talkArea.awaitingCommit = true
+                        win.marginRight = newMR
+                        win.marginBottom = newMB
+                    }
+                    // Keep anchor synced when clamped against a screen edge so reversing never jumps.
+                    talkArea.pressX = Math.max(0, Math.min(win.width, talkArea.pressX + (dx - appliedDx)))
+                    talkArea.pressY = Math.max(0, Math.min(win.height, talkArea.pressY + (dy - appliedDy)))
                     talkArea.curX = talkArea.pressX
                     talkArea.curY = talkArea.pressY
                 }
             }
             faceCloud.redraw()
+        }
+    }
+
+    Connections {
+        target: win
+        function onFrameSwapped() {
+            if (talkArea.awaitingCommit) {
+                talkArea.awaitingCommit = false
+                talkArea.hasDragDelta = false
+            }
         }
     }
 
@@ -195,6 +218,8 @@ Window {
         property bool leftHeld: false
         property bool dragging: false
         property bool talking: false
+        property bool hasDragDelta: false
+        property bool awaitingCommit: false
         property real pressX: 0
         property real pressY: 0
         property real curX: 0
@@ -209,8 +234,11 @@ Window {
                 lookY = Math.max(-1, Math.min(1, dy))
             }
             if (leftHeld) {
+                if (awaitingCommit)
+                    return
                 curX = mouse.x
                 curY = mouse.y
+                hasDragDelta = true
                 if (!dragging) {
                     const moveDist = Math.hypot(mouse.x - pressX, mouse.y - pressY)
                     if (moveDist >= 7) {
@@ -239,6 +267,8 @@ Window {
             pressY = mouse.y
             curX = mouse.x
             curY = mouse.y
+            hasDragDelta = false
+            awaitingCommit = false
             leftHeld = true
             dragging = false
             // In push_to_talk mode (or when answering an approval prompt):
@@ -262,11 +292,13 @@ Window {
                 return
             dragGraceTalkTimer.stop()
             if (dragging) {
-                const dx = Math.round(curX - pressX)
-                const dy = Math.round(curY - pressY)
-                if (dx !== 0 || dy !== 0) {
-                    win.marginRight = win.clampMarginRight(win.marginRight - dx)
-                    win.marginBottom = win.clampMarginBottom(win.marginBottom - dy)
+                if (hasDragDelta && !awaitingCommit) {
+                    const dx = Math.round(curX - pressX)
+                    const dy = Math.round(curY - pressY)
+                    if (dx !== 0 || dy !== 0) {
+                        win.marginRight = win.clampMarginRight(win.marginRight - dx)
+                        win.marginBottom = win.clampMarginBottom(win.marginBottom - dy)
+                    }
                 }
                 if (typeof settingsBridge !== "undefined" && settingsBridge)
                     settingsBridge.savePosition(win.marginRight, win.marginBottom)
@@ -278,6 +310,8 @@ Window {
             leftHeld = false
             dragging = false
             talking = false
+            hasDragDelta = false
+            awaitingCommit = false
         }
         onCanceled: {
             dragGraceTalkTimer.stop()
@@ -286,6 +320,8 @@ Window {
             leftHeld = false
             dragging = false
             talking = false
+            hasDragDelta = false
+            awaitingCommit = false
         }
     }
 

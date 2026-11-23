@@ -33,15 +33,21 @@ Window {
 
     property var installedModels: []
     property var allowedDirsList: []
+    property var extraIntegrations: []
     property var diagnosticChecks: []
     property var diagnosticProblems: []
     property string diagnosticOverall: ""
     property string selectedMode: "push_to_talk"
+    property string lastSyncedPresenceMode: ""
+    property bool pendingScrollToDiagnostics: false
+    property real loadedApprovalTimeout: 20.0
+    property int loadedApprovalSpinValue: 20
     property string statusText: ""
     property bool statusError: false
     property string dataDirValue: ""
 
     function openSettings() {
+        pendingScrollToDiagnostics = false
         loadFromDisk()
         visible = true
         raise()
@@ -49,14 +55,11 @@ Window {
     }
 
     function openDiagnostics() {
+        pendingScrollToDiagnostics = true
         loadFromDisk()
-        runSelfDiagnosis()
         visible = true
         raise()
         requestActivate()
-        Qt.callLater(() => {
-            flick.contentY = Math.max(0, flick.contentHeight - flick.height)
-        })
     }
 
     function runSelfDiagnosis() {
@@ -71,6 +74,25 @@ Window {
             diagnosticOverall = rep.overall_status || "ok"
             diagnosticChecks = rep.checks || []
             diagnosticProblems = rep.recent_problems || []
+            if (pendingScrollToDiagnostics) {
+                pendingScrollToDiagnostics = false
+                Qt.callLater(() => {
+                    flick.contentY = Math.max(0, flick.contentHeight - flick.height)
+                })
+            }
+        }
+    }
+
+    Connections {
+        target: typeof presence !== "undefined" ? presence : null
+        function onChanged() {
+            if (!presence || !presence.mode)
+                return
+            if (presence.mode !== root.lastSyncedPresenceMode) {
+                root.lastSyncedPresenceMode = presence.mode
+                if (presence.mode === "push_to_talk" || presence.mode === "wake_word" || presence.mode === "hands_free")
+                    root.selectedMode = presence.mode
+            }
         }
     }
 
@@ -81,6 +103,12 @@ Window {
                 root.diagnosticOverall = rep.overall_status || "ok"
                 root.diagnosticChecks = rep.checks || []
                 root.diagnosticProblems = rep.recent_problems || []
+            }
+            if (root.pendingScrollToDiagnostics) {
+                root.pendingScrollToDiagnostics = false
+                Qt.callLater(() => {
+                    flick.contentY = Math.max(0, flick.contentHeight - flick.height)
+                })
             }
         }
         function onModelsReady(models) {
@@ -112,20 +140,26 @@ Window {
         ollamaUrlField.text = cfg.ollama_url || "http://127.0.0.1:11434"
 
         selectedMode = (cfg.mode === "hands_free" || cfg.mode === "wake_word") ? cfg.mode : "push_to_talk"
+        if (typeof presence !== "undefined" && presence && presence.mode)
+            lastSyncedPresenceMode = presence.mode
         aecSwitch.checked = Boolean(cfg.aec)
         voicePresetField.text = cfg.voice || "female-american-english"
-        silenceSpin.value = Math.max(200, Math.min(3000, Number(cfg.silence_ms || 700)))
-        bargeInSpin.value = Math.max(64, Math.min(1500, Number(cfg.barge_in_ms || 256)))
+        silenceSpin.value = Math.max(100, Math.min(5000, Number(cfg.silence_ms || 700)))
+        bargeInSpin.value = Math.max(64, Math.min(2000, Number(cfg.barge_in_ms || 256)))
 
         allowedDirsList = (cfg.allowed_read_dirs || []).slice()
         const integrations = cfg.enabled_integrations || []
         desktopIntegrationSwitch.checked = integrations.indexOf("linux_desktop") >= 0
+        extraIntegrations = integrations.filter(i => i !== "linux_desktop")
         reversibleApprovalSwitch.checked = Boolean(cfg.require_reversible_approval)
-        approvalTimeoutSpin.value = Math.max(5, Math.min(120, Math.round(Number(cfg.approval_timeout_s || 20))))
+        const rawTimeout = Number(cfg.approval_timeout_s || 20)
+        loadedApprovalTimeout = Math.max(2.0, Math.min(120.0, isNaN(rawTimeout) ? 20.0 : rawTimeout))
+        loadedApprovalSpinValue = Math.max(2, Math.min(120, Math.round(loadedApprovalTimeout)))
+        approvalTimeoutSpin.value = loadedApprovalSpinValue
         excludedWindowsField.text = (cfg.excluded_windows || []).join(", ")
 
         maxHistorySpin.value = Math.max(2, Math.min(200, Number(cfg.max_history || 20)))
-        maxContextSpin.value = Math.max(1000, Math.min(64000, Number(cfg.max_context_chars || 10000)))
+        maxContextSpin.value = Math.max(500, Math.min(200000, Number(cfg.max_context_chars || 10000)))
         const lvl = String(cfg.log_level || "INFO").toUpperCase()
         const idx = logLevelBox.model.indexOf(lvl)
         logLevelBox.currentIndex = idx >= 0 ? idx : 1
@@ -189,7 +223,12 @@ Window {
             .split(",")
             .map(s => s.trim())
             .filter(s => s.length > 0)
-        const integrations = desktopIntegrationSwitch.checked ? ["linux_desktop"] : []
+        const integrations = desktopIntegrationSwitch.checked
+            ? ["linux_desktop"].concat(extraIntegrations)
+            : extraIntegrations.slice()
+        const timeoutVal = (approvalTimeoutSpin.value === loadedApprovalSpinValue)
+            ? loadedApprovalTimeout
+            : approvalTimeoutSpin.value
         const payload = {
             "mode": selectedMode,
             "aec": aecSwitch.checked,
@@ -210,15 +249,19 @@ Window {
             "enabled_integrations": integrations,
             "excluded_windows": excluded,
             "require_reversible_approval": reversibleApprovalSwitch.checked,
-            "approval_timeout_s": approvalTimeoutSpin.value
+            "approval_timeout_s": timeoutVal
         }
         const res = settingsBridge.saveAndApply(payload)
         if (res && res.ok) {
             statusError = false
             const needsRestart = res.restart_required || []
-            statusText = needsRestart.length > 0
-                ? ("Saved & applied (restart Autum for " + needsRestart.join(", ") + ")")
-                : "Saved & applied live"
+            if (res.applied_live === false) {
+                statusText = "Saved to disk (runtime offline — takes effect on next start)"
+            } else {
+                statusText = needsRestart.length > 0
+                    ? ("Saved & applied (restart Autum for " + needsRestart.join(", ") + ")")
+                    : "Saved & applied live"
+            }
             refreshModels()
             runSelfDiagnosis()
         } else {
@@ -757,13 +800,13 @@ Window {
                             Layout.fillWidth: true
                             spacing: 4
                             Text { text: "End-of-turn Silence (ms)"; color: root.textPrimary; font.pixelSize: 12 }
-                            StyledSpinBox { id: silenceSpin; from: 200; to: 3000; stepSize: 50; Layout.fillWidth: true }
+                            StyledSpinBox { id: silenceSpin; from: 100; to: 5000; stepSize: 50; Layout.fillWidth: true }
                         }
                         ColumnLayout {
                             Layout.fillWidth: true
                             spacing: 4
                             Text { text: "Barge-in Onset (ms)"; color: root.textPrimary; font.pixelSize: 12 }
-                            StyledSpinBox { id: bargeInSpin; from: 64; to: 1500; stepSize: 32; Layout.fillWidth: true }
+                            StyledSpinBox { id: bargeInSpin; from: 64; to: 2000; stepSize: 32; Layout.fillWidth: true }
                         }
                     }
                 }
@@ -905,7 +948,7 @@ Window {
                             font.pixelSize: 13
                             Layout.fillWidth: true
                         }
-                        StyledSpinBox { id: approvalTimeoutSpin; from: 5; to: 120; stepSize: 5 }
+                        StyledSpinBox { id: approvalTimeoutSpin; from: 2; to: 120; stepSize: 5 }
                     }
 
                     ColumnLayout {
@@ -939,7 +982,7 @@ Window {
                             Layout.fillWidth: true
                             spacing: 4
                             Text { text: "Max Context Chars"; color: root.textPrimary; font.pixelSize: 12 }
-                            StyledSpinBox { id: maxContextSpin; from: 1000; to: 64000; stepSize: 1000; Layout.fillWidth: true }
+                            StyledSpinBox { id: maxContextSpin; from: 500; to: 200000; stepSize: 1000; Layout.fillWidth: true }
                         }
 
                         ColumnLayout {

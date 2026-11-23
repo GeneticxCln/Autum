@@ -152,6 +152,9 @@ def validate_arguments(schema: Mapping[str, Any], arguments: Any) -> str | None:
         checker = _TYPE_CHECKERS.get(expected)
         if checker is not None and not checker(value):
             return f"argument '{key}' must be {expected}"
+        enum_vals = spec.get("enum")
+        if enum_vals is not None and value not in enum_vals:
+            return f"argument '{key}' must be one of {list(enum_vals)}"
         if expected == "string":
             min_len = spec.get("minLength")
             max_len = spec.get("maxLength")
@@ -300,8 +303,8 @@ class ApprovalGate:
                 return None
             if captured_at_ns is not None and captured_at_ns < pending.ready_at_ns:
                 return None
-        # §5.2: in hands-free mode, irreversible actions need push-to-talk or explicit command/text.
-        if pending.level is PermissionLevel.IRREVERSIBLE and hands_free_mode and source == "hands_free":
+        # §5.2: open-mic hands_free speech can NEVER approve irreversible actions (even if mode just changed).
+        if pending.level is PermissionLevel.IRREVERSIBLE and source == "hands_free":
             return None
 
         outcome = "granted" if is_affirmative(response) else "denied"
@@ -488,9 +491,29 @@ class ToolRegistry:
             if cap.cancellable:
                 result = await asyncio.wait_for(coro, cap.timeout_s)
             else:
-                result = await asyncio.shield(asyncio.wait_for(coro, cap.timeout_s))
+                inner = asyncio.create_task(asyncio.wait_for(coro, cap.timeout_s))
+                try:
+                    result = await asyncio.shield(inner)
+                except asyncio.CancelledError:
+                    def _on_detached_done(t: asyncio.Task[Any]) -> None:
+                        if t.cancelled():
+                            self.audit.record("tool_cancelled", tool=cap.name, tool_call_id=tc_id)
+                        elif (exc := t.exception()) is not None:
+                            self.audit.record(
+                                "tool_failed",
+                                tool=cap.name,
+                                tool_call_id=tc_id,
+                                error=f"{type(exc).__name__}: {exc}",
+                            )
+                        else:
+                            self.audit.record("tool_completed_after_cancel", tool=cap.name, tool_call_id=tc_id)
+
+                    inner.add_done_callback(_on_detached_done)
+                    self.audit.record("tool_detached_on_cancel", tool=cap.name, tool_call_id=tc_id)
+                    raise
         except asyncio.CancelledError:
-            self.audit.record("tool_cancelled", tool=cap.name, tool_call_id=tc_id)
+            if cap.cancellable:
+                self.audit.record("tool_cancelled", tool=cap.name, tool_call_id=tc_id)
             raise
         except asyncio.TimeoutError:
             err = f"timed out after {cap.timeout_s:.1f}s"

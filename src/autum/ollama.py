@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from contextlib import asynccontextmanager
 import json
 from typing import Any, AsyncIterator, Callable, Iterable, Sequence
 
@@ -77,20 +78,33 @@ class ModelSwapper:
         self.active: str | None = None
         self._lock = asyncio.Lock()
 
+    async def _activate_locked(self, model: str) -> None:
+        if self.active == model:
+            return
+        prev = self.active
+        if prev is not None and prev not in self.pinned:
+            self.active = None
+            await unload(self.client, model=prev, base_url=self.base_url)
+        self.active = model
+        if self.on_swap is not None and prev is not None:
+            self.on_swap(model, prev)
+
     async def ensure_active(self, model: str) -> None:
         """Ensure `model` is the active heavy model, unloading any prior heavy model first."""
         if model in self.pinned:
             return
         async with self._lock:
-            if self.active == model:
-                return
-            prev = self.active
-            if prev is not None and prev not in self.pinned:
-                self.active = None
-                await unload(self.client, model=prev, base_url=self.base_url)
-            self.active = model
-            if self.on_swap is not None and prev is not None:
-                self.on_swap(model, prev)
+            await self._activate_locked(model)
+
+    @asynccontextmanager
+    async def lease(self, model: str) -> AsyncIterator[None]:
+        """Hold the swapper lock across a heavy model call so another model cannot unload it mid-stream."""
+        if model in self.pinned:
+            yield
+            return
+        async with self._lock:
+            await self._activate_locked(model)
+            yield
 
 
 class OmniChat:
@@ -118,8 +132,6 @@ class OmniChat:
         operation_id: str,
         tools: Sequence[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str | ToolCall]:
-        if self.swapper is not None:
-            await self.swapper.ensure_active(self.model)
         body: dict[str, Any] = {
             "model": self.model,
             "messages": [to_openai(m) for m in messages],
@@ -132,55 +144,99 @@ class OmniChat:
         if tools:
             body["tools"] = list(tools)
         pending_calls: dict[int, dict[str, str]] = {}
+        next_auto_idx = 0
         in_think = False
         think_buf = ""
-        async with self.client.stream("POST", f"{self.base_url}/v1/chat/completions", json=body) as r:
-            if r.status_code != 200:
-                raise RuntimeError(f"Ollama chat failed ({r.status_code}): {(await r.aread())[:200]!r}")
-            async for line in r.aiter_lines():
-                if not line.startswith("data: ") or line == "data: [DONE]":
-                    continue
-                choice = json.loads(line[6:])["choices"][0]
-                delta = choice.get("delta", {})
-                if delta.get("content"):
-                    think_buf += str(delta["content"])
-                    while think_buf:
-                        if in_think:
-                            end_idx = think_buf.find("</think>")
-                            if end_idx < 0:
-                                think_buf = think_buf[-7:] if len(think_buf) > 7 else think_buf
-                                break
-                            think_buf = think_buf[end_idx + 8 :]
-                            in_think = False
+
+        async def _run_stream() -> AsyncIterator[str | ToolCall]:
+            nonlocal in_think, think_buf, next_auto_idx
+            async with self.client.stream("POST", f"{self.base_url}/v1/chat/completions", json=body) as r:
+                if r.status_code != 200:
+                    raise RuntimeError(f"Ollama chat failed ({r.status_code}): {(await r.aread())[:200]!r}")
+                async for line in r.aiter_lines():
+                    if not line.startswith("data: ") or line == "data: [DONE]":
+                        continue
+                    try:
+                        payload = json.loads(line[6:])
+                    except ValueError:
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    choices = payload.get("choices")
+                    if not isinstance(choices, list) or not choices:
+                        continue
+                    choice = choices[0]
+                    if not isinstance(choice, dict):
+                        continue
+                    delta = choice.get("delta")
+                    if not isinstance(delta, dict):
+                        continue
+                    if delta.get("content"):
+                        think_buf += str(delta["content"])
+                        while think_buf:
+                            if in_think:
+                                end_idx = think_buf.find("</think>")
+                                if end_idx < 0:
+                                    think_buf = think_buf[-7:] if len(think_buf) > 7 else think_buf
+                                    break
+                                think_buf = think_buf[end_idx + 8 :]
+                                in_think = False
+                            else:
+                                start_idx = think_buf.find("<think>")
+                                if start_idx < 0:
+                                    # Hold back a partial '<think' prefix at chunk boundary
+                                    partial = 0
+                                    for k in range(1, min(7, len(think_buf) + 1)):
+                                        if "<think>".startswith(think_buf[-k:]):
+                                            partial = k
+                                    emit = think_buf[:-partial] if partial else think_buf
+                                    think_buf = think_buf[-partial:] if partial else ""
+                                    if emit:
+                                        yield emit
+                                    break
+                                if start_idx > 0:
+                                    yield think_buf[:start_idx]
+                                think_buf = think_buf[start_idx + 7 :]
+                                in_think = True
+                    for tc in delta.get("tool_calls") or ():
+                        if not isinstance(tc, dict):
+                            continue
+                        raw_idx = tc.get("index")
+                        tc_id = str(tc["id"]) if tc.get("id") else ""
+                        if isinstance(raw_idx, int) and not isinstance(raw_idx, bool):
+                            idx = raw_idx
+                            if (
+                                tc_id
+                                and idx in pending_calls
+                                and pending_calls[idx]["id"]
+                                and pending_calls[idx]["id"] != tc_id
+                            ):
+                                idx = max(pending_calls) + 1
+                        elif tc_id:
+                            existing = next((k for k, v in pending_calls.items() if v["id"] == tc_id), None)
+                            idx = existing if existing is not None else (max(pending_calls) + 1 if pending_calls else 0)
                         else:
-                            start_idx = think_buf.find("<think>")
-                            if start_idx < 0:
-                                # Hold back a partial '<think' prefix at chunk boundary
-                                partial = 0
-                                for k in range(1, min(7, len(think_buf) + 1)):
-                                    if "<think>".startswith(think_buf[-k:]):
-                                        partial = k
-                                emit = think_buf[:-partial] if partial else think_buf
-                                think_buf = think_buf[-partial:] if partial else ""
-                                if emit:
-                                    yield emit
-                                break
-                            if start_idx > 0:
-                                yield think_buf[:start_idx]
-                            think_buf = think_buf[start_idx + 7 :]
-                            in_think = True
-                for tc in delta.get("tool_calls") or ():
-                    idx = int(tc.get("index", 0))
-                    slot = pending_calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                    if tc.get("id"):
-                        slot["id"] = str(tc["id"])
-                    fn = tc.get("function") or {}
-                    if fn.get("name"):
-                        slot["name"] += str(fn["name"])
-                    if fn.get("arguments"):
-                        slot["arguments"] += str(fn["arguments"])
-            if think_buf and not in_think:
-                yield think_buf
+                            idx = next_auto_idx
+                            next_auto_idx += 1
+                        slot = pending_calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                        if tc_id:
+                            slot["id"] = tc_id
+                        fn = tc.get("function")
+                        if isinstance(fn, dict):
+                            if fn.get("name"):
+                                slot["name"] += str(fn["name"])
+                            if fn.get("arguments"):
+                                slot["arguments"] += str(fn["arguments"])
+                if think_buf and not in_think:
+                    yield think_buf
+
+        if self.swapper is not None:
+            async with self.swapper.lease(self.model):
+                async for item in _run_stream():
+                    yield item
+        else:
+            async for item in _run_stream():
+                yield item
         for idx in sorted(pending_calls):
             slot = pending_calls[idx]
             if not slot["name"]:
@@ -198,12 +254,19 @@ class OmniSpeech:
     """Streams 24 kHz 16-bit mono PCM for one piece of text."""
 
     def __init__(
-        self, client: httpx.AsyncClient, model: str = MODEL, voice: str = VOICE, base_url: str = OLLAMA
+        self,
+        client: httpx.AsyncClient,
+        model: str = MODEL,
+        voice: str = VOICE,
+        base_url: str = OLLAMA,
+        *,
+        on_fallback: Callable[[str], None] | None = None,
     ) -> None:
         self.client = client
         self.model = model
         self.voice = voice
         self.base_url = base_url.rstrip("/")
+        self.on_fallback = on_fallback
 
     async def stream(self, text: str) -> AsyncIterator[bytes]:
         body = {"model": self.model, "input": text, "voice": self.voice, "response_format": "pcm"}
@@ -212,6 +275,8 @@ class OmniSpeech:
                 err_bytes = await r.aread()
                 if r.status_code == 400 and b"does not support speech" in err_bytes and self.model != MODEL:
                     self.model = MODEL
+                    if self.on_fallback is not None:
+                        self.on_fallback(MODEL)
                 else:
                     raise RuntimeError(f"Ollama speech failed ({r.status_code}): {err_bytes[:200]!r}")
             else:
@@ -241,14 +306,25 @@ class OmniTranscriber:
             data={"model": self.model, "language": "en"},
             files={"file": ("speech.wav", wav, "audio/wav")},
         )
+        if r.status_code == 400 and "does not support" in r.text.lower() and self.model != MODEL:
+            self.model = MODEL
+            r = await self.client.post(
+                f"{self.base_url}/v1/audio/transcriptions",
+                data={"model": self.model, "language": "en"},
+                files={"file": ("speech.wav", wav, "audio/wav")},
+            )
         if r.status_code != 200:
             raise RuntimeError(f"Ollama transcription failed ({r.status_code}): {r.text[:200]}")
-        return r.json()["text"].strip()
+        return str((r.json() or {}).get("text") or "").strip()
 
 
 async def preload(client: httpx.AsyncClient, model: str = MODEL, base_url: str = OLLAMA) -> None:
     """Load the model now (default context, like the endpoints above) so the first turn is fast."""
-    await client.post(f"{base_url.rstrip('/')}/api/generate", json={"model": model, "keep_alive": "30m"}, timeout=90)
+    r = await client.post(
+        f"{base_url.rstrip('/')}/api/generate", json={"model": model, "keep_alive": "30m"}, timeout=90
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Ollama preload failed for {model} ({r.status_code}): {r.text[:200]}")
 
 
 async def unload(client: httpx.AsyncClient, model: str, base_url: str = OLLAMA) -> None:
@@ -265,7 +341,7 @@ async def resolve_speech_model(client: httpx.AsyncClient, model: str, base_url: 
     try:
         r = await client.post(f"{base}/api/show", json={"name": model}, timeout=3)
         if r.status_code == 200:
-            caps = r.json().get("capabilities")
+            caps = (r.json() or {}).get("capabilities")
             if isinstance(caps, list) and caps and "speech" not in caps:
                 await unload(client, model=model, base_url=base)
                 return MODEL
@@ -280,7 +356,15 @@ async def check_ready(client: httpx.AsyncClient, model: str = MODEL, base_url: s
         r = await client.get(f"{base_url.rstrip('/')}/api/tags", timeout=3)
     except httpx.HTTPError:
         return "Ollama is not running. Start it (systemctl start ollama, or `ollama serve`) and try again."
-    names = {m["name"] for m in r.json().get("models", [])}
-    if model not in names:
+    if r.status_code != 200:
+        return f"Ollama returned HTTP {r.status_code} at {base_url}; check that Ollama is healthy."
+    try:
+        payload = r.json()
+    except ValueError:
+        return f"Ollama at {base_url} returned non-JSON data; check ollama_url in config.toml."
+    models = payload.get("models") if isinstance(payload, dict) else None
+    names = {str(m["name"]) for m in (models or ()) if isinstance(m, dict) and m.get("name")}
+    candidates = {model} if ":" in model else {model, f"{model}:latest"}
+    if not (candidates & names):
         return f"Ollama does not have {model}. Pull it with `ollama pull {model}` (with your approval) or update config.toml."
     return None

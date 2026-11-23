@@ -10,16 +10,55 @@ import logging
 import re
 import sys
 
+_SECRET_KEY = (
+    r"[A-Za-z0-9_-]*(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|"
+    r"refresh[_-]?token|auth[_-]?token|private[_-]?key)"
+)
+
+_LOG_LEVELS: dict[str, int] = {
+    "CRITICAL": logging.CRITICAL,
+    "ERROR": logging.ERROR,
+    "WARNING": logging.WARNING,
+    "WARN": logging.WARNING,
+    "INFO": logging.INFO,
+    "DEBUG": logging.DEBUG,
+    "NOTSET": logging.NOTSET,
+}
+
 _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # Private key blocks
     (
         re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----"),
         "[REDACTED_PRIVATE_KEY]",
     ),
-    # Authorization / Bearer tokens
+    # Authorization / Bearer tokens (JSON-escaped quoted, quoted, and unquoted)
     (
-        re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)[^\s,;\"']+"),
+        re.compile(r'(?i)(authorization\s*[:=]\s*(?:bearer|basic|token)\s+\\")[^"\\]+(\\")'),
+        r"\1[REDACTED]\2",
+    ),
+    (
+        re.compile(r'(?i)(authorization\s*[:=]\s*(?:bearer|basic|token)\s+")[^"]+(")'),
+        r"\1[REDACTED]\2",
+    ),
+    (
+        re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer|basic|token)\s+')[^']+(')"),
+        r"\1[REDACTED]\2",
+    ),
+    (
+        re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)[^\s,;\"'\\}{]+"),
         r"\1[REDACTED]",
+    ),
+    (
+        re.compile(r'(?i)\b(bearer\s+\\")[^"\\]+(\\")'),
+        r"\1[REDACTED]\2",
+    ),
+    (
+        re.compile(r'(?i)\b(bearer\s+")[^"]+(")'),
+        r"\1[REDACTED]\2",
+    ),
+    (
+        re.compile(r"(?i)\b(bearer\s+')[A-Za-z0-9._\-~+/= ]+(')"),
+        r"\1[REDACTED]\2",
     ),
     (
         re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._\-~+/]+=*"),
@@ -30,9 +69,29 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(r"\b(?:sk-[A-Za-z0-9_\-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{20,}|xox[baprs]-[A-Za-z0-9\-]{10,})\b"),
         "[REDACTED_KEY]",
     ),
-    # Key-value secret assignments: password=..., db_password=..., token: "...", service_api_key=...
+    # JSON key-value secrets: {"password": "supersecret", "api_key": "abc"}
     (
-        re.compile(r"(?i)(\b[A-Za-z0-9_-]*(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|private[_-]?key)\b\s*[:=]\s*['\"]?)([^'\"\s,;}{]+)"),
+        re.compile(rf'(?i)("{_SECRET_KEY}"\s*:\s*")([^"\\]*(?:\\.[^"\\]*)*)(")'),
+        r"\1[REDACTED]\3",
+    ),
+    # JSON-escaped quoted assignments inside JSON strings: password=\"supersecret\"
+    (
+        re.compile(rf'(?i)(\b{_SECRET_KEY}\b\s*[:=]\s*\\")([^"\\]+)(\\")'),
+        r"\1[REDACTED]\3",
+    ),
+    # Double-quoted assignments: password="my secret phrase"
+    (
+        re.compile(rf'(?i)(\b{_SECRET_KEY}\b\s*[:=]\s*")([^"]+)(")'),
+        r"\1[REDACTED]\3",
+    ),
+    # Single-quoted assignments: password='my secret phrase'
+    (
+        re.compile(rf"(?i)(\b{_SECRET_KEY}\b\s*[:=]\s*')([^']+)(')"),
+        r"\1[REDACTED]\3",
+    ),
+    # Unquoted key-value assignments: password=secret123
+    (
+        re.compile(rf"(?i)(\b{_SECRET_KEY}\b\s*[:=]\s*)([^'\"\\\s,;}}{{]+)"),
         r"\1[REDACTED]",
     ),
     # Long base64 blobs (e.g. raw input_audio WAV payloads)
@@ -76,7 +135,8 @@ class SensitiveDataFilter(logging.Filter):
 def configure_logging(level: str = "INFO") -> logging.Logger:
     """Attach a filtered stderr handler to the `autum` logger hierarchy."""
     logger = logging.getLogger("autum")
-    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    resolved = _LOG_LEVELS.get(level.upper(), logging.INFO) if isinstance(level, str) else logging.INFO
+    logger.setLevel(resolved)
     logger.propagate = False
     if not logger.handlers:
         handler = logging.StreamHandler(sys.stderr)

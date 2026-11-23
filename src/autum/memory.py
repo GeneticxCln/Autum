@@ -29,7 +29,7 @@ log = logging.getLogger("autum.memory")
 
 MAX_MEMORIES = 500
 _SECRET_KEY_WORDS = ("password", "passwd", "secret", "token", "api_key", "apikey", "private_key", "credential")
-_WORD_RE = re.compile(r"[a-z0-9]+")
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
 
 
 @dataclass(frozen=True)
@@ -148,7 +148,11 @@ class MemoryStore:
                 updated_ms=now,
             )
             self._entries[existing.id] = updated
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                self._entries[existing.id] = existing
+                raise
             return updated
 
         if len(self._entries) >= MAX_MEMORIES:
@@ -163,7 +167,11 @@ class MemoryStore:
             updated_ms=now,
         )
         self._entries[entry.id] = entry
-        self._save()
+        try:
+            self._save()
+        except Exception:
+            self._entries.pop(entry.id, None)
+            raise
         return entry
 
     def find_by_key(self, key: str) -> MemoryEntry | None:
@@ -184,12 +192,26 @@ class MemoryStore:
             items = [e for e in items if e.category == cat]
         return sorted(items, key=lambda e: (e.category, e.key.lower()))
 
-    def search(self, query: str, *, limit: int = 10) -> list[MemoryEntry]:
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        category: str | None = None,
+        provenance: str | None = None,
+    ) -> list[MemoryEntry]:
+        cat = category.strip().lower() if category else None
+        pool = [
+            e
+            for e in self._entries.values()
+            if (cat is None or e.category == cat) and (provenance is None or e.provenance == provenance)
+        ]
         terms = set(_WORD_RE.findall(query.lower()))
         if not terms:
-            return self.list_all()[:limit]
+            pool.sort(key=lambda e: (e.category, e.key.lower()))
+            return pool[:limit]
         scored: list[tuple[int, MemoryEntry]] = []
-        for entry in self._entries.values():
+        for entry in pool:
             hay = set(_WORD_RE.findall(f"{entry.key} {entry.value} {entry.category}".lower()))
             overlap = len(terms & hay)
             if overlap > 0:
@@ -202,7 +224,7 @@ class MemoryStore:
 
         Never injects observed-provenance entries into the system context.
         """
-        candidates = [e for e in self.search(query, limit=max_entries * 2) if e.provenance == Provenance.USER.value]
+        candidates = self.search(query, limit=max_entries * 2, provenance=Provenance.USER.value)
         if not candidates:
             # Include general preferences when no specific keyword matches
             candidates = [
@@ -211,9 +233,11 @@ class MemoryStore:
         chosen: list[MemoryEntry] = []
         used = 0
         for entry in candidates:
-            line_len = len(entry.key) + len(entry.value) + 4
-            if len(chosen) >= max_entries or used + line_len > max_chars:
+            if len(chosen) >= max_entries:
                 break
+            line_len = len(entry.key) + len(entry.value) + 4
+            if used + line_len > max_chars:
+                continue
             chosen.append(entry)
             used += line_len
         return chosen
@@ -223,7 +247,11 @@ class MemoryStore:
         if entry is None:
             raise LookupError(f"no memory matching {identifier!r}")
         self._entries.pop(entry.id, None)
-        self._save()
+        try:
+            self._save()
+        except Exception:
+            self._entries[entry.id] = entry
+            raise
         return entry
 
 
@@ -286,8 +314,9 @@ def register_memory_capabilities(
 
     # 2. Recall memories (READ_ONLY, observed_output=True because stored entries may include observed data)
     async def _recall(args: dict[str, Any]) -> dict[str, Any]:
-        query = str(args.get("query") or "")
-        entries = store.search(query) if query else store.list_all(args.get("category"))
+        query = str(args.get("query") or "").strip()
+        category = args.get("category")
+        entries = store.search(query, category=category) if query else store.list_all(category)
         return {"memories": [e.to_dict() for e in entries]}
 
     async def _verify_recall(_args: dict[str, Any], result: dict[str, Any]) -> bool:

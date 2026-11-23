@@ -160,21 +160,28 @@ class VoiceInput:
         if self.muted or self.capturing:
             return None
         turn = self._turn = new_id()
-        self._pcm = bytearray()
-        self._first_audio = asyncio.Event()
+        pcm_buf = bytearray()
+        first_audio = asyncio.Event()
+        self._pcm = pcm_buf
+        self._first_audio = first_audio
         target_args = ("--target", self.target) if self.target else ()
-        proc = await self.spawn(
-            "pw-record", *target_args, "--raw", "--rate", str(MIC_RATE), "--channels", "1", "--format", "s16",
-            "--latency", "20ms", "-", stdout=PIPE,
-        )
+        try:
+            proc = await self.spawn(
+                "pw-record", *target_args, "--raw", "--rate", str(MIC_RATE), "--channels", "1", "--format", "s16",
+                "--latency", "20ms", "-", stdout=PIPE,
+            )
+        except BaseException:
+            if self._turn == turn:
+                self._turn = None
+            raise
         # Guard against quick tap / mute while pw-record was still spawning
         if self._turn != turn or self.muted:
             _kill(proc)
             await proc.wait()
             return None
         self._proc = proc
-        self._reader = asyncio.create_task(self._read(self._proc))
-        self._watchdog = asyncio.create_task(self._watch(turn))
+        self._reader = asyncio.create_task(self._read(self._proc, pcm_buf, first_audio))
+        self._watchdog = asyncio.create_task(self._watch(turn, first_audio))
         self.bus.emit("audio.capture_started")
         self.bus.emit("audio.speech_started", {"mode": "push_to_talk"}, provenance=Provenance.USER, turn_id=turn)
         return turn
@@ -192,7 +199,8 @@ class VoiceInput:
             self._nothing_heard(turn)
             return
         wav = wav_bytes(highpass_pcm(pcm, MIC_RATE), MIC_RATE)
-        if not waiting_approval and getattr(self.runtime, "direct_audio", True):
+        is_wake_mode = str(getattr(self.runtime, "mode", "")) == "wake_word"
+        if not waiting_approval and not is_wake_mode and getattr(self.runtime, "direct_audio", True):
             while len(self._awaiting_transcript) >= 8:
                 self._awaiting_transcript.pop(next(iter(self._awaiting_transcript)))
             self._awaiting_transcript[turn] = wav
@@ -212,20 +220,25 @@ class VoiceInput:
         # An empty final transcript returns the runtime to rest.
         self.bus.emit("audio.transcribed", {"text": "", "final": True}, provenance=Provenance.USER, turn_id=turn)
 
-    async def _read(self, proc: asyncio.subprocess.Process) -> None:
+    async def _read(
+        self,
+        proc: asyncio.subprocess.Process,
+        pcm_buf: bytearray,
+        first_audio: asyncio.Event,
+    ) -> None:
         while chunk := await proc.stdout.read(3200):
-            self._pcm += chunk
-            self._first_audio.set()
+            pcm_buf += chunk
+            first_audio.set()
 
-    async def _watch(self, turn: str) -> None:
+    async def _watch(self, turn: str, first_audio: asyncio.Event) -> None:
         try:
-            await asyncio.wait_for(self._first_audio.wait(), self.stall_s)
+            await asyncio.wait_for(first_audio.wait(), self.stall_s)
         except asyncio.TimeoutError:
             if self._turn == turn:
                 await self.abort(MIC_HELP)
 
     async def _stop_capture(self) -> bytes:
-        proc, reader, watchdog = self._proc, self._reader, self._watchdog
+        proc, reader, watchdog, pcm_buf = self._proc, self._reader, self._watchdog, self._pcm
         was_started = proc is not None
         self._turn = self._proc = self._reader = self._watchdog = None
         if watchdog is not None and watchdog is not asyncio.current_task():
@@ -240,7 +253,7 @@ class VoiceInput:
             await proc.wait()
         if was_started:
             self.bus.emit("audio.capture_stopped")
-        return bytes(self._pcm)
+        return bytes(pcm_buf)
 
     def _on_event(self, event) -> None:
         if event.type == "audio.mute_changed":
@@ -317,6 +330,8 @@ class SpeechPlayer:
         if operation_id != self._op:
             return
         await self._queue.join()
+        if operation_id != self._op:
+            return
         if self._error is not None:
             error, self._error = self._error, None
             raise error
@@ -330,16 +345,20 @@ class SpeechPlayer:
                 _kill(proc)
                 await proc.wait()
                 raise RuntimeError("the speakers did not finish playing; check the audio output") from None
+        if operation_id != self._op:
+            return
         started = self._t0 is not None
+        turn = self._turn
         self._reset()
         if started:
-            self.bus.emit("speech.playback_finished", {"reason": "completed"}, turn_id=self._turn, operation_id=operation_id)
+            self.bus.emit("speech.playback_finished", {"reason": "completed"}, turn_id=turn, operation_id=operation_id)
 
     def stop(self) -> str:
         if self._op is None:
             return ""
-        heard = " ".join(text for start, text in self._timeline if start <= self._elapsed())
-        op, turn, started = self._op, self._turn, self._t0 is not None
+        started = self._t0 is not None
+        heard = " ".join(text for start, text in self._timeline if start <= self._elapsed()) if started else ""
+        op, turn = self._op, self._turn
         self._reset()
         if started:
             self.bus.emit("speech.playback_finished", {"reason": "cancelled"}, turn_id=turn, operation_id=op)
@@ -363,7 +382,9 @@ class SpeechPlayer:
         self._written = 0
         self._t0 = None
         self._next_level_s = 0.0
+        self._error = None
         self._op = None
+        self._turn = None
 
     def _written_s(self) -> float:
         return self._written / (SPEECH_RATE * 2)
@@ -515,11 +536,13 @@ class HandsFreeInput:
         self._bleed_rms = 0.018
         self._candidate_barge_in = False
         self._candidate_check_echo = False
+        self._candidate_started_ns = 0
         self._loud_run = 0
         self._errored = False
         self._turn: str | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._runner: asyncio.Task | None = None
+        self._runner_gen = 0
         self._awaiting_transcript: dict[str, bytes] = {}
         self._tasks: set[asyncio.Task] = set()
         bus.subscribe(
@@ -558,9 +581,13 @@ class HandsFreeInput:
 
     def _start_runner(self) -> None:
         if self._runner is None or self._runner.done():
-            self._runner = asyncio.create_task(self._run())
+            self._runner_gen += 1
+            gen = self._runner_gen
+            self._runner = asyncio.create_task(self._run(gen))
 
     async def _stop_runner(self) -> None:
+        self._runner_gen += 1
+        gen = self._runner_gen
         runner, self._runner = self._runner, None
         if runner is not None and not runner.done():
             runner.cancel()
@@ -568,24 +595,28 @@ class HandsFreeInput:
                 await runner
             except asyncio.CancelledError:
                 pass
-        await self._close_capture()
-        self._drop_turn()
-        self.detector.reset()
+        if self._runner_gen == gen:
+            await self._close_capture()
+            self._drop_turn()
+            self.detector.reset()
+            if self._active and not self.muted:
+                self._start_runner()
 
-    async def _run(self) -> None:
+    async def _run(self, gen: int) -> None:
         try:
-            while self._active and not self.muted:
-                ok = await self._capture_session()
-                if not self._active or self.muted:
+            while self._active and not self.muted and self._runner_gen == gen:
+                ok = await self._capture_session(gen)
+                if not self._active or self.muted or self._runner_gen != gen:
                     break
                 if not ok:
                     await asyncio.sleep(self.reconnect_s)
         except asyncio.CancelledError:
             raise
         finally:
-            await self._close_capture()
+            if self._runner_gen == gen:
+                await self._close_capture()
 
-    async def _capture_session(self) -> bool:
+    async def _capture_session(self, gen: int) -> bool:
         target_args = ("--target", self.target) if self.target else ()
         try:
             proc = await self.spawn(
@@ -595,19 +626,26 @@ class HandsFreeInput:
         except Exception as exc:
             self._report_error(str(exc))
             return False
+        if not self._active or self.muted or self._runner_gen != gen:
+            _kill(proc)
+            try:
+                await asyncio.wait_for(proc.wait(), DEVICE_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                pass
+            return True
         self._proc = proc
         self.detector.reset()
         self.bus.emit("audio.capture_started")
         got_audio = False
         try:
-            while self._active and not self.muted:
+            while self._active and not self.muted and self._runner_gen == gen:
                 try:
                     frame = await asyncio.wait_for(proc.stdout.readexactly(VAD_FRAME_BYTES), self.stall_s)
                 except asyncio.TimeoutError:
                     self._report_error(MIC_HELP)
                     return False
                 except asyncio.IncompleteReadError:
-                    if self._active and not self.muted:
+                    if self._active and not self.muted and self._runner_gen == gen:
                         self._report_error("microphone stream ended unexpectedly; retrying")
                     return False
                 if not got_audio:
@@ -618,8 +656,17 @@ class HandsFreeInput:
                 self._handle_frame(frame)
             return True
         finally:
-            await self._close_capture()
-            self._drop_turn()
+            if self._proc is proc:
+                await self._close_capture()
+            else:
+                _kill(proc)
+                try:
+                    await asyncio.wait_for(proc.wait(), DEVICE_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    pass
+                self.bus.emit("audio.capture_stopped")
+            if self._runner_gen == gen:
+                self._drop_turn()
 
     def _handle_frame(self, frame: bytes) -> None:
         now = time.monotonic()
@@ -694,18 +741,27 @@ class HandsFreeInput:
         if event.kind == "speech_started":
             self._turn = new_id()
             self._loud_run = 0
-            accept_direct = not in_barge_window and (
+            # In WAITING_FOR_APPROVAL, playback has already finished and ready_at_ns guards
+            # anti-spoofing, so accept approval replies directly even during the 0.45s cooldown.
+            accept_direct = (
                 self._runtime_state == "waiting_for_approval"
-                or (is_wake_mode and in_wake_window and self._runtime_state in ("idle", "listening"))
+                or (
+                    not in_barge_window
+                    and is_wake_mode
+                    and in_wake_window
+                    and self._runtime_state in ("idle", "listening", "processing")
+                )
             )
             if silent_verify and not accept_direct:
                 # Buffer quietly first and verify via wake-word / non-echo transcript
                 # without flickering the bubble or cancelling an in-progress reply.
                 self._candidate_barge_in = True
                 self._candidate_check_echo = in_barge_window
+                self._candidate_started_ns = time.monotonic_ns()
                 return
             self._candidate_barge_in = False
             self._candidate_check_echo = False
+            self._candidate_started_ns = 0
             self.bus.emit(
                 "audio.speech_started",
                 {"mode": "hands_free"},
@@ -716,8 +772,10 @@ class HandsFreeInput:
             turn, self._turn = self._turn, None
             was_candidate = self._candidate_barge_in
             was_check_echo = self._candidate_check_echo
+            was_started_ns = self._candidate_started_ns
             self._candidate_barge_in = False
             self._candidate_check_echo = False
+            self._candidate_started_ns = 0
             self._loud_run = 0
             waiting_approval = str(getattr(self.runtime, "state", "")) == "waiting_for_approval"
             min_s = MIN_APPROVAL_UTTERANCE_S if waiting_approval else MIN_UTTERANCE_S
@@ -733,7 +791,11 @@ class HandsFreeInput:
                 return
             wav = wav_bytes(highpass_pcm(event.pcm, MIC_RATE), MIC_RATE)
             if was_candidate:
-                self._track(self._verify_barge_in(turn, wav, check_echo=was_check_echo))
+                self._track(
+                    self._verify_barge_in(
+                        turn, wav, check_echo=was_check_echo, captured_at_ns=was_started_ns
+                    )
+                )
                 return
             ended = self.bus.emit(
                 "audio.speech_ended",
@@ -741,7 +803,7 @@ class HandsFreeInput:
                 provenance=Provenance.USER,
                 turn_id=turn,
             )
-            if not waiting_approval and getattr(self.runtime, "direct_audio", True):
+            if not waiting_approval and not is_wake_mode and getattr(self.runtime, "direct_audio", True):
                 while len(self._awaiting_transcript) >= 8:
                     self._awaiting_transcript.pop(next(iter(self._awaiting_transcript)))
                 self._awaiting_transcript[turn] = wav
@@ -805,7 +867,14 @@ class HandsFreeInput:
         elif event.turn_id in self._awaiting_transcript:
             self._track(self._transcribe(event.turn_id))
 
-    async def _verify_barge_in(self, turn: str, wav: bytes, *, check_echo: bool = True) -> None:
+    async def _verify_barge_in(
+        self,
+        turn: str,
+        wav: bytes,
+        *,
+        check_echo: bool = True,
+        captured_at_ns: int | None = None,
+    ) -> None:
         """Transcribe a candidate utterance captured while Autum was speaking or in wake_word mode.
 
         If it is her own speaker echo (or background speech without 'Autum' in wake_word mode),
@@ -821,9 +890,12 @@ class HandsFreeInput:
         barge_fn = getattr(self.runtime, "barge_in_with_text", None)
         if callable(barge_fn):
             try:
-                barge_fn(text, turn_id=turn, check_echo=check_echo)
+                barge_fn(text, turn_id=turn, check_echo=check_echo, captured_at_ns=captured_at_ns)
             except TypeError:
-                barge_fn(text, turn_id=turn)
+                try:
+                    barge_fn(text, turn_id=turn, check_echo=check_echo)
+                except TypeError:
+                    barge_fn(text, turn_id=turn)
 
     async def _transcribe(self, turn: str) -> None:
         wav = self._awaiting_transcript.pop(turn, None)

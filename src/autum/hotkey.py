@@ -82,9 +82,16 @@ class PushToTalkKey:
         ctx = self._glib_context
         if loop is not None and ctx is not None:
             try:
-                ctx.invoke(loop.quit)
+                from gi.repository import GLib
+
+                src = GLib.idle_source_new()
+                src.set_callback(lambda *_: (loop.quit(), False)[1])
+                src.attach(ctx)
             except Exception:
-                pass
+                try:
+                    loop.quit()
+                except Exception:
+                    pass
 
     def _status(self, message: str) -> None:
         self._dispatch(self.on_status, message)
@@ -98,6 +105,9 @@ class PushToTalkKey:
         context = GLib.MainContext.new()
         context.push_thread_default()
         self._glib_context = context
+        bus = None
+        subs: list[int] = []
+        session: str | None = None
         try:
             bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
             self._register(bus, Gio, GLib)
@@ -105,10 +115,11 @@ class PushToTalkKey:
             if self._stopped.is_set():
                 return
             for name in ("Activated", "Deactivated"):
-                bus.signal_subscribe(
+                sub = bus.signal_subscribe(
                     PORTAL, SHORTCUTS, name, PORTAL_PATH, None, Gio.DBusSignalFlags.NONE,
                     lambda _c, _s, _p, _i, signal, params: self.router.signal(signal, *params.unpack()[:2]),
                 )
+                subs.append(sub)
             self.router.session = session
             key = self._bind(bus, context, session, Gio, GLib)
             if self._stopped.is_set():
@@ -122,6 +133,21 @@ class PushToTalkKey:
             if not self._stopped.is_set():
                 self._status(f"Hold-to-talk key unavailable ({exc}); hold the bubble to talk.")
         finally:
+            self.router.session = None
+            if bus is not None:
+                for sub in subs:
+                    try:
+                        bus.signal_unsubscribe(sub)
+                    except Exception:
+                        pass
+                if session is not None:
+                    try:
+                        bus.call_sync(
+                            PORTAL, session, "org.freedesktop.portal.Session", "Close",
+                            None, None, Gio.DBusCallFlags.NONE, 2000, None,
+                        )
+                    except Exception:
+                        pass
             self._glib_loop = None
             self._glib_context = None
             context.pop_thread_default()
@@ -186,6 +212,14 @@ class PushToTalkKey:
                     time.sleep(0.02)
         finally:
             bus.signal_unsubscribe(sub)
+            if "code" not in reply:
+                try:
+                    bus.call_sync(
+                        PORTAL, path, "org.freedesktop.portal.Request", "Close",
+                        None, None, Gio.DBusCallFlags.NONE, 2000, None,
+                    )
+                except Exception:
+                    pass
         if reply["code"] != 0:
             raise RuntimeError(f"{method} was {'cancelled' if reply['code'] == 1 else 'refused'}")
         return reply["results"]

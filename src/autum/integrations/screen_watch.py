@@ -184,7 +184,8 @@ def _open_screencast_session(
             None,
         )
         fd_idx = int(reply.unpack()[0])
-        pw_fd = os.dup(out_fds.get(fd_idx))
+        # Gio.UnixFDList.get() calls g_unix_fd_list_get() which already returns an owned dup'd FD.
+        pw_fd = int(out_fds.get(fd_idx))
         if cancel_event is not None and cancel_event.is_set():
             os.close(pw_fd)
             raise RuntimeError("screen sharing was cancelled")
@@ -232,6 +233,9 @@ class ScreenWatcher:
         self._pw_fd: int | None = None
         self._pipeline = None
         self._active = False
+        self._starting = False
+        self._start_cancel: threading.Event | None = None
+        self._notified_started = False
 
     def set_on_started(self, callback: Callable[[], None] | None) -> None:
         self._on_started = callback
@@ -249,9 +253,14 @@ class ScreenWatcher:
             return None if self._frame is None else max(0.0, time.monotonic() - self._frame_ts)
 
     async def start(self, source_type: str = "both") -> dict[str, Any]:
-        if self._active:
-            return {"active": True, "already_watching": True}
-        cancel_event = threading.Event()
+        with self._lifecycle_lock:
+            if self._active:
+                return {"active": True, "already_watching": True}
+            if self._starting:
+                raise RuntimeError("screen sharing startup is already in progress")
+            cancel_event = threading.Event()
+            self._starting = True
+            self._start_cancel = cancel_event
         try:
             return await asyncio.to_thread(self._start_sync, source_type, cancel_event)
         except asyncio.CancelledError:
@@ -265,53 +274,79 @@ class ScreenWatcher:
         from gi.repository import Gst
 
         Gst.init(None)
-        session_handle, pw_fd, node_id = _open_screencast_session(source_type, cancel_event=cancel_event)
-        if cancel_event is not None and cancel_event.is_set():
-            try:
-                os.close(pw_fd)
-            except OSError:
-                pass
-            _close_portal_session(session_handle)
-            raise RuntimeError("screen sharing was cancelled")
-        self._session_handle = session_handle
-        self._pw_fd = pw_fd
-        self._frame_ready.clear()
+        session_handle: str | None = None
+        pw_fd: int | None = None
+        pipeline = None
+        try:
+            session_handle, pw_fd, node_id = _open_screencast_session(source_type, cancel_event=cancel_event)
+            with self._lifecycle_lock:
+                if cancel_event is not None and cancel_event.is_set():
+                    try:
+                        os.close(pw_fd)
+                    except OSError:
+                        pass
+                    _close_portal_session(session_handle)
+                    raise RuntimeError("screen sharing was cancelled")
+                self._session_handle = session_handle
+                self._pw_fd = pw_fd
+                self._notified_started = False
+                self._frame_ready.clear()
 
-        desc = (
-            f"pipewiresrc fd={pw_fd} path={node_id} do-timestamp=true ! "
-            f"videorate ! video/x-raw,framerate={self.fps}/1 ! "
-            f"videoconvert ! videoscale ! "
-            f"video/x-raw,width=[1,{self.max_width}],height=[1,{self.max_height}] ! "
-            f"jpegenc quality=82 ! "
-            f"appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false"
-        )
-        pipeline = Gst.parse_launch(desc)
-        sink = pipeline.get_by_name("sink")
-        sink.connect("new-sample", self._on_sample)
-        ret = pipeline.set_state(Gst.State.PLAYING)
-        if ret == Gst.StateChangeReturn.FAILURE:
-            pipeline.set_state(Gst.State.NULL)
-            self._cleanup_sync()
-            raise RuntimeError("failed to start PipeWire GStreamer capture pipeline")
+                desc = (
+                    f"pipewiresrc fd={pw_fd} path={node_id} do-timestamp=true ! "
+                    f"videorate ! video/x-raw,framerate={self.fps}/1 ! "
+                    f"videoconvert ! videoscale ! "
+                    f"video/x-raw,width=[1,{self.max_width}],height=[1,{self.max_height}] ! "
+                    f"jpegenc quality=82 ! "
+                    f"appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false"
+                )
+                pipeline = Gst.parse_launch(desc)
+                sink = pipeline.get_by_name("sink") if pipeline is not None else None
+                if pipeline is None or sink is None:
+                    raise RuntimeError("failed to construct PipeWire GStreamer capture pipeline")
+                sink.connect("new-sample", self._on_sample)
+                ret = pipeline.set_state(Gst.State.PLAYING)
+                if ret == Gst.StateChangeReturn.FAILURE:
+                    pipeline.set_state(Gst.State.NULL)
+                    raise RuntimeError("failed to start PipeWire GStreamer capture pipeline")
 
-        self._pipeline = pipeline
-        self._active = True
-        threading.Thread(target=self._watch_bus, args=(pipeline,), name="autum-screenwatch-bus", daemon=True).start()
-        got_first = self._frame_ready.wait(timeout=5.0)
-        if not got_first or (cancel_event is not None and cancel_event.is_set()):
-            self._cleanup_sync()
-            if cancel_event is not None and cancel_event.is_set():
-                raise RuntimeError("screen sharing was cancelled")
-            raise RuntimeError("screen sharing started, but no video frames arrived within 5 seconds")
-        cb = self._on_started
-        if cb is not None:
-            try:
-                cb()
-            except Exception:
-                pass
-        with self._lock:
-            size = len(self._frame or b"")
-        return {"active": True, "node_id": node_id, "frame_bytes": size}
+                self._pipeline = pipeline
+                self._active = True
+
+            threading.Thread(target=self._watch_bus, args=(pipeline,), name="autum-screenwatch-bus", daemon=True).start()
+            got_first = self._frame_ready.wait(timeout=5.0)
+            with self._lifecycle_lock:
+                cancelled = cancel_event is not None and cancel_event.is_set()
+                still_alive = self._active and self._pipeline is pipeline
+                if not got_first or cancelled or not still_alive:
+                    self._cleanup_locked()
+                    if cancelled:
+                        raise RuntimeError("screen sharing was cancelled")
+                    raise RuntimeError("screen sharing started, but no video frames arrived within 5 seconds")
+                self._notified_started = True
+                cb = self._on_started
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    pass
+            with self._lock:
+                size = len(self._frame or b"")
+            return {"active": True, "node_id": node_id, "frame_bytes": size}
+        except Exception:
+            with self._lifecycle_lock:
+                if pipeline is not None and self._pipeline is None:
+                    try:
+                        pipeline.set_state(Gst.State.NULL)
+                    except Exception:
+                        pass
+                self._cleanup_locked()
+            raise
+        finally:
+            with self._lifecycle_lock:
+                if self._start_cancel is cancel_event:
+                    self._starting = False
+                    self._start_cancel = None
 
     def _watch_bus(self, pipeline) -> None:
         """Detect OS-side revocation (e.g. KDE tray 'Stop sharing') or stream errors."""
@@ -324,8 +359,14 @@ class ScreenWatcher:
         while self._active and self._pipeline is pipeline:
             msg = bus.timed_pop_filtered(500 * Gst.MSECOND, mask)
             if msg is not None:
-                self._cleanup_sync()
-                cb = self._on_ended
+                with self._lifecycle_lock:
+                    if self._pipeline is not pipeline:
+                        return
+                    was_notified = self._notified_started
+                    self._cleanup_locked()
+                    # Wake any _start_sync waiting for the first frame so it fails immediately
+                    self._frame_ready.set()
+                    cb = self._on_ended if was_notified else None
                 if cb is not None:
                     try:
                         cb()
@@ -362,27 +403,33 @@ class ScreenWatcher:
         await asyncio.to_thread(self._cleanup_sync)
         return {"active": False}
 
+    def _cleanup_locked(self) -> None:
+        self._active = False
+        self._notified_started = False
+        if self._start_cancel is not None:
+            self._start_cancel.set()
+        pipeline, self._pipeline = self._pipeline, None
+        if pipeline is not None:
+            try:
+                from gi.repository import Gst
+
+                pipeline.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+        pw_fd, self._pw_fd = self._pw_fd, None
+        if pw_fd is not None:
+            try:
+                os.close(pw_fd)
+            except OSError:
+                pass
+        session, self._session_handle = self._session_handle, None
+        if session is not None:
+            _close_portal_session(session)
+        with self._lock:
+            self._frame = None
+            self._frame_ts = 0.0
+        self._frame_ready.clear()
+
     def _cleanup_sync(self) -> None:
         with self._lifecycle_lock:
-            self._active = False
-            pipeline, self._pipeline = self._pipeline, None
-            if pipeline is not None:
-                try:
-                    from gi.repository import Gst
-
-                    pipeline.set_state(Gst.State.NULL)
-                except Exception:
-                    pass
-            pw_fd, self._pw_fd = self._pw_fd, None
-            if pw_fd is not None:
-                try:
-                    os.close(pw_fd)
-                except OSError:
-                    pass
-            session, self._session_handle = self._session_handle, None
-            if session is not None:
-                _close_portal_session(session)
-            with self._lock:
-                self._frame = None
-                self._frame_ts = 0.0
-            self._frame_ready.clear()
+            self._cleanup_locked()

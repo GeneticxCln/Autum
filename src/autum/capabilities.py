@@ -130,8 +130,13 @@ class NotesStore:
         if redact_sensitive(content) != content:
             raise ValueError("refusing to store passwords, keys, or tokens in notes (plan §5.3)")
         path = self._path(title)
+        parent_existed = self.notes_dir.parent.exists()
         self.notes_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(self.notes_dir.parent, 0o700)
+        if not parent_existed or self.notes_dir.parent.name == "autum":
+            try:
+                os.chmod(self.notes_dir.parent, 0o700)
+            except OSError:
+                pass
         self.notes_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.notes_dir, 0o700)
         # Exclusive creation (O_CREAT | O_EXCL, mode 0600): atomic no-overwrite + private (§5.2, §5.3).
@@ -139,7 +144,7 @@ class NotesStore:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
             raise FileExistsError(f"note {path.stem!r} already exists; create_note never overwrites") from None
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
             fh.write(content)
         os.chmod(path, 0o600)
         return {"slug": path.stem, "bytes": len(content.encode("utf-8"))}
@@ -153,7 +158,9 @@ class NotesStore:
         path = self._path(title)
         if not path.is_file():
             raise FileNotFoundError(f"note {path.stem!r} does not exist")
-        return {"slug": path.stem, "content": path.read_text(encoding="utf-8")}
+        with path.open("r", encoding="utf-8", newline="") as fh:
+            content = fh.read()
+        return {"slug": path.stem, "content": content}
 
     def delete(self, title: str) -> dict[str, Any]:
         path = self._path(title)

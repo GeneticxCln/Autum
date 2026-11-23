@@ -114,7 +114,7 @@ def command_handler(
                 else:
                     await voice.start()
             case "talk_finish":
-                if getattr(runtime, "mode", Mode.PUSH_TO_TALK) is Mode.PUSH_TO_TALK or waiting:
+                if getattr(voice, "capturing", False) or getattr(runtime, "mode", Mode.PUSH_TO_TALK) is Mode.PUSH_TO_TALK or waiting:
                     await voice.finish()
             case "talk_abort":
                 await voice.abort()
@@ -140,14 +140,15 @@ def command_handler(
                 runtime.submit_text(prompt)
             case "set_mode":
                 target_mode = Mode(command["mode"])
-                hf = get_hands_free()
-                if target_mode in (Mode.HANDS_FREE, Mode.WAKE_WORD) and hf is not None:
-                    await voice.abort()
-                    runtime.set_mode(target_mode)
-                    await hf.start()
-                elif target_mode is Mode.PUSH_TO_TALK:
+                if target_mode in (Mode.HANDS_FREE, Mode.WAKE_WORD):
+                    hf = get_hands_free()
                     if hf is not None:
-                        await hf.stop()
+                        await voice.abort()
+                        runtime.set_mode(target_mode)
+                        await hf.start()
+                elif target_mode is Mode.PUSH_TO_TALK:
+                    if hf_instance is not None:
+                        await hf_instance.stop()
                     runtime.set_mode(Mode.PUSH_TO_TALK)
             case "reload_config":
                 if on_reload is not None:
@@ -158,7 +159,7 @@ def command_handler(
     return handle
 
 
-async def start_bubble() -> asyncio.subprocess.Process | None:
+async def start_bubble(config_path: Path | None = None) -> asyncio.subprocess.Process | None:
     """The bubble runs as its own process; Autum keeps working without it."""
     if importlib.util.find_spec("PySide6") is None:
         log("the bubble needs PySide6, which is not installed")
@@ -173,8 +174,11 @@ async def start_bubble() -> asyncio.subprocess.Process | None:
     elif env.get("DISPLAY"):
         # Fallback for X11 or Wayland compositors without layer-shell-qt.
         env["QT_QPA_PLATFORM"] = "xcb"
+    cmd = [sys.executable, "-m", "autum.presence"]
+    if config_path is not None:
+        cmd.extend(["--config", str(config_path)])
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "autum.presence",
+        *cmd,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, env=env,
     )
     try:
@@ -183,6 +187,15 @@ async def start_bubble() -> asyncio.subprocess.Process | None:
         return None
     except asyncio.TimeoutError:
         return proc  # still running: it started
+    except asyncio.CancelledError:
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), 1.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        raise
 
 
 class BubbleSupervisor:
@@ -211,21 +224,24 @@ class BubbleSupervisor:
 
     async def _watch(self) -> None:
         restarts = 0
-        while not self._stop.is_set() and self.proc is not None:
-            waiter = asyncio.create_task(self.proc.wait())
-            stopper = asyncio.create_task(self._stop.wait())
-            done, pending = await asyncio.wait({waiter, stopper}, return_when=asyncio.FIRST_COMPLETED)
-            for p in pending:
-                p.cancel()
-            if self._stop.is_set():
-                return
-            code = waiter.result()
-            self.proc = None
-            restarts += 1
-            self.bus.emit(
-                "runtime.component_error",
-                {"component": "presence", "error": f"visual presence exited unexpectedly (code {code})"},
-            )
+        while not self._stop.is_set():
+            if self.proc is not None:
+                waiter = asyncio.create_task(self.proc.wait())
+                stopper = asyncio.create_task(self._stop.wait())
+                done, pending = await asyncio.wait({waiter, stopper}, return_when=asyncio.FIRST_COMPLETED)
+                for p in pending:
+                    p.cancel()
+                if self._stop.is_set():
+                    return
+                code = waiter.result()
+                self.proc = None
+                restarts += 1
+                self.bus.emit(
+                    "runtime.component_error",
+                    {"component": "presence", "error": f"visual presence exited unexpectedly (code {code})"},
+                )
+            else:
+                restarts += 1
             if restarts > self.max_restarts:
                 log("visual presence crashed repeatedly; continuing without it")
                 return
@@ -361,6 +377,10 @@ async def main(argv: Sequence[str] | None = None) -> int:
 
             voice_model = await resolve_speech_model(client, cfg.model, base_url=cfg.ollama_url)
             if voice_model != cfg.model:
+                fallback_problem = await check_ready(client, model=voice_model, base_url=cfg.ollama_url)
+                if fallback_problem:
+                    log(f"{cfg.model} has no TTS speech weights in Ollama and fallback {voice_model} is missing: {fallback_problem}")
+                    return 1
                 log(f"{cfg.model} has no TTS speech weights in Ollama; using {voice_model} for voice audio I/O.")
 
             _FAST_TAGS = ("gemma4", "gemma-4", "qwen3", "qwen-3")
@@ -389,9 +409,15 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 {"runtime.component_recovered"},
             )
             mode = start_mode
-            speech_synth = OmniSpeech(client, model=voice_model, voice=cfg.voice, base_url=cfg.ollama_url)
-            speech = SpeechPlayer(bus, speech_synth, target=out_target)
             transcriber = OmniTranscriber(client, model=voice_model, base_url=cfg.ollama_url)
+            speech_synth = OmniSpeech(
+                client,
+                model=voice_model,
+                voice=cfg.voice,
+                base_url=cfg.ollama_url,
+                on_fallback=lambda m: setattr(transcriber, "model", m),
+            )
+            speech = SpeechPlayer(bus, speech_synth, target=out_target)
             runtime_ref: list[Runtime] = []
             data_dir = cfg.resolved_data_dir() or default_data_dir()
             registry, timers, _notes = build_default_registry(
@@ -509,6 +535,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                         smart_barge_in=True,
                         post_speech_cooldown_s=0.45,
                     )
+                    hands_free.muted = runtime.muted
                 return hands_free
 
             async def reload_live_config() -> None:
@@ -531,6 +558,10 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 base = new_cfg.ollama_url.rstrip("/")
                 resolved_voice = await resolve_speech_model(client, new_voice, base_url=base)
                 if resolved_voice != new_voice:
+                    fb_prob = await check_ready(client, model=resolved_voice, base_url=base)
+                    if fb_prob:
+                        bus.emit("runtime.component_error", {"component": "config", "error": fb_prob})
+                        return
                     log(f"{new_voice} has no TTS speech weights in Ollama; using {resolved_voice} for voice audio I/O.")
                 new_voice = resolved_voice
 
@@ -552,7 +583,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                         swapper.pinned = frozenset((new_voice,))
                 else:
                     if prev_swapper is not None and prev_swapper.active and prev_swapper.active not in (new_chat, new_voice):
-                        await unload(client, model=prev_swapper.active, base_url=base)
+                        await unload(client, model=prev_swapper.active, base_url=prev_swapper.base_url)
                     swapper = None
 
                 chat.model = new_chat
@@ -581,8 +612,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 silence_ms = new_cfg.silence_ms
                 barge_in_ms = new_cfg.barge_in_ms
                 if hands_free is not None:
-                    hands_free.detector.silence_frames = max(1, int((silence_ms + 31) // 32))
-                    hands_free.detector.barge_in_frames = max(1, int((barge_in_ms + 31) // 32))
+                    hands_free.detector.update_thresholds(silence_ms=silence_ms, barge_in_ms=barge_in_ms)
 
                 if new_cfg.mode is not runtime.mode:
                     await handle_command({"command": "set_mode", "mode": new_cfg.mode.value})
@@ -590,12 +620,16 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 active_cfg[0] = new_cfg
                 runtime.begin_model_load(new_chat)
                 t_rel = time.monotonic()
-                await preload(client, model=new_voice, base_url=base)
-                if swapper is not None:
-                    await swapper.ensure_active(new_chat)
-                if new_chat != new_voice:
-                    await preload(client, model=new_chat, base_url=base)
-                runtime.finish_model_load(new_chat, (time.monotonic() - t_rel) * 1000.0)
+                try:
+                    await preload(client, model=new_voice, base_url=base)
+                    if swapper is not None:
+                        await swapper.ensure_active(new_chat)
+                    if new_chat != new_voice:
+                        await preload(client, model=new_chat, base_url=base)
+                except Exception as exc:
+                    bus.emit("runtime.component_error", {"component": "config", "error": f"model preload failed: {exc}"})
+                finally:
+                    runtime.finish_model_load(new_chat, (time.monotonic() - t_rel) * 1000.0)
                 log(
                     f"reloaded settings (mode={new_cfg.mode.value}, chat={new_chat}, "
                     f"vision={new_vis}, voice={new_voice}, swap={bool(swapper)})."
@@ -608,46 +642,64 @@ async def main(argv: Sequence[str] | None = None) -> int:
             except RuntimeError as exc:
                 log(str(exc))
                 return 1
-            mute = asyncio.create_task(MuteMonitor(bus).run())
-            bubble = BubbleSupervisor(bus)
-            await bubble.start()
-
-            runtime.begin_model_load(chat_model)
-            t_load = time.monotonic()
-            # Preload pinned voice engine + primary chat brain; vision_model swaps in dynamically on demand
-            await preload(client, model=voice_model, base_url=cfg.ollama_url)
-            if chat_model != voice_model:
-                if swapper is not None:
-                    await swapper.ensure_active(chat_model)
-                await preload(client, model=chat_model, base_url=cfg.ollama_url)
-            runtime.finish_model_load(chat_model, (time.monotonic() - t_load) * 1000.0)
-
-            if use_continuous:
-                await make_hands_free().start()
-                if aec is None:
-                    log(f"{mode.value} mode active (use headphones or enable AEC when using speakers).")
+            mute: asyncio.Task[None] | None = None
+            bubble = BubbleSupervisor(bus, starter=lambda: start_bubble(args.config))
             hotkey: PushToTalkKey | None = None
-            if args.hotkey:
-                def on_hotkey_status(msg: str) -> None:
-                    log(msg)
-                    if "unavailable" in msg.lower():
-                        diag_log.record_problem(
-                            component="hotkey",
-                            summary=msg,
-                            severity="warning",
-                            source="startup",
-                        )
-
-                hotkey = PushToTalkKey(
-                    loop,
-                    on_press=lambda: loop.create_task(handle_command({"command": "talk_start"})),
-                    on_release=lambda: loop.create_task(handle_command({"command": "talk_finish"})),
-                    on_status=on_hotkey_status,
-                )
-                hotkey.start()
-            swap_note = ", dynamic VRAM swap" if swapper is not None else ""
-            log(f"running ({mode.value}, chat={chat_model}, vision={vision_model}, voice={voice_model}{swap_note}). Stop with Ctrl+C.")
             try:
+                mute = asyncio.create_task(MuteMonitor(bus).run())
+                await bubble.start()
+
+                async def _preload_startup() -> None:
+                    await preload(client, model=voice_model, base_url=cfg.ollama_url)
+                    if chat_model != voice_model:
+                        if swapper is not None:
+                            await swapper.ensure_active(chat_model)
+                        await preload(client, model=chat_model, base_url=cfg.ollama_url)
+
+                runtime.begin_model_load(chat_model)
+                t_load = time.monotonic()
+                preload_task = asyncio.create_task(_preload_startup())
+                stop_waiter = asyncio.create_task(stop.wait())
+                try:
+                    done, pending = await asyncio.wait(
+                        {preload_task, stop_waiter}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for p in pending:
+                        p.cancel()
+                    if stop.is_set():
+                        try:
+                            await preload_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        return 0
+                    await preload_task
+                finally:
+                    runtime.finish_model_load(chat_model, (time.monotonic() - t_load) * 1000.0)
+
+                if use_continuous:
+                    await make_hands_free().start()
+                    if aec is None:
+                        log(f"{mode.value} mode active (use headphones or enable AEC when using speakers).")
+                if args.hotkey:
+                    def on_hotkey_status(msg: str) -> None:
+                        log(msg)
+                        if "unavailable" in msg.lower():
+                            diag_log.record_problem(
+                                component="hotkey",
+                                summary=msg,
+                                severity="warning",
+                                source="startup",
+                            )
+
+                    hotkey = PushToTalkKey(
+                        loop,
+                        on_press=lambda: loop.create_task(handle_command({"command": "talk_start"})),
+                        on_release=lambda: loop.create_task(handle_command({"command": "talk_finish"})),
+                        on_status=on_hotkey_status,
+                    )
+                    hotkey.start()
+                swap_note = ", dynamic VRAM swap" if swapper is not None else ""
+                log(f"running ({mode.value}, chat={chat_model}, vision={vision_model}, voice={voice_model}{swap_note}). Stop with Ctrl+C.")
                 await stop.wait()
             finally:
                 if hotkey is not None:
@@ -655,7 +707,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 await bubble.stop()
                 await integrations.shutdown()
                 await server.close()
-                mute.cancel()
+                if mute is not None:
+                    mute.cancel()
                 timers.stop_all()
                 if hands_free is not None:
                     await hands_free.stop()

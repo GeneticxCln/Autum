@@ -183,17 +183,32 @@ def _portal_screenshot_sync(timeout_s: float, cancel_event: threading.Event | No
         bus.signal_unsubscribe(sub_id)
         ctx.pop_thread_default()
 
-    if outcome.get("cancelled"):
-        raise RuntimeError("window capture was cancelled")
-    if outcome.get("timeout"):
-        raise TimeoutError("window selection timed out")
-    if outcome.get("code", 1) != 0:
-        raise RuntimeError("window capture was cancelled by the user")
     uri = outcome.get("uri", "")
     parsed = urllib.parse.urlparse(uri)
-    if parsed.scheme != "file" or not parsed.path:
+    shot_path = Path(urllib.parse.unquote(parsed.path)) if (parsed.scheme == "file" and parsed.path) else None
+    if outcome.get("cancelled"):
+        if shot_path is not None:
+            try:
+                shot_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise RuntimeError("window capture was cancelled")
+    if outcome.get("timeout"):
+        if shot_path is not None:
+            try:
+                shot_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise TimeoutError("window selection timed out")
+    if outcome.get("code", 1) != 0:
+        if shot_path is not None:
+            try:
+                shot_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise RuntimeError("window capture was cancelled by the user")
+    if shot_path is None:
         raise RuntimeError("screenshot portal did not return a local file")
-    shot_path = Path(urllib.parse.unquote(parsed.path))
     try:
         data = shot_path.read_bytes()
     finally:
@@ -219,12 +234,32 @@ async def portal_screenshot_interactive(timeout_s: float = 30.0) -> bytes:
 
 
 def desktop_app_dirs() -> list[Path]:
-    dirs = [
-        Path.home() / ".local" / "share" / "applications",
+    raw: list[Path] = []
+    data_home = os.environ.get("XDG_DATA_HOME")
+    raw.append((Path(data_home) if data_home else Path.home() / ".local" / "share") / "applications")
+    xdg_dirs = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
+    for entry in xdg_dirs.split(":"):
+        if entry.strip():
+            raw.append(Path(entry.strip()) / "applications")
+    for extra in (
+        Path.home() / ".local" / "share" / "flatpak" / "exports" / "share" / "applications",
+        Path("/var/lib/flatpak/exports/share/applications"),
+        Path("/var/lib/snapd/desktop/applications"),
         Path("/usr/local/share/applications"),
         Path("/usr/share/applications"),
-    ]
-    return [d for d in dirs if d.is_dir()]
+    ):
+        raw.append(extra)
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for d in raw:
+        try:
+            resolved = d.resolve()
+        except OSError:
+            continue
+        if resolved not in seen and resolved.is_dir():
+            seen.add(resolved)
+            out.append(resolved)
+    return out
 
 
 def _desktop_entry_meta(path: Path) -> tuple[bool, str]:
@@ -249,27 +284,35 @@ def _desktop_entry_meta(path: Path) -> tuple[bool, str]:
 
 
 def find_desktop_entry(app_query: str, search_dirs: Sequence[Path] | None = None) -> Path | None:
-    """Resolve an app name or desktop ID to a visible installed `.desktop` file."""
+    """Resolve an app name or desktop ID to a visible installed `.desktop` file (respecting XDG masking)."""
     q = app_query.strip().lower()
     if not q or "/" in q or "\\" in q or ".." in q:
         return None
     dirs = list(search_dirs) if search_dirs is not None else desktop_app_dirs()
     stem_target = q[:-8] if q.endswith(".desktop") else q
 
-    # Pass 1: exact stem match (e.g. "firefox" -> firefox.desktop, "org.kde.dolphin")
+    # Collect effective entries by desktop ID in XDG priority order so a user-level
+    # Hidden=true / NoDisplay=true override masks lower-priority system entries.
+    effective: list[tuple[Path, bool, str]] = []
+    seen_names: set[str] = set()
     for d in dirs:
         for p in sorted(d.glob("*.desktop")):
-            if p.stem.lower() == stem_target or p.stem.lower().endswith(f".{stem_target}"):
-                visible, _ = _desktop_entry_meta(p)
-                if visible:
-                    return p
+            key = p.name.lower()
+            if key in seen_names:
+                continue
+            seen_names.add(key)
+            visible, name = _desktop_entry_meta(p)
+            effective.append((p, visible, name))
+
+    # Pass 1: exact stem match (e.g. "firefox" -> firefox.desktop, "org.kde.dolphin")
+    for p, visible, _ in effective:
+        if visible and (p.stem.lower() == stem_target or p.stem.lower().endswith(f".{stem_target}")):
+            return p
 
     # Pass 2: exact Name= match inside [Desktop Entry]
-    for d in dirs:
-        for p in sorted(d.glob("*.desktop")):
-            visible, name = _desktop_entry_meta(p)
-            if visible and name == stem_target:
-                return p
+    for p, visible, name in effective:
+        if visible and name == stem_target:
+            return p
     return None
 
 
@@ -288,7 +331,7 @@ async def launch_desktop_app(app_name: str, desktop_file: Path | None) -> dict[s
     if not shutil.which("gtk-launch"):
         raise RuntimeError("launching desktop applications requires 'gtk-launch'")
     proc = await asyncio.create_subprocess_exec(
-        "gtk-launch", desktop_file.name,
+        "gtk-launch", "--", desktop_file.name,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         start_new_session=True,
     )
@@ -298,7 +341,7 @@ async def launch_desktop_app(app_name: str, desktop_file: Path | None) -> dict[s
         if code != 0:
             raise RuntimeError(f"gtk-launch exited with status {code}")
     except asyncio.TimeoutError:
-        pass
+        asyncio.create_task(proc.wait())  # reap slow launcher cleanly without zombie process
     return {"app": app_name, "desktop_file": desktop_file.name, "launched": True}
 
 
@@ -331,8 +374,10 @@ class LinuxDesktopIntegration:
         return platform.system() == "Linux"
 
     async def shutdown(self) -> None:
-        if getattr(self.screen_watcher, "active", False):
+        was_active = bool(getattr(self.screen_watcher, "active", False))
+        if hasattr(self.screen_watcher, "stop"):
             await self.screen_watcher.stop()
+        if was_active:
             if self._end_obs is not None:
                 self._end_obs("screen")
             elif self._set_obs is not None:
@@ -391,12 +436,19 @@ class LinuxDesktopIntegration:
             if not target.is_dir():
                 raise NotADirectoryError(f"not a directory: {target}")
             entries: list[dict[str, str]] = []
-            for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
-                if is_excluded_path(child) is not None:
+            for child in sorted(target.iterdir(), key=lambda p: p.name.lower()):
+                try:
+                    resolved_child = child.resolve()
+                except OSError:
+                    continue
+                if not any(resolved_child == d or d in resolved_child.parents for d in allowed):
+                    continue  # Never enumerate or follow symlinks outside allowed_read_dirs (§5.2)
+                if is_excluded_path(resolved_child) is not None:
                     continue  # Never enumerate secret stores or sensitive files (§5.2 / §5.3)
-                entries.append({"name": child.name, "kind": "dir" if child.is_dir() else "file"})
+                entries.append({"name": child.name, "kind": "dir" if resolved_child.is_dir() else "file"})
                 if len(entries) >= 100:
                     break
+            entries.sort(key=lambda e: (e["kind"] != "dir", e["name"].lower()))
             return {"path": str(target), "entries": entries, "count": len(entries)}
 
         async def _verify_list_dir(_args: dict[str, Any], result: dict[str, Any]) -> bool:
@@ -554,12 +606,14 @@ class LinuxDesktopIntegration:
         async def _look_at_screen(args: dict[str, Any]) -> dict[str, Any]:
             if context.vision is None:
                 raise RuntimeError("local vision analyzer is not configured")
-            # §5.3: refuse live screen vision while an excluded password/wallet window is active
+            # §5.3: refuse live screen vision while an excluded password/wallet window is active (fail-closed)
             if wm is not None and hasattr(wm, "active_excluded_window") and context.excluded_windows:
                 try:
                     hit = await wm.active_excluded_window(context.excluded_windows)
-                except Exception:
-                    hit = None
+                except Exception as exc:
+                    raise PermissionError(
+                        f"cannot verify active window exclusion before inspecting screen ({exc}); refusing fail-closed (plan §5.3)"
+                    ) from None
                 if hit is not None:
                     raise PermissionError(
                         f"cannot inspect live screen while excluded sensitive window matching {hit!r} is active (plan §5.3)"
@@ -830,7 +884,7 @@ class LinuxDesktopIntegration:
                     return await wm.switch_desktop(int(args["desktop"]))
 
                 async def _verify_switch(args: dict[str, Any], res: dict[str, Any]) -> bool:
-                    return int(res.get("desktop", 0)) >= 1
+                    return int(res.get("desktop", 0)) == int(args["desktop"])
 
                 registry.register(
                     Capability(

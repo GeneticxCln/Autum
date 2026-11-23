@@ -73,18 +73,19 @@ ObservationHook = Callable[[str], None]
 def is_excluded_path(path: Path) -> str | None:
     """Return a reason string if path points to an excluded secret store/file, else None."""
     resolved = path.expanduser().resolve()
-    parts_lower = {p.lower() for p in resolved.parts}
-    hit_dir = parts_lower & EXCLUDED_DIR_NAMES
+    parts_lower = [p.lower() for p in resolved.parts]
+    hit_dir = set(parts_lower) & EXCLUDED_DIR_NAMES
     if hit_dir:
         return f"access to excluded secret folder {sorted(hit_dir)[0]!r} is blocked (plan §5.2)"
     name_lower = resolved.name.lower()
     if name_lower in EXCLUDED_FILE_NAMES or name_lower.startswith(".env."):
         return f"access to sensitive file {resolved.name!r} is blocked (plan §5.2)"
-    if resolved.suffix.lower() in EXCLUDED_FILE_SUFFIXES:
+    if any(sfx.lower() in EXCLUDED_FILE_SUFFIXES for sfx in resolved.suffixes):
         return f"access to key/vault file {resolved.name!r} is blocked (plan §5.2)"
-    for sub in EXCLUDED_NAME_SUBSTRINGS:
-        if sub in name_lower:
-            return f"access to sensitive file {resolved.name!r} is blocked (plan §5.3)"
+    for part in parts_lower:
+        for sub in EXCLUDED_NAME_SUBSTRINGS:
+            if sub in part:
+                return f"access to sensitive path {resolved.name!r} is blocked (plan §5.3)"
     return None
 
 
@@ -127,9 +128,7 @@ class OllamaVision:
         self.swapper = swapper
 
     async def __call__(self, image_bytes: bytes, mime: str, question: str) -> str:
-        if self.swapper is not None:
-            await self.swapper.ensure_active(self.model)
-        b64 = base64.b64encode(image_bytes).decode()
+        b64 = (await asyncio.to_thread(base64.b64encode, image_bytes)).decode()
         body: dict[str, Any] = {
             "model": self.model,
             "stream": False,
@@ -148,11 +147,28 @@ class OllamaVision:
         }
         if self.reasoning_effort is not None:
             body["reasoning_effort"] = self.reasoning_effort
-        r = await self.client.post(f"{self.base_url}/v1/chat/completions", json=body, timeout=60.0)
+
+        async def _post() -> httpx.Response:
+            return await self.client.post(f"{self.base_url}/v1/chat/completions", json=body, timeout=60.0)
+
+        if self.swapper is not None and hasattr(self.swapper, "lease"):
+            async with self.swapper.lease(self.model):
+                r = await _post()
+        else:
+            if self.swapper is not None:
+                await self.swapper.ensure_active(self.model)
+            r = await _post()
         if r.status_code != 200:
             raise RuntimeError(f"local vision request failed ({r.status_code}): {r.text[:200]}")
-        content = r.json()["choices"][0]["message"].get("content", "")
-        return redact_sensitive(str(content).strip())
+        payload = r.json()
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise RuntimeError("local vision returned no choices")
+        msg = choices[0].get("message")
+        raw_content = msg.get("content") if isinstance(msg, dict) else None
+        if raw_content is None:
+            return ""
+        return redact_sensitive(str(raw_content).strip())
 
 
 async def extract_document_text(path: Path, max_chars: int = MAX_DOC_CHARS) -> tuple[str, bool]:
@@ -169,8 +185,31 @@ async def extract_document_text(path: Path, max_chars: int = MAX_DOC_CHARS) -> t
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+
+        async def _read_bounded() -> tuple[bytes, bytes, bool]:
+            out_buf = bytearray()
+            capped = False
+            assert proc.stdout is not None and proc.stderr is not None
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                remaining = MAX_DOC_BYTES - len(out_buf)
+                if remaining > 0:
+                    out_buf.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    capped = True
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    break
+            err_bytes = await proc.stderr.read(4096)
+            await proc.wait()
+            return bytes(out_buf), err_bytes, capped
+
         try:
-            out, err = await asyncio.wait_for(proc.communicate(), 15.0)
+            out, err, pdf_capped = await asyncio.wait_for(_read_bounded(), 15.0)
         except asyncio.TimeoutError:
             try:
                 proc.kill()
@@ -188,16 +227,17 @@ async def extract_document_text(path: Path, max_chars: int = MAX_DOC_CHARS) -> t
             except Exception:
                 pass
             raise
-        if proc.returncode != 0:
+        if not pdf_capped and proc.returncode != 0:
             raise RuntimeError(f"pdftotext failed: {err.decode(errors='replace').strip()[:200]}")
         raw = out.decode("utf-8", errors="replace")
     elif ext in TEXT_EXTENSIONS or (mimetypes.guess_type(str(path))[0] or "").startswith("text/"):
-        raw = path.read_text(encoding="utf-8", errors="replace")
+        raw = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
+        pdf_capped = False
     else:
         raise ValueError(f"unsupported document format {ext or '(none)'!r}")
 
-    sanitized = redact_sensitive(raw)
-    truncated = len(sanitized) > max_chars
+    sanitized = await asyncio.to_thread(redact_sensitive, raw)
+    truncated = pdf_capped or len(sanitized) > max_chars
     return sanitized[:max_chars], truncated
 
 
@@ -227,7 +267,7 @@ def register_perception_capabilities(
             raise ValueError("image file is empty")
         if size > MAX_IMAGE_BYTES:
             raise ValueError(f"image exceeds maximum size of {MAX_IMAGE_BYTES // (1024 * 1024)} MiB")
-        data = path.read_bytes()
+        data = await asyncio.to_thread(path.read_bytes)
         question = str(args.get("question") or "Describe what is visible in this image concisely.")
         _notify("image")
         try:

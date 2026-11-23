@@ -91,8 +91,10 @@ class PresenceModel(QObject):
                     self._set_level(0.0)
             case "speech.output_level":
                 self._set_level(min(1.0, float(p["rms"]) * 4.0))
+                return
             case "speech.playback_finished":
                 self._set_level(0.0)
+                return
             case "runtime.component_error":
                 self._error = f"{p['component']}: {p['error']}"
                 self._error_timer.start()

@@ -24,6 +24,7 @@ from autum.transport import default_socket_path
 def main() -> int:
     parser = argparse.ArgumentParser(prog="python3 -m autum.presence")
     parser.add_argument("--socket", type=Path)
+    parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--measure", type=int, default=0)
     args = parser.parse_args()
 
@@ -31,7 +32,7 @@ def main() -> int:
     app.setApplicationName("Autum")
     register_qml_types()
     model = PresenceModel(args.socket or default_socket_path(), measure=args.measure)
-    settings_bridge = SettingsBridge(model)
+    settings_bridge = SettingsBridge(model, config_path=args.config)
     engine = QQmlApplicationEngine()
     engine.rootContext().setContextProperty("presence", model)
     engine.rootContext().setContextProperty("settingsBridge", settings_bridge)
@@ -41,9 +42,23 @@ def main() -> int:
         return 1
     window = engine.rootObjects()[0]
     window.frameSwapped.connect(model.frame_swapped)
+
+    def _update_mask(*_args) -> None:
+        # Match the clickable orb circle (~1.05x orb diameter) instead of the oversized
+        # padded window so clicks in the transparent outer ring pass through to windows below.
+        w, h = int(window.width()), int(window.height())
+        if w <= 0 or h <= 0:
+            return
+        orb_size = int(round(float(window.property("size") or w) * 1.06))
+        diam = max(1, min(w, h, orb_size))
+        ox = (w - diam) // 2
+        oy = (h - diam) // 2
+        window.setMask(QRegion(ox, oy, diam, diam, QRegion.RegionType.Ellipse))
+
+    window.widthChanged.connect(_update_mask)
+    window.heightChanged.connect(_update_mask)
     window.show()
-    # Only the round orb takes clicks; the transparent corners pass them through.
-    window.setMask(QRegion(0, 0, window.width(), window.height(), QRegion.RegionType.Ellipse))
+    _update_mask()
     if app.platformName() == "xcb":
         QTimer.singleShot(300, lambda: skip_taskbar(int(window.winId())))
     model.start()
@@ -56,8 +71,11 @@ def skip_taskbar(window_id: int) -> None:
     Standard EWMH requests for a window that is already shown, sent through
     the system's libX11; Qt has no API for them.
     """
+    lib_name = ctypes.util.find_library("X11")
+    if not lib_name:
+        return
     try:
-        x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
+        x11 = ctypes.CDLL(lib_name)
     except (OSError, TypeError):
         return
     x11.XOpenDisplay.restype = ctypes.c_void_p

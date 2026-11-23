@@ -32,6 +32,8 @@ def test_commands_are_validated():
     assert parse_command(b'{"command": "set_mode", "mode": "push_to_talk"}') == {"command": "set_mode", "mode": "push_to_talk"}
     assert parse_command(b'{"command": "approve"}') == {"command": "approve"}
     assert parse_command(b'{"command": "deny"}') == {"command": "deny"}
+    assert parse_command(b'{"command": "reload_bubble"}') == {"command": "reload_bubble"}
+    assert parse_command(b'{"command": "close_bubble"}') == {"command": "close_bubble"}
     assert parse_command(b'{"command": "observe", "path": "/tmp/a.png", "question": "what?"}') == {
         "command": "observe", "path": "/tmp/a.png", "question": "what?",
     }

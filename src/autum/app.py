@@ -105,6 +105,8 @@ def command_handler(
     voice: VoiceInput,
     hands_free: HandsFreeInput | Callable[[], HandsFreeInput] | None = None,
     on_reload: Callable[[], asyncio.Future | Any] | None = None,
+    on_reload_bubble: Callable[[], asyncio.Future | Any] | None = None,
+    on_close_bubble: Callable[[], asyncio.Future | Any] | None = None,
 ):
     """User actions from the bubble (validated by the transport)."""
     hf_instance: HandsFreeInput | None = hands_free if not callable(hands_free) else None
@@ -165,6 +167,22 @@ def command_handler(
                     res = on_reload()
                     if asyncio.iscoroutine(res):
                         await res
+            case "reload_bubble":
+                if on_reload is not None:
+                    res = on_reload()
+                    if asyncio.iscoroutine(res):
+                        await res
+                if on_reload_bubble is not None:
+                    res_b = on_reload_bubble()
+                    if asyncio.iscoroutine(res_b):
+                        await res_b
+            case "close_bubble":
+                await voice.abort()
+                await runtime.cancel()
+                if on_close_bubble is not None:
+                    res_c = on_close_bubble()
+                    if asyncio.iscoroutine(res_c):
+                        await res_c
 
     return handle
 
@@ -261,6 +279,12 @@ class BubbleSupervisor:
             self.proc = await self.starter()
             if self.proc is not None:
                 self.bus.emit("runtime.component_recovered", {"component": "presence"})
+
+    async def reload(self) -> None:
+        """Restart the visual presence process cleanly without logging a crash."""
+        await self.stop()
+        self._stop.clear()
+        await self.start()
 
     async def stop(self) -> None:
         self._stop.set()
@@ -662,7 +686,15 @@ async def main(argv: Sequence[str] | None = None) -> int:
                     f"vision={new_vis}, voice={new_voice}, swap={bool(swapper)})."
                 )
 
-            handle_command = command_handler(runtime, voice, make_hands_free, on_reload=reload_live_config)
+            bubble = BubbleSupervisor(bus, starter=lambda: start_bubble(args.config))
+            handle_command = command_handler(
+                runtime,
+                voice,
+                make_hands_free,
+                on_reload=reload_live_config,
+                on_reload_bubble=bubble.reload,
+                on_close_bubble=stop.set,
+            )
             server = EventServer(bus, handle_command)
             try:
                 await server.start()
@@ -670,7 +702,6 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 log(str(exc))
                 return 1
             mute: asyncio.Task[None] | None = None
-            bubble = BubbleSupervisor(bus, starter=lambda: start_bubble(args.config))
             hotkey: PushToTalkKey | None = None
             try:
                 mute = asyncio.create_task(MuteMonitor(bus).run())

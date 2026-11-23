@@ -606,6 +606,8 @@ class Runtime:
                 return
             self._approval_turn = (event.turn_id or new_id(), src_mode, event.mono_ns)
             return
+        if event.payload.get("mode") == Mode.PUSH_TO_TALK:
+            self._cancel_pending_transcription()
         self._input_turn = event.turn_id
         if self._op is not None:
             source = "push_to_talk" if event.payload["mode"] == Mode.PUSH_TO_TALK else "barge_in"
@@ -762,7 +764,9 @@ class Runtime:
             try:
                 await prev_task
             except asyncio.CancelledError:
-                raise
+                cur = asyncio.current_task()
+                if cur is not None and cur.cancelling() > 0:
+                    raise
             except Exception:
                 pass
         if gen != self._tx_gen:

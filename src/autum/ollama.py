@@ -337,9 +337,9 @@ class OmniTranscriber:
 
 
 async def preload(client: httpx.AsyncClient, model: str = MODEL, base_url: str = OLLAMA) -> None:
-    """Load the model now (default context, like the endpoints above) so the first turn is fast."""
+    """Pin the model in GPU VRAM (`keep_alive: -1`) so it never expires while Autum runs."""
     r = await client.post(
-        f"{base_url.rstrip('/')}/api/generate", json={"model": model, "keep_alive": "30m"}, timeout=90
+        f"{base_url.rstrip('/')}/api/generate", json={"model": model, "keep_alive": -1}, timeout=90
     )
     if r.status_code != 200:
         raise RuntimeError(f"Ollama preload failed for {model} ({r.status_code}): {r.text[:200]}")

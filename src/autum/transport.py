@@ -27,7 +27,20 @@ log = logging.getLogger("autum.transport")
 CLIENT_QUEUE = 512
 MAX_LINE = 8192
 MAX_TEXT = 2000
-COMMANDS = {"talk_start", "talk_finish", "talk_abort", "stop", "text", "set_mode", "approve", "deny", "observe", "reload_config"}
+COMMANDS = {
+    "talk_start",
+    "talk_finish",
+    "talk_abort",
+    "stop",
+    "text",
+    "set_mode",
+    "approve",
+    "deny",
+    "observe",
+    "reload_config",
+    "reload_bubble",
+    "close_bubble",
+}
 MODES = {"push_to_talk", "wake_word", "hands_free"}
 SNAPSHOT_TYPES = ("runtime.state_changed", "audio.mute_changed")
 

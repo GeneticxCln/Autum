@@ -198,14 +198,47 @@ Window {
         onTriggered: {
             if (talkArea.leftHeld && !talkArea.dragging && !talkArea.talking) {
                 talkArea.talking = true
+                talkArea.talkLocked = true
                 presence.talkStart()
             }
+        }
+    }
+
+    Timer {
+        id: talkLockTimer
+        interval: 220
+        repeat: false
+        onTriggered: {
+            if (talkArea.leftHeld && talkArea.talking && !talkArea.dragging)
+                talkArea.talkLocked = true
+        }
+    }
+
+    Timer {
+        id: tapTalkTimer
+        interval: 3000
+        repeat: false
+        onTriggered: {
+            if (talkArea.tapTalking) {
+                talkArea.tapTalking = false
+                presence.talkFinish()
+            }
+        }
+    }
+
+    onStChanged: {
+        if (st !== "speech_detected" && st !== "listening" && talkArea.tapTalking && !talkArea.leftHeld) {
+            tapTalkTimer.stop()
+            talkArea.tapTalking = false
         }
     }
 
     // Left-drag moves the orb anywhere on screen; holding talks immediately at
     // 0 ms when idle (or after a brief 140 ms drag grace window while Autum is
     // speaking so dragging the orb out of the way never interrupts her reply).
+    // Once held for 220 ms without dragging, talk hold locks so hand movement
+    // while speaking never aborts the utterance; a quick single tap (< 240 ms)
+    // keeps recording for 3 s (or until tapped again).
     MouseArea {
         id: talkArea
         anchors.fill: parent
@@ -218,6 +251,10 @@ Window {
         property bool leftHeld: false
         property bool dragging: false
         property bool talking: false
+        property bool talkLocked: false
+        property bool tapTalking: false
+        property bool finishTapOnRelease: false
+        property real pressTimeMs: 0
         property bool hasDragDelta: false
         property bool awaitingCommit: false
         property real pressX: 0
@@ -238,11 +275,15 @@ Window {
                     return
                 curX = mouse.x
                 curY = mouse.y
-                hasDragDelta = true
-                if (!dragging) {
+                if (!dragging && !talkLocked) {
                     const moveDist = Math.hypot(mouse.x - pressX, mouse.y - pressY)
-                    if (moveDist >= 7) {
+                    const dragThreshold = talking ? 18 : 8
+                    if (moveDist >= dragThreshold) {
                         dragGraceTalkTimer.stop()
+                        talkLockTimer.stop()
+                        tapTalkTimer.stop()
+                        tapTalking = false
+                        finishTapOnRelease = false
                         dragging = true
                         if (talking) {
                             talking = false
@@ -250,6 +291,8 @@ Window {
                         }
                     }
                 }
+                if (dragging)
+                    hasDragDelta = true
             }
         }
         onExited: hoveringOrb = false
@@ -267,10 +310,21 @@ Window {
             pressY = mouse.y
             curX = mouse.x
             curY = mouse.y
+            pressTimeMs = Date.now()
             hasDragDelta = false
             awaitingCommit = false
             leftHeld = true
             dragging = false
+            talkLocked = false
+            finishTapOnRelease = false
+            if (tapTalking) {
+                tapTalkTimer.stop()
+                tapTalking = false
+                talking = false
+                finishTapOnRelease = true
+                presence.talkFinish()
+                return
+            }
             // In push_to_talk mode (or when answering an approval prompt):
             // - At rest, start recording at 0 ms so the first syllable is never clipped.
             // - While speaking/busy, use a 140 ms drag grace window so dragging the orb
@@ -281,6 +335,7 @@ Window {
                     dragGraceTalkTimer.restart()
                 } else {
                     talking = true
+                    talkLockTimer.restart()
                     presence.talkStart()
                 }
             } else {
@@ -291,6 +346,8 @@ Window {
             if (mouse.button !== Qt.LeftButton)
                 return
             dragGraceTalkTimer.stop()
+            talkLockTimer.stop()
+            const heldMs = Date.now() - pressTimeMs
             if (dragging) {
                 if (hasDragDelta && !awaitingCommit) {
                     const dx = Math.round(curX - pressX)
@@ -302,24 +359,37 @@ Window {
                 }
                 if (typeof settingsBridge !== "undefined" && settingsBridge)
                     settingsBridge.savePosition(win.marginRight, win.marginBottom)
+            } else if (finishTapOnRelease) {
+                finishTapOnRelease = false
             } else if (talking) {
-                presence.talkFinish()
+                if (heldMs < 240) {
+                    tapTalking = true
+                    tapTalkTimer.restart()
+                } else {
+                    presence.talkFinish()
+                }
             } else if (win.speaking || win.busy) {
                 presence.stopSpeaking()
             }
             leftHeld = false
             dragging = false
             talking = false
+            talkLocked = false
             hasDragDelta = false
             awaitingCommit = false
         }
         onCanceled: {
             dragGraceTalkTimer.stop()
+            talkLockTimer.stop()
+            tapTalkTimer.stop()
+            tapTalking = false
+            finishTapOnRelease = false
             if (talking)
                 presence.talkAbort()
             leftHeld = false
             dragging = false
             talking = false
+            talkLocked = false
             hasDragDelta = false
             awaitingCommit = false
         }
@@ -443,6 +513,24 @@ Window {
         StyledMenuItem {
             text: "Reset Position"
             onTriggered: win.resetOrbPosition()
+        }
+
+        MenuSeparator {
+            padding: 4
+            contentItem: Rectangle {
+                implicitHeight: 1
+                color: "#223047"
+            }
+        }
+
+        StyledMenuItem {
+            text: "Reload Bubble"
+            onTriggered: presence.reloadBubble()
+        }
+
+        StyledMenuItem {
+            text: "Close Bubble"
+            onTriggered: presence.closeBubble()
         }
     }
 

@@ -87,3 +87,34 @@ def test_mode_switching_and_hands_free_manual_interrupt():
         ("approval", "yes", "command"),
         ("approval", "no", "command"),
     ]
+
+
+def test_reload_bubble_and_close_bubble_commands():
+    voice, runtime = FakeVoice(), FakeRuntime()
+    events = []
+
+    async def on_reload():
+        events.append("reload_config")
+
+    async def on_reload_bubble():
+        events.append("reload_bubble")
+
+    def on_close_bubble():
+        events.append("close_bubble")
+
+    handle = command_handler(
+        runtime,
+        voice,
+        on_reload=on_reload,
+        on_reload_bubble=on_reload_bubble,
+        on_close_bubble=on_close_bubble,
+    )
+
+    async def scenario():
+        await handle({"command": "reload_bubble"})
+        await handle({"command": "close_bubble"})
+
+    asyncio.run(scenario())
+    assert events == ["reload_config", "reload_bubble", "close_bubble"]
+    assert voice.calls == ["abort"]
+    assert runtime.calls == [("cancel", "user_command")]

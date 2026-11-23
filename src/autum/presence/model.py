@@ -172,6 +172,22 @@ class PresenceModel(QObject):
     def reloadConfig(self) -> None:
         self._send({"command": "reload_config"})
 
+    @Slot()
+    def reloadBubble(self) -> None:
+        if self._connected:
+            self._send({"command": "reload_bubble"})
+        else:
+            import os
+            import sys
+
+            os.execv(sys.executable, [sys.executable, "-m", "autum.presence", *sys.argv[1:]])
+
+    @Slot()
+    def closeBubble(self) -> None:
+        if self._connected:
+            self._send({"command": "close_bubble"})
+        QTimer.singleShot(80, QGuiApplication.quit)
+
     # ----- measurement (WP4 acceptance: state lag) ----------------------
 
     @Slot()

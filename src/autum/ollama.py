@@ -359,11 +359,20 @@ async def unload(client: httpx.AsyncClient, model: str, base_url: str = OLLAMA) 
         pass
 
 
+def model_candidates(model: str) -> set[str]:
+    """Candidate Ollama model identifiers (matching untagged `<name>` with `<name>:latest`)."""
+    clean = (model or "").strip()
+    if not clean:
+        return set()
+    return {clean} if ":" in clean else {clean, f"{clean}:latest"}
+
+
 async def release_models(client: httpx.AsyncClient, models: Iterable[str], base_url: str = OLLAMA) -> None:
     """On exit, unload Autum's pinned (`keep_alive: -1`) models that are still in VRAM.
 
     Only models Ollama reports as loaded are unloaded: asking Ollama to unload a
-    model that is not loaded would load it first.
+    model that is not loaded would load it first. Matches untagged model names
+    against Ollama's normalized `<name>:latest` identifier in `/api/ps`.
     """
     base = base_url.rstrip("/")
     try:
@@ -371,9 +380,12 @@ async def release_models(client: httpx.AsyncClient, models: Iterable[str], base_
         loaded = {str(m.get("name") or "") for m in (r.json() or {}).get("models") or () if isinstance(m, dict)}
     except (httpx.HTTPError, ValueError):
         return
+    unloaded: set[str] = set()
     for model in dict.fromkeys(models):
-        if model and model in loaded:
-            await unload(client, model=model, base_url=base)
+        for loaded_name in sorted(model_candidates(model) & loaded):
+            if loaded_name and loaded_name not in unloaded:
+                unloaded.add(loaded_name)
+                await unload(client, model=loaded_name, base_url=base)
 
 
 _THINKING_MODEL_TAGS: tuple[str, ...] = (
@@ -446,7 +458,6 @@ async def check_ready(client: httpx.AsyncClient, model: str = MODEL, base_url: s
         return f"Ollama at {base_url} returned non-JSON data; check ollama_url in config.toml."
     models = payload.get("models") if isinstance(payload, dict) else None
     names = {str(m["name"]) for m in (models or ()) if isinstance(m, dict) and m.get("name")}
-    candidates = {model} if ":" in model else {model, f"{model}:latest"}
-    if not (candidates & names):
+    if not (model_candidates(model) & names):
         return f"Ollama does not have {model}. Pull it with `ollama pull {model}` (with your approval) or update config.toml."
     return None

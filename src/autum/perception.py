@@ -21,6 +21,7 @@ from typing import Any, Awaitable, Callable, Sequence
 import httpx
 
 from autum.logging import redact_sensitive
+from autum.ollama import strip_hidden_blocks
 from autum.tools import Capability, PermissionLevel, ToolRegistry
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MiB
@@ -168,6 +169,7 @@ class OllamaVision:
             "temperature": 0,
             "seed": 42,
             "max_tokens": 220,
+            "keep_alive": -1,
             "messages": [
                 {"role": "system", "content": VISION_SYSTEM_PROMPT},
                 {
@@ -202,7 +204,7 @@ class OllamaVision:
         raw_content = msg.get("content") if isinstance(msg, dict) else None
         if raw_content is None:
             return ""
-        return redact_sensitive(str(raw_content).strip())
+        return redact_sensitive(strip_hidden_blocks(str(raw_content)))
 
 
 async def extract_document_text(path: Path, max_chars: int = MAX_DOC_CHARS) -> tuple[str, bool]:

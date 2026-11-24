@@ -329,7 +329,7 @@ Window {
             // - At rest, start recording at 0 ms so the first syllable is never clipped.
             // - While speaking/busy, use a 140 ms drag grace window so dragging the orb
             //   out of the way never interrupts Autum's reply or opens the microphone.
-            if (presence.mode === "push_to_talk" || win.st === "waiting_for_approval") {
+            if (win.st !== "loading" && (presence.mode === "push_to_talk" || win.st === "waiting_for_approval")) {
                 if (win.speaking || win.busy) {
                     talking = false
                     dragGraceTalkTimer.restart()
@@ -369,7 +369,7 @@ Window {
                 } else {
                     presence.talkFinish()
                 }
-            } else if (win.speaking || win.busy) {
+            } else if ((win.speaking || win.busy) && win.st !== "loading") {
                 presence.stopSpeaking()
             }
             leftHeld = false

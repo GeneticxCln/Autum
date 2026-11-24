@@ -715,13 +715,16 @@ class Runtime:
 
     # ----- public API ----------------------------------------------------
 
-    def submit_speech(self, turn_id: str, audio: bytes, cause: Event | None = None) -> None:
+    def submit_speech(self, turn_id: str, audio: bytes, cause: Event | None = None) -> bool:
         """A finished utterance for a pipeline whose model hears audio directly.
 
         The transcript, when the voice engine publishes it, replaces the
         audio in the history. If waiting for approval, transcribes the reply
         to resolve the pending approval instead of starting a new turn.
+        Returns True if the utterance was accepted, False if dropped/superseded.
         """
+        if self.state is State.LOADING:
+            return False
         if self._approval_turn is not None and turn_id == self._approval_turn[0]:
             _, src_mode, started_ns = self._approval_turn
             self._approval_turn = None
@@ -730,9 +733,10 @@ class Runtime:
                     self._resolve_approval_audio(audio, src_mode, started_ns)
                 )
                 self._track(task)
-            return
+                return True
+            return False
         if turn_id != self._input_turn:
-            return  # superseded by a newer utterance
+            return False  # superseded by a newer utterance
         if (not self.direct_audio or self.mode is Mode.WAKE_WORD) and self.transcriber is not None:
             prev_task = (
                 self._transcribe_task
@@ -748,9 +752,10 @@ class Runtime:
             task.add_done_callback(self._transcribe_tasks.discard)
             self._transcribe_turn = turn_id
             self._track(task)
-            return
+            return True
         self._input_turn = None
         self._start_response("", "speech", turn_id, cause, audio=audio)
+        return True
 
     async def _transcribe_and_respond(
         self,

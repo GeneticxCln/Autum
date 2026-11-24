@@ -421,3 +421,18 @@ def test_self_awareness_self_diagnose_and_problem_logging(tmp_path):
     assert is_affirmative("Yes please") is True
     assert is_affirmative("Okay, forget it") is False
     assert is_affirmative("forget it") is False
+
+
+def test_presence_model_clears_matching_component_error_on_recovery(tmp_path):
+    bus = EventBus("s")
+    model = PresenceModel(tmp_path / "none.sock")
+    model.apply(bus.emit("runtime.component_error", {"component": "models", "error": "preload failed"}))
+    assert model.error == "models: preload failed"
+
+    # Unrelated component recovery must NOT clear an active error from a different component
+    model.apply(bus.emit("runtime.component_recovered", {"component": "microphone"}))
+    assert model.error == "models: preload failed"
+
+    # Matching component recovery clears the error immediately without waiting 4s
+    model.apply(bus.emit("runtime.component_recovered", {"component": "models"}))
+    assert model.error == ""

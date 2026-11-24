@@ -698,7 +698,7 @@ Window {
                             Text {
                                 id: verLabel
                                 anchors.centerIn: parent
-                                text: "v" + ((typeof settingsBridge !== "undefined" && settingsBridge && typeof settingsBridge.appVersion === "function") ? settingsBridge.appVersion() : "1.1.1")
+                                text: "v" + ((typeof settingsBridge !== "undefined" && settingsBridge && typeof settingsBridge.appVersion === "function") ? settingsBridge.appVersion() : "1.1.2")
                                 color: root.accentIce
                                 font.pixelSize: 11
                                 font.weight: Font.Medium

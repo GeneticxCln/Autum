@@ -1103,3 +1103,38 @@ def test_highpass_removes_dc_and_subsonic_rumble_while_keeping_speech():
     assert len(highpass_pcm(rumble)) == len(rumble)
     assert rms(highpass_pcm(rumble)) < rms(rumble) * 0.25
     assert rms(highpass_pcm(speech)) > rms(speech) * 0.85
+
+
+def test_voice_input_blocks_capture_during_model_loading_and_never_leaks_wav():
+    async def scenario():
+        bus = EventBus("s")
+        runtime = Runtime(bus, MockInference("ok"), MockSpeech(bus), direct_audio=True)
+        spawner = Spawner([CHUNK_100MS_16K] * 5)
+        voice = VoiceInput(bus, runtime, FakeTranscriber(), spawn_=spawner)
+
+        # 1. While State.LOADING, start() refuses to open pw-record
+        runtime.begin_model_load("gemma4:12b")
+        assert runtime.state is State.LOADING
+        refused = await voice.start()
+        assert refused is None and not voice.capturing and spawner.procs == []
+
+        # 2. Once model finishes loading, start() succeeds; if a reload begins mid-capture,
+        #    active capture is aborted cleanly without stranding WAV bytes in _awaiting_transcript.
+        runtime.finish_model_load("gemma4:12b", 120.0)
+        turn = await voice.start()
+        assert turn is not None and voice.capturing
+        await asyncio.sleep(0.04)
+        runtime.begin_model_load("qwen3-vl:8b")
+        await asyncio.sleep(0.05)
+        assert not voice.capturing
+        assert voice._awaiting_transcript == {}
+
+        # 3. Even if submit_speech drops a superseded turn directly, _awaiting_transcript cleans up
+        runtime.finish_model_load("qwen3-vl:8b", 80.0)
+        t_stale = await voice.start()
+        await asyncio.sleep(0.05)
+        runtime._input_turn = "superseded-turn"
+        await voice.finish()
+        assert voice._awaiting_transcript == {}
+
+    run(scenario())

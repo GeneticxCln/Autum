@@ -289,6 +289,8 @@ class VoiceInput:
             self._on_event,
             {
                 "audio.mute_changed",
+                "runtime.model_loading",
+                "runtime.state_changed",
                 "conversation.response_finished",
                 "operation.cancelled",
                 "runtime.component_error",
@@ -300,8 +302,8 @@ class VoiceInput:
         return self._turn is not None
 
     async def start(self) -> str | None:
-        """Begin a turn. Returns None if muted or already capturing."""
-        if self.muted or self.capturing:
+        """Begin a turn. Returns None if muted, loading models, or already capturing."""
+        if self.muted or self.capturing or str(getattr(self.runtime, "state", "")) == "loading":
             return None
         turn = self._turn = new_id()
         pcm_buf = bytearray()
@@ -318,8 +320,10 @@ class VoiceInput:
             if self._turn == turn:
                 self._turn = None
             raise
-        # Guard against quick tap / mute while pw-record was still spawning
-        if self._turn != turn or self.muted:
+        # Guard against quick tap / mute / model load while pw-record was still spawning
+        if self._turn != turn or self.muted or str(getattr(self.runtime, "state", "")) == "loading":
+            if self._turn == turn:
+                self._turn = None
             _kill(proc)
             await proc.wait()
             return None
@@ -344,11 +348,14 @@ class VoiceInput:
             return
         wav = wav_bytes(highpass_pcm(pcm, MIC_RATE), MIC_RATE)
         is_wake_mode = str(getattr(self.runtime, "mode", "")) == "wake_word"
-        if not waiting_approval and not is_wake_mode and getattr(self.runtime, "direct_audio", True):
+        track_direct = not waiting_approval and not is_wake_mode and getattr(self.runtime, "direct_audio", True)
+        if track_direct:
             while len(self._awaiting_transcript) >= 8:
                 self._awaiting_transcript.pop(next(iter(self._awaiting_transcript)))
             self._awaiting_transcript[turn] = wav
-        self.runtime.submit_speech(turn, wav, ended)
+        accepted = self.runtime.submit_speech(turn, wav, ended)
+        if accepted is False and track_direct:
+            self._awaiting_transcript.pop(turn, None)
 
     async def abort(self, error: str | None = None) -> None:
         """Drop the current utterance (muted, stalled, or quitting)."""
@@ -434,6 +441,12 @@ class VoiceInput:
             self.muted = bool(event.payload["muted"])
             if self.muted and self.capturing:
                 self._track(self.abort())  # captured audio is dropped while muted
+        elif event.type == "runtime.model_loading":
+            if self.capturing:
+                self._track(self.abort())
+        elif event.type == "runtime.state_changed":
+            if event.payload.get("to") == "loading" and self.capturing:
+                self._track(self.abort())
         elif event.type == "runtime.component_error":
             if event.turn_id in self._awaiting_transcript:
                 self._awaiting_transcript.pop(event.turn_id, None)
@@ -1010,11 +1023,14 @@ class HandsFreeInput:
                 provenance=Provenance.USER,
                 turn_id=turn,
             )
-            if not waiting_approval and not is_wake_mode and getattr(self.runtime, "direct_audio", True):
+            track_direct = not waiting_approval and not is_wake_mode and getattr(self.runtime, "direct_audio", True)
+            if track_direct:
                 while len(self._awaiting_transcript) >= 8:
                     self._awaiting_transcript.pop(next(iter(self._awaiting_transcript)))
                 self._awaiting_transcript[turn] = wav
-            self.runtime.submit_speech(turn, wav, ended)
+            accepted = self.runtime.submit_speech(turn, wav, ended)
+            if accepted is False and track_direct:
+                self._awaiting_transcript.pop(turn, None)
 
     async def _close_capture(self) -> None:
         proc, self._proc = self._proc, None

@@ -754,6 +754,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
 
                 active_cfg[0] = new_cfg
                 if models_changed:
+                    await voice.abort()
                     runtime.begin_model_load(new_chat)
                     t_rel = time.monotonic()
                     try:

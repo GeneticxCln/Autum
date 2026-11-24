@@ -654,16 +654,19 @@ async def main(argv: Sequence[str] | None = None) -> int:
 
             reload_lock = asyncio.Lock()
             startup_preload_pending = bool(missing_startup_models)
+            models_errored = bool(missing_startup_models)
+            config_errored = False
 
             async def reload_live_config() -> None:
                 async with reload_lock:
                     await _reload_live_config_locked()
 
             async def _reload_live_config_locked() -> None:
-                nonlocal swapper, silence_ms, barge_in_ms, startup_preload_pending
+                nonlocal swapper, silence_ms, barge_in_ms, startup_preload_pending, models_errored, config_errored
                 try:
                     new_cfg = Config.load(args.config)
                 except (OSError, ValueError) as exc:
+                    config_errored = True
                     bus.emit("runtime.component_error", {"component": "config", "error": str(exc)})
                     return
                 configure_logging(new_cfg.log_level)
@@ -673,6 +676,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 for req_m in dict.fromkeys((new_voice, new_chat, new_vis)):
                     prob = await check_ready(client, model=req_m, base_url=new_cfg.ollama_url)
                     if prob:
+                        config_errored = True
                         bus.emit("runtime.component_error", {"component": "config", "error": prob})
                         return
 
@@ -681,6 +685,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 if resolved_voice != new_voice:
                     fb_prob = await check_ready(client, model=resolved_voice, base_url=base)
                     if fb_prob:
+                        config_errored = True
                         bus.emit("runtime.component_error", {"component": "config", "error": fb_prob})
                         return
                     log(f"{new_voice} has no TTS speech weights in Ollama; using {resolved_voice} for voice audio I/O.")
@@ -753,6 +758,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                     await handle_command({"command": "set_mode", "mode": new_cfg.mode.value})
 
                 active_cfg[0] = new_cfg
+                reload_preload_failed = False
                 if models_changed:
                     await voice.abort()
                     runtime.begin_model_load(new_chat)
@@ -770,9 +776,18 @@ async def main(argv: Sequence[str] | None = None) -> int:
                             await preload(client, model=new_chat, base_url=base)
                         startup_preload_pending = False
                     except Exception as exc:
+                        reload_preload_failed = True
+                        config_errored = True
                         bus.emit("runtime.component_error", {"component": "config", "error": f"model preload failed: {exc}"})
                     finally:
                         runtime.finish_model_load(new_chat, (time.monotonic() - t_rel) * 1000.0)
+                if not reload_preload_failed:
+                    if models_errored and not startup_preload_pending:
+                        models_errored = False
+                        bus.emit("runtime.component_recovered", {"component": "models"})
+                    if config_errored:
+                        config_errored = False
+                        bus.emit("runtime.component_recovered", {"component": "config"})
                 log(
                     f"reloaded settings (mode={new_cfg.mode.value}, chat={new_chat}, "
                     f"vision={new_vis}, voice={new_voice}, swap={bool(swapper)})."
@@ -856,6 +871,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                     # Keep running: Ollama loads models on first use, and a settings
                     # reload retries the preload (startup_preload_pending).
                     startup_preload_pending = True
+                    models_errored = True
                     log(f"WARNING: model preload failed: {load_error}")
                     bus.emit(
                         "runtime.component_error",

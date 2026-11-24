@@ -49,6 +49,7 @@ class PresenceModel(QObject):
         self._mode = "push_to_talk"
         self._level = 0.0
         self._error = ""
+        self._error_component = ""
         self._connected = False
         self._buffer = b""
         cap = max(256, int(measure)) if measure else 256
@@ -96,8 +97,17 @@ class PresenceModel(QObject):
                 self._set_level(0.0)
                 return
             case "runtime.component_error":
+                self._error_component = str(p.get("component") or "")
                 self._error = f"{p['component']}: {p['error']}"
                 self._error_timer.start()
+            case "runtime.component_recovered":
+                comp = str(p.get("component") or "")
+                if self._error and (not comp or comp == self._error_component):
+                    self._error_timer.stop()
+                    self._error = ""
+                    self._error_component = ""
+                else:
+                    return
             case _:
                 return
         self.applied_ms.append((time.monotonic_ns() - event.mono_ns) / 1e6)
@@ -110,6 +120,7 @@ class PresenceModel(QObject):
 
     def _clear_error(self) -> None:
         self._error = ""
+        self._error_component = ""
         self.changed.emit()
 
     # ----- socket ------------------------------------------------------
@@ -128,6 +139,7 @@ class PresenceModel(QObject):
             self._connected = False
             self._state, self._microphone, self._observation = "idle", "off", "none"
             self._error = ""
+            self._error_component = ""
             self._set_level(0.0)
             self.changed.emit()
         self._buffer = b""

@@ -59,6 +59,7 @@ from autum.ollama import (
     OmniSpeech,
     OmniTranscriber,
     check_ready,
+    model_candidates,
     preload,
     release_models,
     resolve_reasoning_effort,
@@ -806,7 +807,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
                     if total_vram is not None and chat_model != voice_model:
                         installed = await asyncio.to_thread(query_ollama_models, cfg.ollama_url, 2.0)
                         sizes = {m["name"]: float(m.get("size_gb") or 0.0) for m in installed}
-                        c_gb, v_gb = sizes.get(chat_model, 0.0), sizes.get(voice_model, 0.0)
+                        c_gb = next((sizes[c] for c in model_candidates(chat_model) if c in sizes), 0.0)
+                        v_gb = next((sizes[c] for c in model_candidates(voice_model) if c in sizes), 0.0)
                         if c_gb + v_gb + 2.5 > total_vram:
                             log(
                                 f"WARNING: {chat_model} ({c_gb:.1f} GB) + {voice_model} ({v_gb:.1f} GB) + desktop (~2.5 GB) "
@@ -817,13 +819,14 @@ async def main(argv: Sequence[str] | None = None) -> int:
                     try:
                         ps_resp = await client.get(f"{cfg.ollama_url.rstrip('/')}/api/ps", timeout=2.0)
                         if ps_resp.status_code == 200:
+                            voice_cands = model_candidates(voice_model)
                             for entry in (ps_resp.json() or {}).get("models") or ():
                                 if not isinstance(entry, dict):
                                     continue
                                 name = str(entry.get("name") or "")
                                 sz = int(entry.get("size") or 0)
                                 vram = int(entry.get("size_vram") or 0)
-                                if name == voice_model and vram > 0 and (sz == 0 or vram >= sz * 0.9):
+                                if name in voice_cands and vram > 0 and (sz == 0 or vram >= sz * 0.9):
                                     voice_hot_gpu = True
                                     break
                     except (httpx.HTTPError, ValueError):

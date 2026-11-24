@@ -415,16 +415,19 @@ def run_system_health_checks(
         except Exception:
             cfg = Config()
 
-    chat_m = cfg.resolved_chat_model()
-    vis_m = cfg.resolved_vision_model()
-    voice_m = cfg.model
+    from autum.ollama import model_candidates
+
+    state_map = live_state or {}
+    chat_m = str(state_map.get("chat_model") or cfg.resolved_chat_model())
+    vis_m = str(state_map.get("vision_model") or cfg.resolved_vision_model())
+    voice_m = str(state_map.get("voice_model") or cfg.model)
     checks: list[dict[str, Any]] = []
 
     # 1. Ollama & AI Models
     models = query_ollama_models(cfg.ollama_url, timeout_s=2.0)
     installed_names = {m["name"] for m in models}
     loaded_models = [f"{m['name']} ({m['status']})" for m in models if m.get("loaded")]
-    missing_models = [m for m in dict.fromkeys((chat_m, vis_m, voice_m)) if m not in installed_names]
+    missing_models = [m for m in dict.fromkeys((chat_m, vis_m, voice_m)) if not (model_candidates(m) & installed_names)]
     if not models:
         checks.append(
             {
@@ -456,8 +459,9 @@ def run_system_health_checks(
         ]
         total_vram = gpu_vram_gb()
         size_by_name = {m["name"]: float(m.get("size_gb") or 0.0) for m in models}
-        chat_gb = size_by_name.get(chat_m, 0.0)
-        voice_gb = 0.0 if voice_m == chat_m else size_by_name.get(voice_m, 0.0)
+        chat_gb = next((size_by_name[c] for c in model_candidates(chat_m) if c in size_by_name), 0.0)
+        same_voice = bool(model_candidates(voice_m) & model_candidates(chat_m))
+        voice_gb = 0.0 if same_voice else next((size_by_name[c] for c in model_candidates(voice_m) if c in size_by_name), 0.0)
         vram_tight = total_vram is not None and (chat_gb + voice_gb + 2.5) > total_vram
         if cpu_spilled:
             checks.append(

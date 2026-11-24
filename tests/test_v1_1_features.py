@@ -375,3 +375,44 @@ def test_self_diagnosis_audio_honors_configured_audio_input(monkeypatch):
     assert audio_disc["status"] == "warning"
     assert "disconnected" in audio_disc["summary"].lower()
     assert "alsa_input.usb-CustomMic" in audio_disc["summary"]
+
+
+def test_transcript_log_cross_process_clear_no_resurrection_and_direct_audio_backfill(tmp_path):
+    tx_path = tmp_path / "transcript.jsonl"
+    daemon_tx = TranscriptLog(tx_path)
+    daemon_tx.record("user", "Old turn 1")
+    daemon_tx.record("assistant", "Old reply 1")
+
+    # Separate process (Settings UI) clears transcript on disk
+    ui_tx = TranscriptLog(tx_path)
+    assert ui_tx.clear() == 2
+
+    # Next daemon write must NOT resurrect cleared turns
+    daemon_tx.record("user", "Fresh turn")
+    assert [(e["role"], e["text"]) for e in TranscriptLog(tx_path).recent(10)] == [("user", "Fresh turn")]
+
+    # Direct-audio turn: user_message has empty text initially, then response_finished, then audio.transcribed
+    tx_path2 = tmp_path / "transcript_direct.jsonl"
+    tx2 = TranscriptLog(tx_path2)
+    bus = EventBus("s")
+    bus.fence.open("op1")
+    tx2.attach_bus(bus)
+    bus.emit("conversation.user_message", {"text": "", "source": "speech"}, turn_id="t1", operation_id="op1")
+    bus.emit("conversation.response_finished", {"text": "Hello there!"}, turn_id="t1", operation_id="op1")
+    bus.emit("audio.transcribed", {"text": "Hi Autum, my token is sk-1234567890abcdef123456", "final": True}, turn_id="t1")
+
+    items = tx2.recent(10)
+    assert [e["role"] for e in items] == ["user", "assistant"]
+    assert "sk-123456" not in items[0]["text"] and "[REDACTED" in items[0]["text"]
+    assert items[1]["text"] == "Hello there!"
+
+    # Non-direct-audio turn (audio.transcribed fires BEFORE conversation.user_message) must NOT duplicate
+    bus.fence.open("op2")
+    bus.emit("audio.transcribed", {"text": "Second question", "final": True}, turn_id="t2")
+    bus.emit("conversation.user_message", {"text": "Second question", "source": "speech"}, turn_id="t2", operation_id="op2")
+    bus.emit("conversation.response_finished", {"text": "Second answer"}, turn_id="t2", operation_id="op2")
+    items2 = tx2.recent(10)
+    assert [(e["role"], e["text"]) for e in items2[2:]] == [
+        ("user", "Second question"),
+        ("assistant", "Second answer"),
+    ]

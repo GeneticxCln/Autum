@@ -113,6 +113,38 @@ class ModelSwapper:
             yield
 
 
+HIDDEN_TAGS: tuple[tuple[str, str], ...] = (
+    ("<think>", "</think>"),
+    ("<|think|>", "<|/think|>"),
+    ("<|channel>thought", "<channel|>"),
+    ("<|tool_call>", "<tool_call|>"),
+)
+
+
+def strip_hidden_blocks(text: str) -> str:
+    """Remove model-internal reasoning or tool-call blocks from non-streaming text."""
+    out = text or ""
+    while True:
+        earliest_idx = -1
+        earliest_open = ""
+        earliest_close = ""
+        for open_tag, close_tag in HIDDEN_TAGS:
+            idx = out.find(open_tag)
+            if idx >= 0 and (earliest_idx < 0 or idx < earliest_idx):
+                earliest_idx = idx
+                earliest_open = open_tag
+                earliest_close = close_tag
+        if earliest_idx < 0:
+            break
+        after = earliest_idx + len(earliest_open)
+        end_idx = out.find(earliest_close, after)
+        if end_idx < 0:
+            out = out[:earliest_idx]
+            break
+        out = out[:earliest_idx] + out[end_idx + len(earliest_close) :]
+    return out.strip()
+
+
 class OmniChat:
     """Inference: streams reply text chunks and optional ToolCall proposals."""
 
@@ -154,12 +186,7 @@ class OmniChat:
         next_auto_idx = 0
         hidden_close: str | None = None
         think_buf = ""
-        hidden_tags = (
-            ("<think>", "</think>"),
-            ("<|think|>", "<|/think|>"),
-            ("<|channel>thought", "<channel|>"),
-            ("<|tool_call>", "<tool_call|>"),
-        )
+        hidden_tags = HIDDEN_TAGS
         max_open = max(len(o) for o, _ in hidden_tags)
 
         async def _run_stream() -> AsyncIterator[str | ToolCall]:

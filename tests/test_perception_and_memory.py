@@ -242,3 +242,35 @@ def test_memory_capabilities_remember_recall_and_approve_forget(tmp_path):
         {"tool": "recall_memories", "verified": True},
         {"tool": "forget_memory", "verified": True},
     ]
+
+
+def test_ollama_vision_pins_keep_alive_and_strips_hidden_thought_blocks():
+    import httpx
+    from autum.perception import OllamaVision
+
+    seen_bodies: list[dict] = []
+    replies = iter(
+        [
+            "<think>\nLet me inspect the window carefully.\n</think>\nA terminal showing git status.",
+            "<|channel>thought\nchecking pixels<channel|>A browser window open to Docs.",
+            "<|think|>analyzing<|/think|>Secret token sk-1234567890abcdef123456 on screen.",
+        ]
+    )
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen_bodies.append(json.loads(req.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": next(replies)}}]})
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            vis = OllamaVision(client, model="qwen3-vl:8b", reasoning_effort="none")
+            r1 = await vis(make_png(), "image/png", "What is visible?")
+            r2 = await vis(make_png(), "image/png", "What is visible?")
+            r3 = await vis(make_png(), "image/png", "What is visible?")
+            return r1, r2, r3
+
+    r1, r2, r3 = run(go())
+    assert all(b.get("keep_alive") == -1 and b.get("reasoning_effort") == "none" for b in seen_bodies)
+    assert r1 == "A terminal showing git status."
+    assert r2 == "A browser window open to Docs."
+    assert "analyzing" not in r3 and "sk-123456" not in r3 and "[REDACTED" in r3

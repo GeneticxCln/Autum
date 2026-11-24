@@ -865,14 +865,32 @@ class TranscriptLog:
         self.max_entries = max(1, int(max_entries))
         self._lock = threading.RLock()
         self._entries: deque[dict[str, Any]] = deque(maxlen=self.max_entries)
+        self._last_mtime_ns: int = -1
+        self._awaiting_turns: dict[str, str] = {}
+        self._assistant_by_turn: dict[str, dict[str, Any]] = {}
         self._load()
+
+    def _sync_from_disk_locked(self) -> None:
+        try:
+            mtime = self.path.stat().st_mtime_ns
+        except OSError:
+            if self._last_mtime_ns != -1 or self._entries:
+                self._entries.clear()
+                self._awaiting_turns.clear()
+                self._assistant_by_turn.clear()
+                self._last_mtime_ns = -1
+            return
+        if mtime != self._last_mtime_ns:
+            self._load()
 
     def _load(self) -> None:
         with self._lock:
             self._entries.clear()
             if not self.path.is_file():
+                self._last_mtime_ns = -1
                 return
             try:
+                st = self.path.stat()
                 for line in self.path.read_text(encoding="utf-8", errors="replace").splitlines():
                     line = line.strip()
                     if not line:
@@ -883,8 +901,9 @@ class TranscriptLog:
                         continue
                     if isinstance(obj, dict) and obj.get("role") and obj.get("text"):
                         self._entries.append(obj)
+                self._last_mtime_ns = st.st_mtime_ns
             except OSError:
-                pass
+                self._last_mtime_ns = -1
 
     def _write_locked(self) -> None:
         parent_existed = self.path.parent.exists()
@@ -908,38 +927,87 @@ class TranscriptLog:
                 for item in self._entries:
                     fh.write(json.dumps(item, ensure_ascii=False) + "\n")
             tmp.replace(self.path)
+            try:
+                self._last_mtime_ns = self.path.stat().st_mtime_ns
+            except OSError:
+                self._last_mtime_ns = -1
         except Exception:
             tmp.unlink(missing_ok=True)
             raise
 
-    def record(self, role: str, text: str) -> dict[str, Any] | None:
+    def record(
+        self,
+        role: str,
+        text: str,
+        *,
+        turn_id: str | None = None,
+        timestamp: str | None = None,
+    ) -> dict[str, Any] | None:
         clean = redact_sensitive((text or "").strip())
         if not clean:
             return None
         entry = {
-            "timestamp": _now_iso(),
+            "timestamp": timestamp or _now_iso(),
             "role": str(role),
             "text": clean[:1200],
         }
         with self._lock:
+            self._sync_from_disk_locked()
             self._entries.append(entry)
+            if role == "assistant" and turn_id:
+                while len(self._assistant_by_turn) >= 16:
+                    self._assistant_by_turn.pop(next(iter(self._assistant_by_turn)), None)
+                self._assistant_by_turn[turn_id] = entry
             try:
                 self._write_locked()
             except OSError:
                 pass
         return entry
 
+    def _backfill_user_turn(self, turn_id: str, text: str) -> dict[str, Any] | None:
+        clean = redact_sensitive((text or "").strip())
+        with self._lock:
+            self._sync_from_disk_locked()
+            started_ts = self._awaiting_turns.pop(turn_id, None)
+            assistant_entry = self._assistant_by_turn.pop(turn_id, None)
+            if started_ts is None or not clean:
+                return None
+            entry = {
+                "timestamp": started_ts,
+                "role": "user",
+                "text": clean[:1200],
+            }
+            items = list(self._entries)
+            inserted = False
+            if assistant_entry is not None:
+                for idx, cur in enumerate(items):
+                    if cur is assistant_entry:
+                        items.insert(idx, entry)
+                        inserted = True
+                        break
+            if not inserted:
+                items.append(entry)
+            self._entries = deque(items[-self.max_entries :], maxlen=self.max_entries)
+            try:
+                self._write_locked()
+            except OSError:
+                pass
+            return entry
+
     def recent(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
-            self._load()
+            self._sync_from_disk_locked()
             cap = max(1, min(self.max_entries, int(limit)))
             return list(self._entries)[-cap:]
 
     def clear(self) -> int:
         with self._lock:
-            self._load()
+            self._sync_from_disk_locked()
             count = len(self._entries)
             self._entries.clear()
+            self._awaiting_turns.clear()
+            self._assistant_by_turn.clear()
+            self._last_mtime_ns = -1
             try:
                 self.path.unlink(missing_ok=True)
             except OSError:
@@ -951,10 +1019,33 @@ class TranscriptLog:
             if event.type == "conversation.user_message":
                 txt = str(event.payload.get("text") or "").strip()
                 if txt:
-                    self.record("user", txt)
+                    self.record("user", txt, turn_id=event.turn_id)
+                elif event.turn_id:
+                    with self._lock:
+                        self._sync_from_disk_locked()
+                        while len(self._awaiting_turns) >= 16:
+                            self._awaiting_turns.pop(next(iter(self._awaiting_turns)), None)
+                        self._awaiting_turns[event.turn_id] = _now_iso()
             elif event.type == "conversation.response_finished":
                 txt = str(event.payload.get("text") or "").strip()
                 if txt:
-                    self.record("assistant", txt)
+                    self.record("assistant", txt, turn_id=event.turn_id)
+            elif event.type == "audio.transcribed":
+                if event.payload.get("final") and event.turn_id:
+                    self._backfill_user_turn(event.turn_id, str(event.payload.get("text") or ""))
+            elif event.type in ("operation.cancelled", "runtime.component_error"):
+                if event.turn_id:
+                    with self._lock:
+                        self._awaiting_turns.pop(event.turn_id, None)
+                        self._assistant_by_turn.pop(event.turn_id, None)
 
-        bus.subscribe(_on_event, {"conversation.user_message", "conversation.response_finished"})
+        bus.subscribe(
+            _on_event,
+            {
+                "conversation.user_message",
+                "conversation.response_finished",
+                "audio.transcribed",
+                "operation.cancelled",
+                "runtime.component_error",
+            },
+        )
